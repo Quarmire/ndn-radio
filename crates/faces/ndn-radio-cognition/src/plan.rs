@@ -323,8 +323,13 @@ pub struct RadioPlan {
     pub objective: f32,
     /// Cross-node consistency digest over the salient choices (prefix bucket +
     /// radio/channel/rate class). Independent nodes computing from the same
-    /// name+demand land on the same digest → overhearers converge; a mismatch on
-    /// the wire flags a contradictory re-transmit to suppress.
+    /// name+demand land on the same digest — the property that would let
+    /// overhearers converge and let a mismatch flag a contradictory re-transmit.
+    ///
+    /// ACTUATED TODAY: telemetry/observability only (surfaced on the decision span)
+    /// and a determinism check that two nodes agree. NOT YET WIRED: nothing parses a
+    /// peer's digest off the wire to suppress or converge — that RX-path consumer is
+    /// the future work this digest is built for (decided-but-unactuated until then).
     pub consistency: u64,
 }
 
