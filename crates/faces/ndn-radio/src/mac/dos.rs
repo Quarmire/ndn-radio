@@ -15,17 +15,29 @@
 //! [`Verdict::ReachesVerify`] frames cost the expensive operation. The tests + `examples/dos_validation`
 //! quantify attacker cost (frames sent) against victim cost (verifies forced).
 
-use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
+
+/// Fixed number of token buckets per limiter (power of two). This is the memory bound that stops the
+/// DoS defense from becoming a DoS *vector*: keying the per-source limiter on the ephemeral, attacker-
+/// chosen 6-byte nonce (§2), an unbounded map would grow one entry per minted nonce at line rate. With
+/// a fixed hash-indexed array a nonce-rotating flood creates at most `RATE_BUCKETS` live buckets, after
+/// which fresh nonces *collide into* existing buckets and SHARE their budget — the stricter, safe
+/// direction (two sources sharing a bucket get throttled harder, never laxer). 4096 × 16 B ≈ 64 KB.
+const RATE_BUCKETS: usize = 4096;
 
 /// A token-bucket rate limiter keyed on `K`. Used two ways in the cascade: keyed on the **ephemeral
 /// source nonce** (`[u8;6]`, §2) to throttle one source, and keyed on the **routable prefix** (`u64`)
 /// to bound the aggregate across all sources — the two limits doctrine §3.2 pairs. Per-nonce catches
-/// a single flooder; per-prefix catches a distributed one that mints fresh nonces.
+/// a single flooder; per-prefix catches a distributed one that mints fresh nonces. Buckets live in a
+/// fixed hash-indexed array (see [`RATE_BUCKETS`]) so the limiter's memory is O(1) regardless of how
+/// many distinct keys an attacker manufactures.
 pub struct RateLimiter<K: Hash + Eq + Copy> {
     capacity: f64,
     refill_per_ms: f64,
-    buckets: HashMap<K, (f64, u64)>, // key → (tokens, last_ms)
+    buckets: Vec<Option<(f64, u64)>>, // slot = hash(key) % RATE_BUCKETS → (tokens, last_ms)
+    _k: PhantomData<K>,
 }
 
 /// The per-source limiter keyed on the ephemeral nonce — the §2 nonce's DoS-attribution job actuated.
@@ -36,8 +48,17 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
         Self {
             capacity: capacity.max(0.0),
             refill_per_ms: refill_per_ms.max(0.0),
-            buckets: HashMap::new(),
+            buckets: vec![None; RATE_BUCKETS],
+            _k: PhantomData,
         }
+    }
+
+    /// The fixed bucket slot for `key` — a deterministic hash (fixed-seed [`DefaultHasher`], so runs
+    /// stay reproducible) folded into `[0, RATE_BUCKETS)`.
+    fn slot(&self, key: K) -> usize {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        (h.finish() as usize) & (RATE_BUCKETS - 1)
     }
 
     /// Refill by elapsed time and report whether a token is available — WITHOUT consuming it. Pair
@@ -46,7 +67,8 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
     pub fn has_token(&mut self, key: K, now_ms: u64) -> bool {
         let cap = self.capacity;
         let refill = self.refill_per_ms;
-        let (tokens, last) = self.buckets.entry(key).or_insert((cap, now_ms));
+        let idx = self.slot(key);
+        let (tokens, last) = self.buckets[idx].get_or_insert((cap, now_ms));
         *tokens = (*tokens + now_ms.saturating_sub(*last) as f64 * refill).min(cap);
         *last = now_ms;
         *tokens >= 1.0
@@ -54,7 +76,8 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
 
     /// Spend one token for `key` (call only after [`has_token`](Self::has_token) returned true).
     pub fn consume(&mut self, key: K) {
-        if let Some((tokens, _)) = self.buckets.get_mut(&key)
+        let idx = self.slot(key);
+        if let Some((tokens, _)) = self.buckets[idx].as_mut()
             && *tokens >= 1.0
         {
             *tokens -= 1.0;
@@ -71,9 +94,10 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
         }
     }
 
-    /// Number of distinct keys seen (for the source limiter, the attacker's nonce cost).
+    /// Number of occupied buckets (for the source limiter, the attacker's nonce cost — saturating at
+    /// [`RATE_BUCKETS`] once the fixed table fills, which is the whole point of the bound).
     pub fn keys(&self) -> usize {
-        self.buckets.len()
+        self.buckets.iter().filter(|b| b.is_some()).count()
     }
 }
 
@@ -260,6 +284,26 @@ mod tests {
             "10 nonces × burst 4 = 40 — linear in the attacker's nonce count"
         );
         assert_eq!(gate.distinct_sources(), 10);
+    }
+
+    /// The bound that makes the DoS defense not a DoS vector: a flood that mints a FRESH nonce every
+    /// frame (far more distinct nonces than the table has slots) cannot grow the limiter's memory past
+    /// `RATE_BUCKETS`. Without the fix this map grew one entry per nonce, unbounded, at line rate.
+    #[test]
+    fn nonce_rotating_flood_cannot_exhaust_memory() {
+        let mut gate = DosGate::new([WANTED], 8.0, 0.0);
+        // 10× as many distinct nonces as the table has slots — each a fresh 6-byte value.
+        for i in 0u64..(RATE_BUCKETS as u64 * 10) {
+            let src = i.to_le_bytes();
+            let mut nonce = [0u8; 6];
+            nonce.copy_from_slice(&src[..6]);
+            let _ = gate.admit(FrameKind::Interest, WANTED, i, nonce, 0);
+        }
+        assert!(
+            gate.distinct_sources() <= RATE_BUCKETS,
+            "the per-source table is bounded at {RATE_BUCKETS}, saw {}",
+            gate.distinct_sources()
+        );
     }
 
     /// The limiter refills over time (sustained rate), so a legitimate steady sender is not starved.
