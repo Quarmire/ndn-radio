@@ -144,8 +144,10 @@ impl CoopRelay {
     /// entry — is dropped** (the doctrine's DoS gate: you only carry Data you relayed
     /// an Interest for).
     pub fn rx_data(&mut self, name: Name, now: u64) {
-        match self.pending.get(&name) {
-            Some(_) => {
+        // Read the breadcrumb's direction first so the match arm can re-insert without holding a borrow.
+        match self.pending.get(&name).map(|p| p.dir) {
+            // PIT match on a live Interest breadcrumb: turn it into a Data-return toward the consumer.
+            Some(Dir::Interest) => {
                 self.pending.insert(
                     name,
                     Pending {
@@ -156,6 +158,12 @@ impl CoopRelay {
                     },
                 );
             }
+            // Already a Data forward (scheduled, sent, or CCLF-suppressed): a re-heard copy is a
+            // DUPLICATE — drop it. Resurrecting a done Data (as the old unconditional insert did)
+            // is what let two relays ping-pong the same Data until purge; this is the return-path
+            // analogue of the `rx_interest` re-arm guard.
+            Some(Dir::Data) => { /* duplicate Data: drop */ }
+            // Unsolicited (no breadcrumb): drop (the doctrine's DoS gate).
             None => { /* unsolicited: drop */ }
         }
     }
@@ -307,6 +315,34 @@ mod tests {
 
     fn relay(jitter: u64) -> CoopRelay {
         CoopRelay::new(vec![SCOPE_X], jitter, 1000)
+    }
+
+    /// A re-heard Data must NOT resurrect an already-forwarded breadcrumb — otherwise two relays
+    /// ping-pong the same Data until purge. Once a node has put the Data-return on air, a second
+    /// `rx_data` for that name is a duplicate and yields no new emission.
+    #[test]
+    fn reheard_data_does_not_resurrect_a_forwarded_breadcrumb() {
+        let mut r = relay(0);
+        r.rx_interest(XY, 0); // Interest breadcrumb
+        r.rx_data(XY, 0); // PIT match → Data-return armed
+        let first = r.tick(0);
+        assert_eq!(
+            first,
+            vec![(XY, Dir::Data)],
+            "the Data-return goes on air exactly once"
+        );
+        // A duplicate Data heard after we already forwarded must not re-arm the (done) breadcrumb.
+        r.rx_data(XY, 1);
+        let second = r.tick(1);
+        assert!(
+            second.is_empty(),
+            "a re-heard Data is a duplicate, not a resurrection: {second:?}"
+        );
+        assert_eq!(
+            r.emitted.len(),
+            1,
+            "exactly one Data emission total — no ping-pong"
+        );
     }
 
     /// Multi-hop: C — R1 — R2 — P (a line; C cannot hear P). The Interest must be
