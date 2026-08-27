@@ -169,8 +169,7 @@ pub struct RadioRationale {
     pub channel_busy_pct: Option<u8>,
     /// Weakest wanted-receiver RSSI (dBm) driving the MCS + power pick.
     pub rssi_dbm: Option<i8>,
-    /// Post-link-FEC residual erasure driving the redundancy budget.
-    pub link_per: Option<f32>,
+    // Tombstone: `link_per` removed with its always-empty sensor (`LinkResidual::link_per`).
     /// Replicate vs Split role of this allocation.
     pub role: AllocRole,
 }
@@ -363,7 +362,6 @@ impl RadioPolicy {
                 channel,
                 channel_busy_pct: channel.and_then(|ch| view.busy_pct(*radio, ch)),
                 rssi_dbm: self.demand_set_rssi(*radio, view, now_ms),
-                link_per: view.residual(*radio).and_then(|r| r.link_per.get()),
                 role,
             });
             allocations.push(RadioAllocation {
@@ -1074,7 +1072,6 @@ mod tests {
                 1,
                 NeighborReport {
                     heard_prefixes: vec![],
-                    quality_dbm: Some(-45),
                     spectrum: vec![],
                     max_rx_mcs: max_rx,
                     ts_ms: 1_000,

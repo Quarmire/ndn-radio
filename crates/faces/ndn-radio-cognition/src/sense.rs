@@ -112,15 +112,15 @@ impl ChannelOccupancy {
 pub struct LinkResidual {
     /// Post-PHY-FEC (LDPC) frame error rate (RX-desc CRC fails / frames).
     pub phy_per: Ewma,
-    /// Post-link-FEC frame erasure rate (generations not recovered).
-    pub link_per: Ewma,
+    // Tombstone: `link_per` (post-link-FEC erasure rate) removed — its writer `observe_link_per` had
+    // no caller, so the EWMA was always empty and every reader saw None. Reintroduce with a FEC-decoder
+    // erasure counter feeding it (the residual a link-FEC controller would size redundancy against).
 }
 
 impl Default for LinkResidual {
     fn default() -> Self {
         Self {
             phy_per: Ewma::new(0.2),
-            link_per: Ewma::new(0.2),
         }
     }
 }
@@ -133,7 +133,8 @@ pub struct NeighborReport {
     /// Hashes of name-prefixes this neighbor recently heard (receiver multiplicity
     /// + COPE side-info hints: who already holds what).
     pub heard_prefixes: Vec<u64>,
-    pub quality_dbm: Option<i8>,
+    // Tombstone: `quality_dbm` removed — nothing read it (the policy takes link quality from
+    // `observe_rx`/`weakest_rssi`). Reintroduce only if a report-carried RSSI selector needs it.
     /// The neighbor's per-channel busy% view: `(channel, busy_pct)`.
     pub spectrum: Vec<(u8, u8)>,
     /// Highest HT/VHT MCS this neighbour can *decode* (its advertised RX capability), or
@@ -152,8 +153,8 @@ pub struct NeighborReport {
 pub struct Demand {
     /// PIT in-records / downstream faces wanting this name.
     pub fanout: u32,
-    /// CCLF content-connectivity score (how wanted, regionally).
-    pub ccs: f32,
+    // Tombstone: `ccs` (CCLF content-connectivity score) removed — hardcoded 0.0 with no reader.
+    // Reintroduce when CCLF regional-demand scoring is wired and something reads it.
     /// Measured re-Interest (re-expression) rate — ARQ-elimination's signal; the
     /// budget is allocated to drive THIS down, not an abstract residual.
     pub reinterest_rate: Ewma,
@@ -167,7 +168,6 @@ impl Default for Demand {
     fn default() -> Self {
         Self {
             fanout: 0,
-            ccs: 0.0,
             reinterest_rate: Ewma::new(0.3),
             rank_deficit: Ewma::new(0.3),
             ts_ms: 0,
@@ -350,9 +350,7 @@ impl MediumState {
     pub fn observe_phy_per(&mut self, radio: RadioId, per: f32) {
         self.residual.entry(radio).or_default().phy_per.update(per);
     }
-    pub fn observe_link_per(&mut self, radio: RadioId, per: f32) {
-        self.residual.entry(radio).or_default().link_per.update(per);
-    }
+    // Tombstone: `observe_link_per` removed with `LinkResidual::link_per` — it had no caller.
     pub fn observe_e2e_per(&mut self, per: f32) {
         self.e2e.update(per);
     }
@@ -812,7 +810,6 @@ mod tests {
             7,
             NeighborReport {
                 heard_prefixes: vec![0xABCD],
-                quality_dbm: Some(-55),
                 spectrum: vec![(149, 40)],
                 max_rx_mcs: crate::report::FULL_RX_MCS,
                 ts_ms: 100,

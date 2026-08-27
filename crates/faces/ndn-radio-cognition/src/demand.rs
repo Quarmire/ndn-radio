@@ -137,7 +137,6 @@ impl PrefixDemand {
     fn to_demand(&self, lifetime: u64, now: u64) -> Demand {
         Demand {
             fanout: self.fanout(lifetime, now),
-            ccs: 0.0, // CCLF supplies this when wired
             reinterest_rate: self.reinterest,
             rank_deficit: Ewma::new(0.3), // diversity supplies this later
             ts_ms: self.last_activity_ms,

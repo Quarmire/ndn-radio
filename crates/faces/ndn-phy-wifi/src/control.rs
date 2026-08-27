@@ -425,7 +425,6 @@ impl RadioControl {
                 rep.node_id,
                 NeighborReport {
                     heard_prefixes: rep.heard_prefixes.clone(),
-                    quality_dbm: None,
                     spectrum: rep.spectrum.clone(),
                     max_rx_mcs: rep.max_rx_mcs,
                     ts_ms: now_ms,
@@ -809,7 +808,6 @@ impl RadioControl {
                     score = r.score,
                     channel_busy_pct = ?r.channel_busy_pct,
                     rssi_dbm = ?r.rssi_dbm,
-                    link_per = ?r.link_per,
                     role = ?r.role,
                     // outputs — what was chosen
                     strategy = self.policy.name(),
