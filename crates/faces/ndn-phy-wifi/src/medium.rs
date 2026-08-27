@@ -350,8 +350,9 @@ struct AppliedKnobs {
     edcca: Option<bool>,
     power: Option<u8>,
     power_dbm: Option<i8>,
-    sf: Option<u8>, // LoRa spreading factor
-    cr: Option<u8>, // LoRa coding rate
+    sf: Option<u8>,  // LoRa spreading factor
+    cr: Option<u8>,  // LoRa coding rate
+    bw: Option<u32>, // LoRa bandwidth (kHz)
 }
 
 /// The medium's **actuator**: applies one radio's slice of a [`RadioPlan`] each tick.
@@ -488,6 +489,15 @@ impl RadioActuators for MediumActuator {
         {
             knobs.set_coding_rate(cr).map_err(to_err)?;
             last.cr = Some(cr);
+        }
+        // LoRa bandwidth: the cognition's rate/airtime lever (policy widens to 250 kHz on strong
+        // Bulk links — ~2× rate, half the airtime). The actuator existed but nothing called it, so
+        // the decided width died in the plan; gate on a changed value like the other LoRa dials.
+        if let Some(bw) = p.bandwidth_khz()
+            && last.bw != Some(bw)
+        {
+            knobs.set_bandwidth_khz(bw).map_err(to_err)?;
+            last.bw = Some(bw);
         }
         Ok(())
     }
@@ -1741,7 +1751,7 @@ impl Transport for RunningMedium {
 mod power_actuation_tests {
     use super::*;
     use crate::LoopbackMonitorBus;
-    use ndn_radio_cognition::{RadioPlan, TxParams};
+    use ndn_radio_cognition::{LoraRate, RadioPlan, TxParams};
     use std::sync::Mutex as StdMutex;
 
     /// Records which power scale the actuator reached for.
@@ -1749,6 +1759,7 @@ mod power_actuation_tests {
     struct SpyKnobs {
         dbm_calls: StdMutex<Vec<i8>>,
         idx_calls: StdMutex<Vec<u32>>,
+        bw_calls: StdMutex<Vec<u32>>,
         /// Simulate a radio with no absolute control.
         dbm_unsupported: bool,
     }
@@ -1770,6 +1781,10 @@ mod power_actuation_tests {
             self.dbm_calls.lock().unwrap().push(dbm);
             // Report a clamp, as real firmware does.
             Ok(dbm.min(27))
+        }
+        fn set_bandwidth_khz(&self, khz: u32) -> Result<(), FaceError> {
+            self.bw_calls.lock().unwrap().push(khz);
+            Ok(())
         }
     }
 
@@ -1836,6 +1851,31 @@ mod power_actuation_tests {
         act.apply(alloc).unwrap();
         act.apply(alloc).unwrap();
         assert_eq!(*knobs.dbm_calls.lock().unwrap(), vec![20]);
+    }
+
+    /// The decided LoRa **bandwidth** must reach the actuator — it is a real rate/airtime lever
+    /// (policy widens to 250 kHz on strong Bulk links) whose `set_bandwidth_khz` actuator existed but
+    /// was never called from `apply`, so the width died in the plan. Asserts on the SEAM (the method
+    /// call), and that an unchanged value is not re-pushed (each set is a ~1s AT retune).
+    #[test]
+    fn lora_bandwidth_reaches_the_actuator_once() {
+        let knobs = Arc::new(SpyKnobs::default());
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -55));
+        let act = MediumActuator::new(RadioId(0), io, Some(knobs.clone()));
+        let params = TxParams::lora(LoraRate {
+            bandwidth_khz: Some(250),
+            ..Default::default()
+        });
+        let plan = RadioPlan::single(RadioId(0), None, params);
+        let alloc = plan.allocation_for(RadioId(0)).unwrap();
+        act.apply(alloc).unwrap();
+        act.apply(alloc).unwrap(); // unchanged ⇒ must not re-push
+        assert_eq!(
+            *knobs.bw_calls.lock().unwrap(),
+            vec![250],
+            "decided LoRa bandwidth must reach set_bandwidth_khz exactly once"
+        );
     }
 
     /// A clamped write is remembered as *applied*, not as requested — otherwise a

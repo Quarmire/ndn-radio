@@ -982,8 +982,9 @@ struct AppliedKnobs {
     csd: Option<bool>,
     edcca: Option<bool>,
     power: Option<u8>,
-    sf: Option<u8>, // LoRa spreading factor
-    cr: Option<u8>, // LoRa coding rate
+    sf: Option<u8>,  // LoRa spreading factor
+    cr: Option<u8>,  // LoRa coding rate
+    bw: Option<u32>, // LoRa bandwidth (kHz)
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -1071,6 +1072,15 @@ impl RadioActuators for LibUsbActuator {
         {
             self.knobs.set_coding_rate(cr).map_err(to_err)?;
             last.cr = Some(cr);
+        }
+        // LoRa bandwidth: the rate/airtime lever (policy widens to 250 kHz on strong Bulk links).
+        // The actuator existed but neither apply path called it, so the decided width never reached
+        // the dongle; gate strictly on a changed value like sf/cr (each set is a ~1s AT retune).
+        if let Some(bw) = p.bandwidth_khz()
+            && last.bw != Some(bw)
+        {
+            self.knobs.set_bandwidth_khz(bw).map_err(to_err)?;
+            last.bw = Some(bw);
         }
         drop(last);
 
