@@ -798,6 +798,27 @@ impl RadioMediumFace {
         self
     }
 
+    /// **Tier-0 WIDE-profile receive** (#39): like [`with_bloom`](Self::with_bloom), but the RX gate
+    /// tests the layered 126-bit base + 48-bit extra Blur ([`RxFilter::WideBloom`]). A wide frame
+    /// (carrying `addr4`) is filtered on both regions — strictly lower false-positive rate — while a
+    /// base (commodity) sender's 3-address frame is still admitted on the base region alone (zero
+    /// false negatives). TX stays the base profile (see the note at the inject site): this tightens
+    /// what the node *accepts*, the half that costs wasted wakeups/parses, without a wire change that
+    /// a base neighbour could not read.
+    pub fn with_wide_bloom(
+        mut self,
+        key: &crate::GroupKey,
+        registered_prefixes: &[impl AsRef<[u8]>],
+    ) -> Self {
+        let masks = crate::wide_bloom_masks_for(key, registered_prefixes);
+        self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
+        self.with_tx_bloom(*key)
+            .with_rx_gate(Arc::new(crate::NameGate::new(
+                crate::RxFilter::WideBloom(masks),
+                None,
+            )))
+    }
+
     /// Address outbound frames by name (Tier-0) without changing what this face accepts.
     pub fn with_tx_bloom(mut self, key: crate::GroupKey) -> Self {
         self.tx_bloom = Some(key);
@@ -1174,6 +1195,12 @@ impl TxBearer {
             dst,
             src,
             addr3,
+            // The medium's default addresser emits the base 3-address profile — a valid, universally-
+            // admitted frame. Wide-profile TX (addr4 extra Blur + HT Control fingerprint) is a caller-
+            // driven capability of `build_dot11`, kept out of this hot path to avoid a wide/FEC/A-MSDU
+            // fragment-consistency split; the RX side (`admits_wide` + `RxFilter::WideBloom`) reads it.
+            addr4: None,
+            htc: None,
         };
         // A-MSDU bundling (#82 part 2): a non-robust data frame is coalesced instead of injected
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
@@ -1557,7 +1584,9 @@ impl RunningMedium {
                             // drop accounting — and every filtering feature added recently landed
                             // only on the other face. Sharing it is what stops the two diverging.
                             if let Some(gate) = rx_gate.as_ref()
-                                && !gate.admits(f.group, f.addr, f.addr3, &f.payload)
+                                && !gate.admits_wide(
+                                    f.group, f.addr, f.addr3, f.addr4, f.htc, &f.payload,
+                                )
                             {
                                 continue;
                             }
@@ -1663,6 +1692,8 @@ impl RunningMedium {
                         dst: BROADCAST,
                         src: src.current(super::now_ms() as u64),
                         addr3: None,
+                        addr4: None,
+                        htc: None,
                     };
                     let _ = radio.inject(frame).await; // transient errors: keep the clock alive
                 }
@@ -2049,6 +2080,8 @@ mod tests {
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
                 addr3: None,
+                addr4: None,
+                htc: None,
             };
             radio.inject_at(frame, McsDescriptor::ht(0)).await.unwrap();
         };
@@ -2129,6 +2162,8 @@ mod tests {
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
                 addr3: None,
+                addr4: None,
+                htc: None,
             })
             .await
             .unwrap();

@@ -234,6 +234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             dst: ndn_radio_hal::BROADCAST,
                             src,
                             addr3: None,
+                            addr4: None,
+                            htc: None,
                         };
                         let _ = io.inject(f).await;
                         seq += 1;

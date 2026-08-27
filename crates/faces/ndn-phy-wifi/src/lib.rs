@@ -252,6 +252,8 @@ impl GenerationSink for RadioFecSink {
                 dst: pin.dst,
                 src: pin.src,
                 addr3: pin.addr3,
+                addr4: None,
+                htc: None,
             };
             let _ = match pin.mcs {
                 Some(mcs) => self.radio.inject_at(frame, mcs).await,
@@ -524,6 +526,23 @@ pub(crate) fn bloom_masks_for(
     coverage_antichain(&refs)
         .into_iter()
         .map(|p| PrefixFilter::mask_for(k, p))
+        .collect()
+}
+
+/// The **wide-profile** counterpart of [`bloom_masks_for`]: one [`tier0::WifiWideBlur::mask_for`] per
+/// registered prefix (base 126-bit region + 48-bit extra projection), for [`RxFilter::WideBloom`].
+/// Same coverage-dedup, so the tighter filter costs no extra masks. A wide receiver built from this
+/// tests a wide frame against both regions (lower FP) yet still admits a base sender's 3-address
+/// frame — the base region of each mask is byte-identical to what [`bloom_masks_for`] produced.
+pub(crate) fn wide_bloom_masks_for(
+    key: &GroupKey,
+    prefixes: &[impl AsRef<[u8]>],
+) -> std::sync::Arc<[tier0::WifiWideBlur]> {
+    let k = bloom_key64(key);
+    let refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_ref()).collect();
+    coverage_antichain(&refs)
+        .into_iter()
+        .map(|p| tier0::WifiWideBlur::mask_for(k, p))
         .collect()
 }
 
@@ -1274,6 +1293,8 @@ mod tests {
             dst: BROADCAST,
             src: ADDR_A,
             addr3: None,
+            addr4: None,
+            htc: None,
         })
         .await
         .unwrap();
@@ -1309,6 +1330,8 @@ mod tests {
             dst: BROADCAST,
             src: ADDR_B,
             addr3: None,
+            addr4: None,
+            htc: None,
         })
         .await
         .unwrap();

@@ -278,6 +278,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dst: BROADCAST,
                     src,
                     addr3: None,
+                    addr4: None,
+                    htc: None,
                 })
                 .await;
             last_beacon = Instant::now();
@@ -368,6 +370,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dst: BROADCAST,
                     src,
                     addr3: None,
+                    addr4: None,
+                    htc: None,
                 })
                 .await
             {

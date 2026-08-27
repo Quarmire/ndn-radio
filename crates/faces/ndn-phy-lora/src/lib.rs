@@ -76,6 +76,8 @@ impl GenerationSink for LoraFecSink {
                     dst: [0xff; 6],
                     src: [0x02, b'l', b'o', b'r', b'a', 0x00],
                     addr3: None,
+                    addr4: None,
+                    htc: None,
                 })
                 .await;
         }
@@ -284,6 +286,8 @@ impl Transport for LoraPhy {
                         dst: [0xff; 6],
                         src: [0x02, b'l', b'o', b'r', b'a', 0x00],
                         addr3: None,
+                        addr4: None,
+                        htc: None,
                     })
                     .await
             }

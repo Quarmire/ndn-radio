@@ -176,6 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dst: old_dst,
                         src: DEFAULT_SRC,
                         addr3: None,
+                        addr4: None,
+                        htc: None,
                     })
                     .await?;
                 sent_old += 1;

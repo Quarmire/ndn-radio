@@ -587,6 +587,26 @@ impl WideFrame {
     }
 }
 
+/// Number of extra Blur bytes carried by the **Wi-Fi** wide profile — `addr4` only (48 bits). The
+/// receiver-side wide Blur uses the same width, so a wide sender and a wide receiver test identical
+/// projections. (Other bearers pick their own `EXTRA`; the base region is invariant across all.)
+pub const WIFI_WIDE_EXTRA_BYTES: usize = 6;
+
+/// The Wi-Fi wide-profile filter type: 126-bit base + 48-bit extra. A receiver precomputes one
+/// [`WifiWideBlur::mask_for`] per registered prefix and ANDs the frame against it.
+pub type WifiWideBlur = WideBlur<WIFI_WIDE_EXTRA_BYTES>;
+
+/// Recover the exact-match **fingerprint** a wide frame carries in HT Control, or `None` if the
+/// frame is not wide (no profile marker). The fingerprint is `FP_BITS` (24) of the keyed name hash,
+/// little-endian in `htc[0..3]`; `htc[3]` is the [`WIDE_PROFILE_MARKER`]. Used by the RX gate to
+/// answer PIT-exact / CS-exact **without parsing** the name.
+pub fn fingerprint_from_htc(htc: &[u8; 4]) -> Option<u32> {
+    if htc[3] != WIDE_PROFILE_MARKER {
+        return None;
+    }
+    Some(htc[0] as u32 | (htc[1] as u32) << 8 | (htc[2] as u32) << 16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
