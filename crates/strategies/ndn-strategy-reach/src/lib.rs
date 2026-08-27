@@ -339,7 +339,11 @@ impl Strategy for SoftPrefixReachStrategy {
         let reach = self.reach_norm(key, now);
         match self.mode {
             Mode::Probabilistic => {
-                let p = self.params.p_floor + (1.0 - self.params.p_floor) * reach;
+                // Cold prior (reach≈0) ⇒ p≈1 (WIDEN: forward — can't blackhole, per the module invariant);
+                // warm (reach≈1) ⇒ p≈p_floor (NARROW: path is known, let overhear-cancel thin the flood).
+                // Matches Defer's `(1-reach)` polarity — the old `* reach` inverted it (cold narrowed to
+                // p_floor^hops, so an all-cold mobile mesh blackholed).
+                let p = self.params.p_floor + (1.0 - self.params.p_floor) * (1.0 - reach);
                 if self.draw() < p {
                     smallvec![ForwardingAction::Forward(faces)]
                 } else {
