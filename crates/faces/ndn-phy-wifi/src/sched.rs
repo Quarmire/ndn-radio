@@ -46,8 +46,13 @@ use ndn_time::{NetworkTime, RadioHwClock, RefBelief};
 enum HoldStatus {
     /// We hold this slot and there is room — keep transmitting without re-contending.
     Continue,
-    /// We held it, and must stop: the owner spoke, or the frame no longer fits.
+    /// We held it, and must stop: the owner spoke, the frame no longer fits AND the lease has no more
+    /// base slots, or a reserved lane intervened. The lease is torn down.
     Ended,
+    /// We hold a multi-slot lease that still has base slots left, but this frame does not fit the
+    /// *current* base slot — wait for the next boundary and continue the lease there. Distinct from
+    /// [`Ended`](Self::Ended) so a tight frame does not throw away a still-valid multi-slot lease (#93).
+    WaitBoundary,
     /// We hold no claim on this slot.
     None,
 }
@@ -1118,9 +1123,14 @@ impl FaceScheduler {
             return HoldStatus::Ended;
         }
         if !slot.fits_now(now, airtime) {
-            // No room in THIS base slot. If the lease still has slots left, the frame waits for the
-            // next boundary rather than ending the lease — the gap between base slots is exactly the
-            // off-air moment the design spends on preemption.
+            // No room in THIS base slot. If the lease still has a later base slot (its next boundary
+            // falls before the deadline), the frame waits for that boundary rather than ending the
+            // lease — the gap between base slots is exactly the off-air moment the design spends on
+            // preemption. Only when this is the lease's LAST base slot is a non-fit the end of it.
+            let next_boundary = slot_start + slot.slot_us();
+            if next_boundary < lease_until {
+                return HoldStatus::WaitBoundary;
+            }
             return HoldStatus::Ended;
         }
         HoldStatus::Continue
@@ -1185,6 +1195,12 @@ impl FaceScheduler {
             HoldStatus::Ended => {
                 self.hold_slot_start.store(u64::MAX, Ordering::Relaxed);
                 self.lease_until.store(0, Ordering::Relaxed);
+            }
+            HoldStatus::WaitBoundary => {
+                // Still our lease, just no room in this base slot — do NOT tear the lease down and do
+                // NOT start a fresh election. Decline to transmit; the gate's wait loop re-contends at
+                // the next boundary, where `hold_status` will find room and return `Continue`.
+                return false;
             }
             HoldStatus::None => {}
         }
@@ -2567,6 +2583,21 @@ mod tests {
             s.hold_status(&slot, slot.slot_start_us(in_slot_2), in_slot_2, air),
             HoldStatus::Continue,
             "a lease of 4 must carry into the next base slot; a single-slot hold stopped here"
+        );
+
+        // **A tight frame late in a base slot waits for the next boundary — it does NOT throw the
+        // lease away** (#93). Slots 2 and 3 remain, so a frame that cannot fit in what is left of this
+        // slot defers to the boundary; the old `Ended` here tore down a lease with two slots still on it.
+        let late_in_slot_2 = 3 * slot.slot_us() - 1; // 1 µs before slot 3 begins
+        assert_eq!(
+            s.hold_status(
+                &slot,
+                slot.slot_start_us(late_in_slot_2),
+                late_in_slot_2,
+                air
+            ),
+            HoldStatus::WaitBoundary,
+            "no room now but the lease has a later base slot ⇒ wait, keep the lease"
         );
 
         // **The owner-return contract still applies per base slot**, not once per lease — otherwise
