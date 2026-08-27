@@ -26,11 +26,12 @@ use crate::control::RadioControl;
 /// RSSI→MCS thresholds: rssi = NOISE_FLOOR + snr).
 pub const NOISE_FLOOR_DBM: f32 = -95.0;
 
-/// HT/VHT PHY data rate (Mbps): 20 MHz 1SS long-GI base scaled by bw/nss/SGI.
+/// HT/VHT PHY data rate (Mbps): the shared 20 MHz 1SS long-GI base ladder scaled by bw/nss/SGI. The
+/// base comes from [`ndn_radio_cognition::mcs_base_rate_mbps`] (HAL-derived for HT 0–7, VHT for 8–9),
+/// so the scorer, the scheduler, and cognition's optimand all rate an MCS the same way (the `BASE`
+/// literal here used to duplicate that ladder).
 pub fn mcs_rate_mbps(p: &TxParams) -> f32 {
-    // HT/VHT MCS0–9 (8–9 = VHT 256-QAM), 20 MHz, 1 SS, long GI.
-    const BASE: [f32; 10] = [6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0, 78.0, 87.75];
-    let idx = p.mcs().unwrap_or(0).min(9) as usize;
+    let base = ndn_radio_cognition::mcs_base_rate_mbps(p.mcs().unwrap_or(0).min(9));
     let bw = match p.bw().unwrap_or(0) {
         1 => 2.0,  // 40 MHz
         2 => 4.0,  // 80 MHz
@@ -40,10 +41,15 @@ pub fn mcs_rate_mbps(p: &TxParams) -> f32 {
     };
     let nss = p.nss().unwrap_or(1).max(1) as f32;
     let sgi = if p.short_gi() { 1.0 / 0.9 } else { 1.0 }; // ~+11%
-    BASE[idx] * bw * nss * sgi
+    base * bw * nss * sgi
 }
 
-/// Airtime (µs) to put one frame carrying `payload` bytes on the air at `p`'s rate.
+/// Airtime (µs) to put one frame carrying `payload` bytes on the air at `p`'s rate. This is the
+/// **accurate estimate** for A/B scoring — it accounts for bw/nss/SGI. It is deliberately NOT the same
+/// as `ndn_radio::mac::schedule::wifi_airtime_us`, which is a conservative UPPER BOUND for slot-fit
+/// (fatter preamble, ignores bw/nss so it can only over-estimate): a scheduler that under-counts
+/// bleeds a frame into the next owner's slot, so the two want opposite error directions. They share
+/// the rate ladder ([`mcs_rate_mbps`]) but not the overhead/preamble model, on purpose.
 pub fn frame_airtime_us(p: &TxParams, payload: usize) -> f32 {
     const PREAMBLE_US: f32 = 40.0; // HT-mixed preamble + per-frame fixed overhead
     const OVERHEAD: usize = 60; // MAC header + FCS + LLC/SNAP

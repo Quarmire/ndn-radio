@@ -119,6 +119,20 @@ pub struct LoraRate {
     pub bandwidth_khz: Option<u32>,
 }
 
+/// The 802.11n/ac PHY data rate (Mbps) for a **1×1, 20 MHz, long-GI** stream at MCS `mcs` — the single
+/// base ladder every rate/airtime estimate scales from `(× bw × nss × sgi)`. HT indices 0–7 come
+/// straight from the canonical [`ndn_radio_hal::mcs_phy_rate_bps`] table so there is ONE source of
+/// truth for them; 8–9 are the VHT 256-QAM rates the HT-only HAL table does not carry. This replaced
+/// a hand-rolled `(mcs+1)·6.5` proxy that was correct only through MCS3 and under-rated everything
+/// above it, and a duplicated `BASE[10]` literal in the phy-wifi scorer.
+pub fn mcs_base_rate_mbps(mcs: u8) -> f32 {
+    match mcs {
+        8 => 78.0,    // VHT MCS8 (256-QAM 3/4), 1SS 20 MHz LGI — beyond the HT-only HAL table
+        9 => 87.75,   // VHT MCS9 (256-QAM 5/6)
+        m => ndn_radio_hal::mcs_phy_rate_bps(m) as f32 / 1_000_000.0, // HT 0–7, canonical
+    }
+}
+
 impl TxParams {
     /// Bearer-agnostic knobs plus a Wi-Fi rate.
     pub fn wifi(wifi: WifiRate) -> Self {

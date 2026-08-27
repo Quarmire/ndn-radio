@@ -824,7 +824,11 @@ const DB_PER_POWER_IDX: f32 = 0.5;
 /// Nominal PHY rate proxy (Mbps) for the objective estimate — monotone in the
 /// rate-affecting params, not a calibrated figure.
 fn phy_rate_proxy(p: &TxParams) -> f32 {
-    let mcs = p.mcs().unwrap_or(0) as f32;
+    // The real HT/VHT ladder (shared, HAL-derived), scaled by bw/nss/SGI — replaces a `(mcs+1)·6.5`
+    // approximation that under-rated MCS≥4 (32.5 vs the true 39 at MCS4), which made high-MCS arms
+    // look costlier than they are in the airtime objective. Objective is telemetry, not a gate, so
+    // this only sharpens the reported number.
+    let base = crate::plan::mcs_base_rate_mbps(p.mcs().unwrap_or(0));
     let bw_factor = match p.bw().unwrap_or(0) {
         1 => 2.0,
         2 => 4.0,
@@ -834,7 +838,7 @@ fn phy_rate_proxy(p: &TxParams) -> f32 {
     };
     let nss = p.nss().unwrap_or(1).max(1) as f32;
     let sgi = if p.short_gi() { 1.11 } else { 1.0 };
-    ((mcs + 1.0) * 6.5 * bw_factor * nss * sgi).max(0.25)
+    (base * bw_factor * nss * sgi).max(0.25)
 }
 
 // Tiny FNV-1a over u64 words for the consistency digest (no external dep).
@@ -929,6 +933,27 @@ mod tests {
 
     const W: RadioId = RadioId(0);
     const L: RadioId = RadioId(1);
+
+    /// The shared rate ladder is the TRUE HT/VHT ladder (HAL-derived), and `phy_rate_proxy` now uses
+    /// it — not the old `(mcs+1)·6.5` that under-rated MCS≥4 (32.5 vs the true 39 at MCS4).
+    #[test]
+    fn rate_ladder_is_the_true_ht_ladder() {
+        let expect = [6.5f32, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0];
+        for (mcs, &e) in expect.iter().enumerate() {
+            assert_eq!(crate::plan::mcs_base_rate_mbps(mcs as u8), e, "MCS{mcs}");
+        }
+        assert_eq!(crate::plan::mcs_base_rate_mbps(8), 78.0); // VHT
+        assert_eq!(crate::plan::mcs_base_rate_mbps(9), 87.75);
+        let p = TxParams::wifi(crate::plan::WifiRate {
+            mcs: Some(4),
+            ..Default::default()
+        });
+        assert_eq!(
+            phy_rate_proxy(&p),
+            39.0,
+            "MCS4 must rate at the true 39 Mbps, not the old proxy's 32.5"
+        );
+    }
 
     fn wifi_only() -> MediumState {
         let mut m = MediumState::new();
