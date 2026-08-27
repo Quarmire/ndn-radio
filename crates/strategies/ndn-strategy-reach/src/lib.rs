@@ -64,7 +64,7 @@ const BLOOM_CELLS: usize = 256;
 const BLOOM_K: usize = 4;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub enum Mode {
     Probabilistic, // v1: re-broadcast with prob p(reach); else suppress.
     Defer,         // v2: defer by delay(reach); engine overhear-cancels the redundant ones.
     Bandit, // v3: defer, reach = Thompson sample from a Beta posterior (explore under uncertainty).
