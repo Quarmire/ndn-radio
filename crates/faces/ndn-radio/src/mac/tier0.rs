@@ -210,10 +210,15 @@ pub fn positions_m(key: &[u8; 16], prefix: &[u8], m_blur: u32) -> [u16; K as usi
 /// sender would, so a commodity base-only receiver reads a valid (coarser) filter from it.
 pub const WIFI_BASE_BLUR: u32 = M_BITS; // 126
 /// **Additive** Blur bits on the **wide** profile — a SECOND, independent projection carried in
-/// `addr4` (48) + QoS Control (16), refining the base for wide-capable receivers. It is NOT a single
-/// `mod-190` Blur (that would change the base 126 bits and break coexistence): the base region is
-/// fixed, and these bits are layered on top. The Fingerprint rides HT Control, separately again.
-pub const WIFI_WIDE_EXTRA_BLUR: u32 = 48 + 16; // 64
+/// **`addr4` only (48 bits)**, refining the base for wide-capable receivers. It is NOT a single
+/// `mod-174` Blur (that would change the base 126 bits and break coexistence): the base region is
+/// fixed, these bits are layered on top, and the Fingerprint rides the (unused) HT Control.
+///
+/// ⚠ **QoS Control is deliberately NOT used** — the A-MSDU-present bit and TID live there, and A-MSDU
+/// aggregation ([`build_amsdu`]) is a used airtime lever. Repurposing QoS would clobber it. So the
+/// wide frame is a QoS-Data + `+HTC` 4-address frame that carries A-MSDU in QoS Control AND the filter
+/// in addr4/HTC — they coexist. Duration/ID (NAV, left 0) and SeqCtrl (LP reassembly) are untouched.
+pub const WIFI_WIDE_EXTRA_BLUR: u32 = 48; // addr4 only; QoS Control reserved for A-MSDU
 
 /// **Graduated / importance-weighted k.** Instead of a uniform [`K`] bits per prefix level, spend a
 /// per-level budget so low-entropy shared heads (`/ndn`) earn few bits — they discriminate almost
@@ -508,14 +513,16 @@ pub const WIDE_PROFILE_MARKER: u8 = 0x01;
 
 /// A wide-profile frame's filter fields, laid out to the pushed 802.11 header. A base-only receiver
 /// reads `addr1‖addr2‖addr3[0:4]` as the 126-bit base Blur (coexistence) and ignores the rest.
+///
+/// **QoS Control is intentionally absent here** — it belongs to the A-MSDU/QoS layer, not the filter
+/// (see [`WIFI_WIDE_EXTRA_BLUR`]). The builder sets QoS Control independently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WideFields {
     pub addr1: [u8; 6],
     pub addr2: [u8; 6],
     pub addr3: [u8; 6], // base[12:16] ‖ ID ‖ flags
-    pub addr4: [u8; 6],
-    pub qos: [u8; 2],
-    pub htc: [u8; 4], // fingerprint (24 bits) ‖ profile marker
+    pub addr4: [u8; 6], // extra Blur (48 bits)
+    pub htc: [u8; 4],   // fingerprint (24 bits) ‖ profile marker
 }
 
 /// The wide 802.11 profile: layered Blur + exclusive fingerprint + ephemeral ID + flags, and its
@@ -523,7 +530,7 @@ pub struct WideFields {
 /// frame builder emits these as a 4-address QoS+HTC data frame (that integration + on-air validation
 /// is chip-gated), and a commodity base-only receiver still reads the base from `addr1‖2‖3`.
 pub struct WideFrame {
-    pub blur: WideBlur<8>, // 16-byte base + 8 extra bytes (addr4 ‖ QoS)
+    pub blur: WideBlur<6>, // 16-byte base + 6 extra bytes (addr4)
     pub fingerprint: u32,  // FP_BITS
     pub id: u8,
     pub flags: u8,
@@ -532,7 +539,7 @@ pub struct WideFrame {
 impl WideFrame {
     /// Build the wide-profile filter for one name.
     pub fn of_name(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> Self {
-        let mut blur = WideBlur::<8>::new();
+        let mut blur = WideBlur::<6>::new();
         blur.insert_name(key, name);
         Self {
             blur,
@@ -542,10 +549,10 @@ impl WideFrame {
         }
     }
 
-    /// Pack into the pushed 802.11 header fields.
+    /// Pack into the pushed 802.11 header fields. QoS Control is left to the A-MSDU/QoS layer.
     pub fn to_fields(&self) -> WideFields {
         let base = self.blur.base().to_wire(); // 16 bytes, reserved bits fixed
-        let extra = self.blur.extra_bytes();
+        let extra = self.blur.extra_bytes(); // 6 bytes → addr4
         let mut f = WideFields::default();
         f.addr1.copy_from_slice(&base[0..6]);
         f.addr2.copy_from_slice(&base[6..12]);
@@ -553,7 +560,6 @@ impl WideFrame {
         f.addr3[4] = self.id;
         f.addr3[5] = self.flags;
         f.addr4.copy_from_slice(&extra[0..6]);
-        f.qos.copy_from_slice(&extra[6..8]);
         f.htc[0] = self.fingerprint as u8;
         f.htc[1] = (self.fingerprint >> 8) as u8;
         f.htc[2] = (self.fingerprint >> 16) as u8;
@@ -567,11 +573,8 @@ impl WideFrame {
         base[0..6].copy_from_slice(&f.addr1);
         base[6..12].copy_from_slice(&f.addr2);
         base[12..16].copy_from_slice(&f.addr3[0..4]);
-        let mut extra = [0u8; 8];
-        extra[0..6].copy_from_slice(&f.addr4);
-        extra[6..8].copy_from_slice(&f.qos);
         Self {
-            blur: WideBlur::<8>::from_parts(PrefixFilter::from_wire(base), extra),
+            blur: WideBlur::<6>::from_parts(PrefixFilter::from_wire(base), f.addr4),
             fingerprint: f.htc[0] as u32 | (f.htc[1] as u32) << 8 | (f.htc[2] as u32) << 16,
             id: f.addr3[4],
             flags: f.addr3[5],
@@ -639,7 +642,7 @@ mod tests {
         assert_eq!(back.fingerprint, wf.fingerprint);
         assert_eq!(back.fingerprint, name_fingerprint(&KEY, name));
         assert_eq!(back.id, 0x42);
-        assert!(back.blur.may_match(&WideBlur::<8>::mask_for(&KEY, b"/video")));
+        assert!(back.blur.may_match(&WideBlur::<6>::mask_for(&KEY, b"/video")));
 
         // Coexistence: a base-only (commodity) receiver reads addr1‖addr2‖addr3[0:4] and admits.
         let mut base = [0u8; 16];
@@ -656,7 +659,7 @@ mod tests {
     /// extra region strictly LOWERS false positives — the never-shrink wide profile.
     #[test]
     fn wide_blur_layers_base_plus_extra_coexists_and_lowers_fp() {
-        const E: usize = 8; // addr4 (6) + QoS (2)
+        const E: usize = 6; // addr4 only — QoS Control stays for A-MSDU
         let name = b"/video/ep7/v3/seg41".as_slice();
         let mut w = WideBlur::<E>::new();
         w.insert_name(&KEY, name);
