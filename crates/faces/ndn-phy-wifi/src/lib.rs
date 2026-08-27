@@ -477,16 +477,53 @@ impl Tier0Addresser {
     }
 }
 
+/// True if `anc` is a **component-boundary** prefix of `desc` (an ancestor in the name tree),
+/// including equality and the root `/`. `/a` is an ancestor of `/a/b` but NOT of `/ab`.
+pub fn is_component_ancestor(anc: &[u8], desc: &[u8]) -> bool {
+    if anc == b"/" {
+        return true; // the root covers everything
+    }
+    if anc.len() > desc.len() || desc[..anc.len()] != *anc {
+        return false;
+    }
+    // Boundary: exactly equal, or the next byte in `desc` starts a new component.
+    anc.len() == desc.len() || desc[anc.len()] == b'/'
+}
+
+/// **Coverage-dedup** — reduce a registered-prefix set to its *antichain*: drop any prefix that has
+/// a registered ancestor, keeping one of each exact-duplicate.
+///
+/// A frame under the deeper prefix is already admitted by the shorter one's mask, so the deeper mask
+/// is redundant *for admission*. This strictly reduces the receiver's mask count `E` — and therefore
+/// **both** the O(E) per-frame test and the decision false-positive rate `1 − (1 − p)^E` — with
+/// **zero false negatives**: dropping a covered prefix never removes a frame the ancestor does not
+/// also admit. The dominant win is PIT churn: an on-path Interest is under a FIB prefix you already
+/// registered, so its entry collapses to that prefix and adds no mask at all.
+pub fn coverage_antichain<'a>(prefixes: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    (0..prefixes.len())
+        .filter(|&i| {
+            let p = prefixes[i];
+            !prefixes.iter().enumerate().any(|(j, &q)| {
+                // Covered by a strictly-shorter ancestor, or by an earlier exact duplicate.
+                j != i && is_component_ancestor(q, p) && (q.len() < p.len() || j < i)
+            })
+        })
+        .map(|i| prefixes[i])
+        .collect()
+}
+
 /// Precompute one [`PrefixFilter::mask_for`] per registered `/`-string prefix — a receiver's
-/// [`RxFilter::Bloom`] mask set, reusable by the medium's RX reader.
+/// [`RxFilter::Bloom`] mask set, reusable by the medium's RX reader. The set is coverage-deduped
+/// ([`coverage_antichain`]) so a deep registration under a broader one costs no extra mask or FP.
 pub(crate) fn bloom_masks_for(
     key: &GroupKey,
     prefixes: &[impl AsRef<[u8]>],
 ) -> std::sync::Arc<[PrefixFilter]> {
     let k = bloom_key64(key);
-    prefixes
-        .iter()
-        .map(|p| PrefixFilter::mask_for(k, p.as_ref()))
+    let refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_ref()).collect();
+    coverage_antichain(&refs)
+        .into_iter()
+        .map(|p| PrefixFilter::mask_for(k, p))
         .collect()
 }
 
@@ -912,6 +949,50 @@ fn now_ms() -> u32 {
 #[cfg(test)]
 mod tests {
     use ndn_signals_core::LinkSignals;
+
+    /// **Coverage-dedup: strictly fewer masks, and never a false negative.** A registration deeper
+    /// than one already registered collapses to the ancestor, and a frame under it is still admitted.
+    #[test]
+    fn coverage_antichain_drops_covered_prefixes_without_false_negatives() {
+        let reg: Vec<&[u8]> = vec![
+            b"/video",
+            b"/video/ep1/v3/seg0", // covered by /video
+            b"/video/ep2",         // covered by /video
+            b"/ndn/edu",
+            b"/ndn/edu/cs",        // covered by /ndn/edu
+            b"/misc",              // unrelated — kept
+            b"/video",             // exact duplicate — one kept
+        ];
+        let anti = super::coverage_antichain(&reg);
+        assert_eq!(
+            anti,
+            vec![b"/video".as_slice(), b"/ndn/edu".as_slice(), b"/misc".as_slice()],
+            "antichain keeps only the shortest of each chain, one per duplicate"
+        );
+
+        // Zero false negatives: a frame under a dropped prefix is still admitted by its ancestor.
+        let k = super::bloom_key64(&super::OPEN_GROUP_KEY);
+        let masks: Vec<super::PrefixFilter> =
+            anti.iter().map(|p| super::PrefixFilter::mask_for(k, p)).collect();
+        for name in [
+            b"/video/ep1/v3/seg0".as_slice(),
+            b"/video/ep9/v2/seg7",
+            b"/ndn/edu/cs/lecture",
+            b"/misc/thing",
+        ] {
+            let mut f = super::PrefixFilter::new();
+            f.insert_name(k, name);
+            assert!(
+                masks.iter().any(|m| f.may_match(m)),
+                "deduped set must still admit {}",
+                std::str::from_utf8(name).unwrap()
+            );
+        }
+        // is_component_ancestor is a component-boundary test, not a byte prefix.
+        assert!(super::is_component_ancestor(b"/a", b"/a/b"));
+        assert!(!super::is_component_ancestor(b"/a", b"/ab"));
+        assert!(super::is_component_ancestor(b"/", b"/anything/deep"));
+    }
 
     /// **#92 integration — Tier-1 actually gates the RX path.**
     ///
