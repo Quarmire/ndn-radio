@@ -42,8 +42,12 @@ use crate::recode::{
 /// and a counter seeding coefficient choice.
 pub struct RecoderState {
     /// Runtime kill switch (doctrine §5 operator control). When `false`, the
-    /// face answers nothing and behaves as if no recoder were installed.
-    enabled: AtomicBool,
+    /// face answers nothing and behaves as if no recoder were installed. Held
+    /// behind an `Arc` so an alternative realization of the same recode name
+    /// (e.g. the compute-framed `NcComputeHandler`) can share the SAME switch —
+    /// flipping it must stop every path, not just this face (see
+    /// [`kill_switch`](Self::kill_switch)).
+    enabled: Arc<AtomicBool>,
     counter: AtomicU64,
     /// Buffers keyed by generation name (`<object>/_gen/<id>`).
     generations: Mutex<HashMap<Name, GenerationBuffer>>,
@@ -58,7 +62,7 @@ impl Default for RecoderState {
 impl RecoderState {
     pub fn new() -> Self {
         Self {
-            enabled: AtomicBool::new(true),
+            enabled: Arc::new(AtomicBool::new(true)),
             counter: AtomicU64::new(0x9E37_79B9),
             generations: Mutex::new(HashMap::new()),
         }
@@ -71,6 +75,14 @@ impl RecoderState {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// A shareable handle to this recoder's kill switch. Wire it into any other
+    /// realization of the same recode name (e.g. the compute-framed
+    /// `NcComputeHandler`) so a single `set_enabled(false)` stops them all —
+    /// otherwise the compute path is a bypass of the operator's §5 control.
+    pub fn kill_switch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.enabled)
     }
 
     /// Install an (empty) buffer for a generation under its descriptor.
