@@ -12,6 +12,7 @@ license.workspace = true
 classification = "extension"
 
 [dependencies]
+ndn-radio = { path = "../ndn-radio" }
 ndn-frame-io = { workspace = true }
 ndn-packet   = { workspace = true }
 ndn-tlv      = { workspace = true }

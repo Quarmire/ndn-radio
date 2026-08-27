@@ -19,6 +19,8 @@
 //! - **Coex lives below** — phys that share one radio front-end time-share it via the demand-driven split
 //!   on the shared mux (`ndn_radio_drivers::SerialRadioBackend`); the face never sees it.
 
+pub mod mac;
+
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};

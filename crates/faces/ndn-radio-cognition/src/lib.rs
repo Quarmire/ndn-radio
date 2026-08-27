@@ -46,12 +46,10 @@
 //! `LinkServiceFeature` seam, **not** here, so the logic stays unit-testable and
 //! face-agnostic.
 
+pub use ndn_radio::mac::{coop, dos, ephemeral_id};
 mod calibrate;
 mod contextual;
-pub mod coop;
 mod demand;
-pub mod dos;
-pub mod ephemeral_id;
 pub mod gcs;
 pub mod name;
 mod plan;

@@ -1947,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "ndn-frame-io",
  "ndn-packet",
+ "ndn-radio",
  "ndn-radio-drivers",
  "ndn-radio-hal",
  "ndn-signals-core",
