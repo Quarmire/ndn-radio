@@ -398,6 +398,106 @@ impl PrefixFilter {
 
 }
 
+/// Domain separator for the wide profile's extra-region projection — independent of the base hashes.
+const EXTRA_DOMAIN: [u8; 16] = *b"ndn/tier0-xtra!\0";
+
+/// A **layered, variable-width** Blur: the 16-byte [`PrefixFilter`] base (the 126-bit coexistence
+/// floor, byte-identical on the wire to a base-only frame) PLUS `EXTRA` bytes of additive refinement
+/// carried in the pushed 802.11 fields (`addr4` + QoS Control). A base-only receiver reads just the
+/// base — a valid, coarser filter; a wide receiver tests both regions, for lower FP.
+///
+/// It is deliberately NOT a single `mod-(126+extra)` Blur (that would change the base bits and break
+/// base-receiver nesting): the base is inserted with exactly [`PrefixFilter::insert_name`], and the
+/// extra region is an independent second projection layered on top. `EXTRA` bounds the buffer for
+/// no_std/firmware (`addr4` 6 + QoS 2 = 8 bytes → 64 extra bits).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WideBlur<const EXTRA: usize> {
+    base: PrefixFilter,
+    extra: [u8; EXTRA],
+}
+
+impl<const EXTRA: usize> Default for WideBlur<EXTRA> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const EXTRA: usize> WideBlur<EXTRA> {
+    /// Usable extra bits (`EXTRA` bytes).
+    pub const M_EXTRA: u32 = (EXTRA * 8) as u32;
+
+    pub const fn new() -> Self {
+        Self {
+            base: PrefixFilter::new(),
+            extra: [0; EXTRA],
+        }
+    }
+
+    fn set_extra(&mut self, pos: u16) {
+        self.extra[pos as usize / 8] |= 1 << (pos % 8);
+    }
+
+    /// Extra-region positions for one prefix — an independent keyed projection into the extra bits.
+    fn extra_positions(key: &[u8; 16], prefix: &[u8]) -> [u16; K as usize] {
+        let mut xkey = *key;
+        for (b, d) in xkey.iter_mut().zip(EXTRA_DOMAIN.iter()) {
+            *b ^= *d;
+        }
+        positions_m(&xkey, prefix, Self::M_EXTRA)
+    }
+
+    /// Insert every prefix: the base region exactly as [`PrefixFilter`] (coexistence-exact), and — on
+    /// a wide profile — the additive extra region.
+    pub fn insert_name(&mut self, key: &[u8; 16], name: &[u8]) {
+        self.base.insert_name(key, name);
+        if EXTRA > 0 {
+            let mut tmp = self.extra;
+            for_each_prefix(name, |pfx| {
+                for &p in Self::extra_positions(key, pfx).iter() {
+                    tmp[p as usize / 8] |= 1 << (p % 8);
+                }
+            });
+            self.extra = tmp;
+        }
+    }
+
+    /// The mask a receiver precomputes per registered prefix (base + extra).
+    pub fn mask_for(key: &[u8; 16], prefix: &[u8]) -> Self {
+        let mut m = Self::new();
+        m.base = PrefixFilter::mask_for(key, prefix);
+        if EXTRA > 0 {
+            let prefix = &prefix[..clamp_prefix(prefix)];
+            for &p in Self::extra_positions(key, prefix).iter() {
+                m.set_extra(p);
+            }
+        }
+        m
+    }
+
+    /// Could this frame be under `mask`'s prefix — testing BOTH regions (lower FP than the base alone).
+    pub fn may_match(&self, mask: &Self) -> bool {
+        if !self.base.may_match(&mask.base) {
+            return false;
+        }
+        for i in 0..EXTRA {
+            if self.extra[i] & mask.extra[i] != mask.extra[i] {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The 126-bit base — the coexistence floor a base-only (commodity) receiver reads.
+    pub fn base(&self) -> &PrefixFilter {
+        &self.base
+    }
+
+    /// The extra-region wire bytes (go into `addr4 ‖ QoS Control` on the wide profile).
+    pub fn extra_bytes(&self) -> &[u8; EXTRA] {
+        &self.extra
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +537,46 @@ mod tests {
         assert_eq!(n2, 2, "a smaller k yields fewer positions");
         let (_, n3) = positions_k(&KEY, pfx, M_BITS, 0); // clamped to ≥1
         assert_eq!(n3, 1);
+    }
+
+    /// The layered wide Blur: base region byte-identical to a base-only frame (coexistence), and the
+    /// extra region strictly LOWERS false positives — the never-shrink wide profile.
+    #[test]
+    fn wide_blur_layers_base_plus_extra_coexists_and_lowers_fp() {
+        const E: usize = 8; // addr4 (6) + QoS (2)
+        let name = b"/video/ep7/v3/seg41".as_slice();
+        let mut w = WideBlur::<E>::new();
+        w.insert_name(&KEY, name);
+
+        // Coexistence: the wide frame's base region equals a base-only frame's, byte for byte.
+        let mut b = PrefixFilter::new();
+        b.insert_name(&KEY, name);
+        assert_eq!(w.base(), &b, "wide base region is byte-identical to a base-only frame");
+
+        // A base-only receiver admits it under /video; a wide receiver does too (zero FN).
+        assert!(w.base().may_match(&PrefixFilter::mask_for(&KEY, b"/video")));
+        assert!(w.may_match(&WideBlur::<E>::mask_for(&KEY, b"/video")));
+        assert!(!w.may_match(&WideBlur::<E>::mask_for(&KEY, b"/audio")));
+
+        // The extra region can only REDUCE false positives (an extra AND-constraint), never add FN.
+        let base_mask = PrefixFilter::mask_for(&KEY, b"/ndn/edu");
+        let wide_mask = WideBlur::<E>::mask_for(&KEY, b"/ndn/edu");
+        let (mut fp_base, mut fp_wide) = (0u32, 0u32);
+        for i in 0..20_000u32 {
+            let irrel = format!("/svc{}/ep{}/seg{}", i % 5000, i % 64, i);
+            let mut f = WideBlur::<E>::new();
+            f.insert_name(&KEY, irrel.as_bytes());
+            if f.base().may_match(&base_mask) {
+                fp_base += 1;
+            }
+            if f.may_match(&wide_mask) {
+                fp_wide += 1;
+            }
+        }
+        assert!(
+            fp_wide < fp_base,
+            "the extra region must reduce FP: wide {fp_wide} vs base {fp_base}"
+        );
     }
 
     /// The exact-match Fingerprint is a SEPARATE `FP_BITS`-wide value (not carved from the Blur):
