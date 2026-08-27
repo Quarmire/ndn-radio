@@ -119,6 +119,28 @@ impl SlotSchedule {
         self.reserved_stride >= 2 && slot_idx.is_multiple_of(self.reserved_stride)
     }
 
+    /// **The bounded access latency a latency-class name is guaranteed**, microseconds — the worst
+    /// case wait for the next reserved lane.
+    ///
+    /// This is the number the reserved-lane mechanism exists to provide, so it should be derivable
+    /// rather than folklore: lanes sit every `reserved_stride` slots and are disjoint from bulk
+    /// (a bulk lease never squats one — see `lease_deadline_us`), so a latency name waits at most
+    /// `stride * slot_us` regardless of how loaded the bulk classes are. That independence from
+    /// offered load is what makes it a *bound* and not an average.
+    ///
+    /// `None` when no lanes are reserved (`stride < 2`), which is the default — there is then no
+    /// guarantee to report, only the unbounded-by-load `slots * slot_us` access period.
+    pub fn urgent_access_bound_us(&self) -> Option<u64> {
+        (self.reserved_stride >= 2).then(|| self.reserved_stride * self.slot_us)
+    }
+
+    /// The per-name access period for ordinary (bulk) traffic, microseconds: `slots * slot_us`.
+    /// Unlike [`urgent_access_bound_us`](Self::urgent_access_bound_us) this is a *period*, not a
+    /// guarantee — a bulk name can still be deferred by claim/CCLF contention within its turn.
+    pub fn bulk_access_period_us(&self) -> u64 {
+        self.slots * self.slot_us
+    }
+
     /// How many slots per superframe are reserved lanes.
     pub fn reserved_slots(&self) -> u64 {
         if self.reserved_stride < 2 {

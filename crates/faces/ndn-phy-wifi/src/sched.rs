@@ -3201,4 +3201,53 @@ mod tests {
         );
     }
 
+
+    /// **Can we hit <10 ms access, and where?** Pins the geometry that answers it, so the tradeoff
+    /// is a fact in the test suite rather than a claim in a commit message.
+    ///
+    /// `slot = airtime + clock_guard + actuation_guard`; bulk access period = `slots * slot`;
+    /// the latency-class GUARANTEE = `stride * slot` (reserved lanes are disjoint from bulk, so the
+    /// bound holds regardless of bulk load).
+    #[test]
+    fn urgent_access_bound_and_where_sub_10ms_is_reachable() {
+        use ndn_radio_hal::TxDiscipline as T;
+        let geom = |mtu: usize, clock: ClockSource, d: T, n: u64, stride: u64| {
+            let g = clock.guard_us() + actuation_guard_us(d);
+            let s = SlotSchedule::from_airtime(mtu_airtime_us(mtu), g, n)
+                .with_reserved_stride(stride);
+            (s.slot_us(), s.bulk_access_period_us() / 1000, s.urgent_access_bound_us().map(|u| u / 1000))
+        };
+
+        // The RTL8733BU as measured: PromptBounded{4 ms}. Actuation dominates, so the slot floor is
+        // ~5 ms and even stride-2 lanes cannot get urgent traffic under 10 ms.
+        let (slot_wifi, bulk_wifi, urgent_wifi) =
+            geom(1500, ClockSource::Hardware, T::PromptBounded { max_delay_ns: 4_000_000 }, 8, 2);
+        assert!(slot_wifi >= 4_900, "8733b slot is actuation-bound: {slot_wifi} us");
+        assert!(urgent_wifi.unwrap() >= 9, "stride-2 on this bearer is ~10 ms: {urgent_wifi:?}");
+
+        // A hardware-scheduled bearer (the ESP32-C5 class) at the same MTU: the actuation term
+        // collapses and BOTH numbers drop under 10 ms.
+        let (_, bulk_sched, urgent_sched) =
+            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 2);
+        assert!(bulk_sched < 10, "scheduled bearer gets bulk under 10 ms: {bulk_sched} ms");
+        assert!(urgent_sched.unwrap() <= 2, "and urgent to ~2 ms: {urgent_sched:?} ms");
+
+        // Shrinking the frame the slot is sized for compounds it — the airtime term is the only
+        // other lever once actuation is gone.
+        let (_, bulk_small, urgent_small) =
+            geom(300, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 2);
+        assert!(bulk_small <= 3, "small-MTU scheduled: bulk {bulk_small} ms");
+
+        // No lanes reserved => no guarantee to report, only a load-dependent period.
+        let (_, _, none) =
+            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 0);
+        assert!(none.is_none(), "stride 0 must report no guarantee");
+
+        println!(
+            "8733b(4ms): slot {slot_wifi}us bulk {bulk_wifi}ms urgent {urgent_wifi:?}ms | \
+             scheduled: bulk {bulk_sched}ms urgent {urgent_sched:?}ms | \
+             scheduled+300B: bulk {bulk_small}ms urgent {urgent_small:?}ms"
+        );
+    }
+
 }
