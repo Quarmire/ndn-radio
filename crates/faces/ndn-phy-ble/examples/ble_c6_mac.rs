@@ -34,34 +34,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c6: Arc<dyn AdvBackend> = Arc::new(SharedBleBackend::new(wifi.shared_mux()));
 
     // The Mac's own Bluetooth as the receiver (RX): CoreBluetooth scan for ND manufacturer adverts.
-    let mac = MacBleBackend::open().await?;
+    let mac = Arc::new(MacBleBackend::open().await?);
 
-    println!("C6 (serial {port}) advertises → the Mac's Bluetooth scans. {rounds} rounds.");
+    // Drain ALL scanned adverts in the background into a set. Decoupling reception from the send loop is
+    // the honest way to measure: CoreBluetooth batches/delays advert callbacks, so a tight per-round
+    // window under-counts (a late-delivered advert looks like the "wrong round" and gets discarded).
+    let received: Arc<tokio::sync::Mutex<std::collections::HashSet<Vec<u8>>>> = Arc::default();
+    {
+        let (mac, received) = (mac.clone(), received.clone());
+        tokio::spawn(async move {
+            while let Ok(sf) = mac.next_scanned().await {
+                received.lock().await.insert(sf.frame.to_vec());
+            }
+        });
+    }
+
+    let reps: u32 = std::env::var("NDR_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    println!("C6 (serial {port}) advertises → the Mac's Bluetooth scans. {rounds} names × {reps} reps.");
     tokio::time::sleep(Duration::from_millis(1500)).await; // NimBLE ext-adv + CoreBluetooth spin-up
 
-    let mut received = 0u32;
+    // Each Data is re-advertised `reps` times — the firmware burst is only ~90 ms, so a single broadcast
+    // easily falls between CoreBluetooth scan windows. A real producer keeps a Data advertised until it is
+    // fetched or expires; this mimics that briefly.
     for r in 0..rounds {
-        let payload = format!("C6-BLE->MAC #{r}");
-        c6.broadcast(Bytes::from(payload.clone().into_bytes()))
-            .await?;
-
-        // Wait up to 600 ms for the Mac to surface THIS advert (older adverts in the queue are skipped;
-        // the controller dedups the 3-event burst so we see each payload once).
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
-        while let Ok(Ok(sf)) = tokio::time::timeout_at(deadline, mac.next_scanned()).await {
-            if sf.frame.as_ref() == payload.as_bytes() {
-                received += 1;
-                println!(
-                    "  #{r}: Mac heard {payload:?}  (link-id {:02x?})",
-                    sf.addr.unwrap_or_default()
-                );
-                break;
-            }
+        let payload = format!("C6-BLE->MAC #{r}").into_bytes();
+        for _ in 0..reps {
+            c6.broadcast(Bytes::from(payload.clone())).await.ok();
+            tokio::time::sleep(Duration::from_millis(60)).await;
         }
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
+    tokio::time::sleep(Duration::from_millis(1500)).await; // let the last adverts drain
 
-    println!("\n  Mac Bluetooth received {received}/{rounds} named adverts from the C6 BLE PHY.");
+    let got = received.lock().await;
+    let hits = (0..rounds).filter(|r| got.contains(format!("C6-BLE->MAC #{r}").as_bytes())).count();
+    println!("\n  Mac Bluetooth received {hits}/{rounds} distinct named Data from the C6 BLE PHY.");
     println!("  → C6 (NimBLE) TX ↔ Mac (CoreBluetooth) RX: named data over BLE across two stacks.");
-    std::process::exit(if received > 0 { 0 } else { 1 });
+    std::process::exit(if hits > 0 { 0 } else { 1 });
 }
