@@ -25,6 +25,7 @@
 //! genuine hop (a consumer's own Interest, or an Interest reaching a local producer) always forwards.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -180,6 +181,21 @@ impl CountingBloom {
     }
 }
 
+/// Hands out a distinct ordinal to each `SoftPrefixReachStrategy::new`, so instances built in one
+/// process (the sim, where every node lives in the same address space) get INDEPENDENT xorshift
+/// streams. Construction order is deterministic, so the ordinals — and thus the runs — are reproducible.
+static NEXT_INSTANCE: AtomicU32 = AtomicU32::new(0);
+
+/// Fold an arbitrary 64-bit identity into a non-zero xorshift32 seed (splitmix64 finalizer, xored down
+/// to 32 bits). Non-zero is mandatory: xorshift32 seeded 0 is a fixed point that only ever yields 0.
+fn xorshift_seed(mix: u64) -> u32 {
+    let mut z = mix.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z as u32) ^ ((z >> 32) as u32)) | 1
+}
+
 /// The strategy: a decaying name-prefix reachability prior driving one of four axis variants.
 pub struct SoftPrefixReachStrategy {
     name: Name,
@@ -192,7 +208,20 @@ pub struct SoftPrefixReachStrategy {
 }
 
 impl SoftPrefixReachStrategy {
+    /// Construct with an independent RNG stream. Instances get distinct streams from a process ordinal
+    /// (`NEXT_INSTANCE`) so many nodes in one process do not draw identically — the old shared constant
+    /// `0x2545_F491` gave every node the same xorshift stream, so nodes that received one Interest at the
+    /// same instant computed the SAME `defer_delay` and fired *simultaneously* instead of staggering,
+    /// defeating the tie-break/overhear-cancel the defer variants rely on. Callers that have a real node
+    /// identity should prefer [`with_seed`](Self::with_seed) so the stream is tied to the node, not to
+    /// construction order.
     pub fn new(mode: Mode) -> Self {
+        let ordinal = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed) as u64;
+        Self::with_seed(mode, 0x2545_F491 ^ ordinal)
+    }
+
+    /// Construct with an explicit RNG seed (fold in a node/face id for a per-node-reproducible stream).
+    pub fn with_seed(mode: Mode, seed: u64) -> Self {
         let leaf: &'static [u8] = match mode {
             Mode::Probabilistic => b"soft-prefix-reach",
             Mode::Defer => b"soft-prefix-reach-defer",
@@ -211,7 +240,7 @@ impl SoftPrefixReachStrategy {
             prior: Mutex::new(HashMap::new()),
             bandit: Mutex::new(HashMap::new()),
             bloom: Mutex::new(CountingBloom::new(params.bloom_cells)),
-            rng: Mutex::new(0x2545_F491),
+            rng: Mutex::new(xorshift_seed(seed)),
             params,
         }
     }
@@ -294,7 +323,9 @@ impl SoftPrefixReachStrategy {
         Duration::from_micros((ms * 1000.0) as u64)
     }
 
-    /// Count a re-broadcast attempt (bandit β) — decayed evidence the node forwarded for this prefix.
+    /// Count a re-broadcast attempt as a **provisional failed trial** (bandit β += 1): we forwarded but
+    /// have not yet seen the Data return. If the Data does come back, [`note_success`](Self::note_success)
+    /// converts this trial into a success; if it never does, the failure stands (and decays).
     fn note_attempt(&self, key: u64, now_ms: u64) {
         if self.mode == Mode::Bandit {
             let mut map = self.bandit.lock().unwrap();
@@ -308,6 +339,24 @@ impl SoftPrefixReachStrategy {
             b.alpha *= f;
             b.last_ms = now_ms;
         }
+    }
+
+    /// Data returned for `key` → convert the provisional failed trial `note_attempt` logged into a
+    /// success: α gains a trial, β loses the one the matching attempt added. This keeps the posterior a
+    /// genuine Beta(successes, failures). The old update only *added* to α while β kept every attempt
+    /// (β = attempts, not failures), so a fully reliable path converged to α ≈ β ⇒ posterior mean → 0.5
+    /// — the "confident node exploits with a high reach" half of the design was unreachable.
+    fn note_success(&self, key: u64, now_ms: u64) {
+        let mut map = self.bandit.lock().unwrap();
+        let b = map.entry(key).or_insert(Beta {
+            alpha: 0.0,
+            beta: 0.0,
+            last_ms: now_ms,
+        });
+        let f = (-(now_ms.saturating_sub(b.last_ms) as f64) / self.params.tau_ms).exp();
+        b.alpha = b.alpha * f + 1.0; // one successful trial
+        b.beta = (b.beta * f - 1.0).max(0.0); // remove the provisional failure this trial logged
+        b.last_ms = now_ms;
     }
 }
 
@@ -382,18 +431,7 @@ impl Strategy for SoftPrefixReachStrategy {
                 b.decay_to(now, p.tau_ms);
                 b.insert(key, p.reinforce, p.w_max);
             }
-            Mode::Bandit => {
-                let mut map = self.bandit.lock().unwrap();
-                let b = map.entry(key).or_insert(Beta {
-                    alpha: 0.0,
-                    beta: 0.0,
-                    last_ms: now,
-                });
-                let f = (-(now.saturating_sub(b.last_ms) as f64) / p.tau_ms).exp();
-                b.alpha = b.alpha * f + p.reinforce; // a success
-                b.beta *= f;
-                b.last_ms = now;
-            }
+            Mode::Bandit => self.note_success(key, now),
         }
         SmallVec::new()
     }
@@ -402,4 +440,60 @@ impl Strategy for SoftPrefixReachStrategy {
 /// `Bytes` from a static slice — small helper so the strategy name can be a const-ish literal.
 fn bytes_static(b: &'static [u8]) -> bytes::Bytes {
     bytes::Bytes::from_static(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two instances constructed in the same process must draw INDEPENDENT streams — the sim runs every
+    /// node in one address space, and the old shared seed made them draw identically (correlated
+    /// defer/tie-break → synchronized flood). `new` gives each a distinct process ordinal.
+    #[test]
+    fn instances_have_independent_rng_streams() {
+        let a = SoftPrefixReachStrategy::new(Mode::Defer);
+        let b = SoftPrefixReachStrategy::new(Mode::Defer);
+        let sa: Vec<u64> = (0..8).map(|_| a.draw().to_bits()).collect();
+        let sb: Vec<u64> = (0..8).map(|_| b.draw().to_bits()).collect();
+        assert_ne!(sa, sb, "two instances must not share an identical draw stream");
+    }
+
+    /// …but the stream stays reproducible given an explicit identity, so a scenario is repeatable.
+    #[test]
+    fn with_seed_is_reproducible() {
+        let a = SoftPrefixReachStrategy::with_seed(Mode::Defer, 0x1234_5678);
+        let b = SoftPrefixReachStrategy::with_seed(Mode::Defer, 0x1234_5678);
+        let sa: Vec<u64> = (0..8).map(|_| a.draw().to_bits()).collect();
+        let sb: Vec<u64> = (0..8).map(|_| b.draw().to_bits()).collect();
+        assert_eq!(sa, sb, "same seed ⇒ identical stream");
+    }
+
+    /// A consistently reliable path (every forward returns Data) must earn a reach WELL above 0.5 so
+    /// the confident node fires first and exploits. The old β=attempts bug pinned it at ~0.5 forever.
+    #[test]
+    fn reliable_path_earns_high_reach_not_stuck_at_half() {
+        let s = SoftPrefixReachStrategy::with_seed(Mode::Bandit, 1);
+        let key = 0xABCD;
+        for _ in 0..20 {
+            s.note_attempt(key, 0);
+            s.note_success(key, 0);
+        }
+        let avg: f64 = (0..2000).map(|_| s.reach_norm(key, 0)).sum::<f64>() / 2000.0;
+        assert!(
+            avg > 0.7,
+            "a consistently reliable path must earn reach well above 0.5, got {avg:.3}"
+        );
+
+        // Contrast: forwards that never see a Data return stay low — the posterior can distinguish them.
+        let s2 = SoftPrefixReachStrategy::with_seed(Mode::Bandit, 2);
+        let k2 = 0x1234;
+        for _ in 0..20 {
+            s2.note_attempt(k2, 0);
+        }
+        let avg2: f64 = (0..2000).map(|_| s2.reach_norm(k2, 0)).sum::<f64>() / 2000.0;
+        assert!(
+            avg2 < 0.3,
+            "a path that never returns Data must stay low, got {avg2:.3}"
+        );
+    }
 }
