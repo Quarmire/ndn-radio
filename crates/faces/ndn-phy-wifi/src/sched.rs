@@ -69,6 +69,40 @@ enum ClockSource {
     CommonView,
 }
 
+/// **The slot guard band the TRANSMITTER earns**, microseconds — the second, independent error term
+/// the guard has to cover, alongside [`ClockSource::guard_us`].
+///
+/// Agreeing on when a slot starts and being able to *transmit* at that instant are different
+/// problems, and until now only the first was priced in. A guard sized purely from the clock says a
+/// hardware-TSF node earns 10 µs slots; but if that node's transmitter only promises
+/// `PromptBounded{1 ms}`, its frames land up to 1 ms into a slot sized for 10 µs of error — i.e.
+/// in a neighbour's turn. The guard must cover `clock error + actuation error`.
+///
+/// ⚠ MEASURED on the RTL8733BU (2026-08-27): the declared `PromptBounded{1 ms}` is the *typical*
+/// case — release jitter is ~250 µs IQR, but the tails reach ±20 ms under host scheduling, even at
+/// SCHED_FIFO on a pinned core. A bearer whose bound is not honest will place frames outside their
+/// slot no matter what this function returns; the fix there is the bearer's declaration, not a
+/// bigger guard here.
+///
+/// Uniform by construction, like the clock term: it is derived from the bearer's *declared*
+/// discipline, never from a live measurement, because every node must compute the same slot map.
+/// Nodes whose bearers differ produce a different `slot_us` and therefore a different
+/// [`SchedParams`] digest, so the existing D2 pin **detects** the mismatch instead of letting two
+/// nodes silently run different maps.
+pub fn actuation_guard_us(d: ndn_radio_hal::TxDiscipline) -> u64 {
+    use ndn_radio_hal::TxDiscipline as T;
+    match d {
+        // The hardware places the frame; only its own granularity is uncovered.
+        T::ScheduledAt { granularity_ns } => granularity_ns.div_ceil(1_000),
+        // Software decides, the host delivers it "soon" — the whole bound is guard.
+        T::PromptBounded { max_delay_ns } => max_delay_ns.div_ceil(1_000),
+        // No timing promise at all: CSMA backoff is unbounded, so no finite guard makes a slot
+        // safe. 1 ms matches the wall-clock term — enough to keep a coarse schedule usable while
+        // being honest that this bearer is not slot-tight.
+        T::BestEffort => 1_000,
+    }
+}
+
 impl ClockSource {
     /// **The slot guard band this clock earns**, microseconds — how far apart two nodes' idea of a
     /// slot boundary can drift, plus margin.
@@ -606,9 +640,18 @@ impl FaceScheduler {
             Some("cv") | Some("common-view") => ClockSource::CommonView,
             _ => ClockSource::Wall,
         };
+        // The transmitter's own contribution to the guard (#85/#86 sized the clock's half only).
+        // `None` here means there is NO bearer attached (a simulation / lab harness that models its
+        // own timing), not "a bearer whose discipline we failed to read" — so it contributes no
+        // actuation error. A real backend that never overrides `tx_discipline` still reports
+        // `BestEffort` through the trait default and is charged the full term below.
+        let actuation_us = knobs
+            .as_ref()
+            .map(|k| actuation_guard_us(k.tx_discipline()))
+            .unwrap_or(0);
         let slot = std::env::var("NDN_SCHED_SLOT")
             .ok()
-            .and_then(|s| parse_slot(&s, mtu, clock_source));
+            .and_then(|s| parse_slot(&s, mtu, clock_source, actuation_us));
         let hop = std::env::var("NDN_SCHED_HOP")
             .ok()
             .and_then(|s| parse_hop(&s));
@@ -1845,7 +1888,7 @@ fn name_components(name_tlv: &[u8], depth: usize) -> Vec<&[u8]> {
 /// were doing).
 ///
 /// `mtu` and `clock` are the sizing inputs; see [`derive_slot_us`].
-fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
+fn parse_slot(s: &str, mtu: usize, clock: ClockSource, actuation_us: u64) -> Option<SlotSchedule> {
     // **Reserved latency lanes** (#93), `NDN_SCHED_RESERVE=<stride>`; default 0 = none, which is the
     // schedule every on-air result was measured under.
     let stride: u64 = std::env::var("NDN_SCHED_RESERVE")
@@ -1860,9 +1903,11 @@ fn parse_slot(s: &str, mtu: usize, clock: ClockSource) -> Option<SlotSchedule> {
         }
         None => {
             let n: u64 = s.trim().parse().ok()?;
+            // The guard covers BOTH error sources: how far apart two nodes think the boundary is
+            // (clock), and how late our own frame can leave after we decide (actuation).
             Some(SlotSchedule::from_airtime(
                 mtu_airtime_us(mtu),
-                clock.guard_us(),
+                clock.guard_us() + actuation_us,
                 n,
             ))
         }
@@ -1933,7 +1978,7 @@ mod tests {
         // HW beacon it reads the peer's hardware timeline (the #74 µs path). Two nodes fed the SAME
         // peer beacon (same peer_tsf) land on the same epoch regardless of their own RX-stamp domain.
         let mk = || FaceScheduler {
-            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall, 0),
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
@@ -1981,7 +2026,7 @@ mod tests {
     #[test]
     fn cclf_jitter_is_deterministic_and_bounded() {
         let s = FaceScheduler {
-            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall, 0),
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
@@ -2069,7 +2114,7 @@ mod tests {
     fn beacon_round_trips_and_ignores_ndn() {
         // A built beacon parses back to a plausible reference; NDN first-bytes are not beacons.
         let sched = FaceScheduler {
-            slot: parse_slot("4:3000", 1500, ClockSource::Wall),
+            slot: parse_slot("4:3000", 1500, ClockSource::Wall, 0),
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
@@ -2122,8 +2167,8 @@ mod tests {
         // A full-MTU frame at the basic broadcast rate — medium-invariant, so every node agrees.
         let air = mtu_airtime_us(1500);
 
-        let wall = parse_slot("8", 1500, ClockSource::Wall).expect("derived");
-        let hw = parse_slot("8", 1500, ClockSource::Hardware).expect("derived");
+        let wall = parse_slot("8", 1500, ClockSource::Wall, 0).expect("derived");
+        let hw = parse_slot("8", 1500, ClockSource::Hardware, 0).expect("derived");
         assert_eq!(wall.slots(), 8);
         assert_eq!(wall.slot_us(), air + 1_000, "wall clock pays a 1 ms guard");
         assert_eq!(hw.slot_us(), air + 10, "the hardware TSF pays 10 µs");
@@ -2142,8 +2187,8 @@ mod tests {
         );
         // Small frames are where the clock really pays: guard, not airtime, is the whole slot.
         let (small_wall, small_hw) = (
-            parse_slot("8", 64, ClockSource::Wall).unwrap().slot_us(),
-            parse_slot("8", 64, ClockSource::Hardware)
+            parse_slot("8", 64, ClockSource::Wall, 0).unwrap().slot_us(),
+            parse_slot("8", 64, ClockSource::Hardware, 0)
                 .unwrap()
                 .slot_us(),
         );
@@ -2162,7 +2207,7 @@ mod tests {
         );
 
         // The explicit form still works — it is the debug-bisect escape hatch, not the default.
-        let explicit = parse_slot("8:20000", 1500, ClockSource::Hardware).expect("explicit");
+        let explicit = parse_slot("8:20000", 1500, ClockSource::Hardware, 0).expect("explicit");
         assert_eq!(
             explicit.slot_us(),
             20_000,
@@ -2239,13 +2284,13 @@ mod tests {
 
     #[test]
     fn config_parsers_round_trip() {
-        let s = parse_slot("8:3000", 1500, ClockSource::Wall).expect("slot");
+        let s = parse_slot("8:3000", 1500, ClockSource::Wall, 0).expect("slot");
         assert_eq!(s.owner_slot(0), 0);
         assert_eq!(s.superframe_us(), 8 * 3000);
         let h = parse_hop("1,6,11:120000").expect("hop");
         assert_eq!(h.classes(), &[1, 6, 11]);
         assert_eq!(h.dwell_remaining_us(0), 120000);
-        assert!(parse_slot("garbage", 1500, ClockSource::Wall).is_none());
+        assert!(parse_slot("garbage", 1500, ClockSource::Wall, 0).is_none());
         assert!(parse_hop(":100").is_none());
     }
 
@@ -2262,7 +2307,7 @@ mod tests {
     #[test]
     fn a_slot_is_only_claimable_with_evidence_its_owner_is_in_range() {
         let sched = FaceScheduler {
-            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall, 0),
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
@@ -2639,7 +2684,7 @@ mod tests {
     /// A claimable scheduler on an arbitrary `slots:slot_us` spec.
     fn mk_claim_sched_slots(spec: &str) -> FaceScheduler {
         let mut s = mk_claim_sched();
-        s.slot = parse_slot(spec, 1500, ClockSource::Wall);
+        s.slot = parse_slot(spec, 1500, ClockSource::Wall, 0);
         s
     }
 
@@ -2956,7 +3001,7 @@ mod tests {
     /// A claimable scheduler with an 8x3ms superframe — the shape the claim tests need.
     fn mk_claim_sched() -> FaceScheduler {
         FaceScheduler {
-            slot: parse_slot("8:3000", 1500, ClockSource::Wall),
+            slot: parse_slot("8:3000", 1500, ClockSource::Wall, 0),
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
@@ -3108,4 +3153,52 @@ mod tests {
             "winning one slot does not grant the next"
         );
     }
+
+    /// **What actually sets per-name access latency** — and it is not the clock.
+    ///
+    /// `slot_us = airtime + guard`, `access latency = slots x slot_us`. The guard has two
+    /// independent terms: how far apart two nodes think the boundary is (clock), and how late our
+    /// own frame leaves after we decide (actuation, #85/#86 priced only the first).
+    ///
+    /// The point this pins: on a bearer that only promises `PromptBounded{1 ms}`, the ACTUATION
+    /// term dominates the hardware clock's 10 us by 100x, so buying a better clock buys almost
+    /// nothing. A `ScheduledAt` bearer is what makes the tight schedule real.
+    #[test]
+    fn access_latency_is_set_by_actuation_not_the_clock() {
+        use ndn_radio_hal::TxDiscipline as T;
+        let air = mtu_airtime_us(1500);
+        let geom = |clock: ClockSource, d: T| {
+            let g = clock.guard_us() + actuation_guard_us(d);
+            let s = SlotSchedule::from_airtime(air, g, 8);
+            (g, s.slot_us(), 8 * s.slot_us() / 1000) // guard us, slot us, access latency ms
+        };
+
+        // Hardware TSF clock (10 us guard) with a 1 ms-bounded transmitter: actuation is 100x the
+        // clock term, so the clock upgrade is invisible in the schedule.
+        let (g_hw_prompt, _, lat_hw_prompt) = geom(ClockSource::Hardware, T::PromptBounded { max_delay_ns: 1_000_000 });
+        assert_eq!(g_hw_prompt, 10 + 1_000);
+
+        // Same clock, but a bearer that places TX in hardware to 10 us (the C5 class).
+        let (g_hw_sched, _, lat_hw_sched) = geom(ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 });
+        assert_eq!(g_hw_sched, 10 + 10);
+
+        // The scheduled bearer must give strictly lower access latency on the same clock.
+        assert!(
+            lat_hw_sched < lat_hw_prompt,
+            "scheduled TX must shorten the superframe: {lat_hw_sched} ms vs {lat_hw_prompt} ms"
+        );
+
+        // And upgrading ONLY the clock, while keeping the 1 ms transmitter, barely moves it —
+        // the measurement that says where to spend effort.
+        let (_, _, lat_wall_prompt) = geom(ClockSource::Wall, T::PromptBounded { max_delay_ns: 1_000_000 });
+        assert!(
+            lat_wall_prompt - lat_hw_prompt <= 8,
+            "clock upgrade under a 1 ms transmitter is marginal: {lat_wall_prompt} ms -> {lat_hw_prompt} ms"
+        );
+
+        println!(
+            "airtime {air} us | wall+prompt {lat_wall_prompt} ms | hw+prompt {lat_hw_prompt} ms | hw+scheduled {lat_hw_sched} ms"
+        );
+    }
+
 }
