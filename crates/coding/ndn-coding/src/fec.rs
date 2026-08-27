@@ -3,16 +3,20 @@
 //! ## Encoding
 //!
 //! Source segments are emitted unchanged (rows `0..K` of the
-//! encoding matrix are the K×K identity). Parity row `p` (for
-//! `p ∈ [0, N-K)`) carries Vandermonde coefficients
-//! `[v_p^0, v_p^1, …, v_p^(K-1)]` with `v_p = p + 1` evaluated in
-//! GF(2^8). Distinct nonzero `v_p` plus the Vandermonde structure
-//! guarantee any K of the N rows are linearly independent, which is
-//! exactly the MDS property we need: any K received segments
-//! decode the generation.
+//! encoding matrix are the K×K identity). The parity row for node
+//! `index ∈ [K, N)` carries **Cauchy** coefficients
+//! `C[j] = 1/(index ⊕ j)` over GF(2^8): the parity node's Cauchy
+//! X-coordinate is its absolute `index` (disjoint from the sources'
+//! Y-coordinates `0..K`, and `index ⊕ j ≠ 0` since `index ≥ K > j`).
+//! Every square submatrix of a Cauchy matrix is invertible, so the
+//! systematic generator `[I | C]` is genuinely **MDS**: ANY K of the
+//! N segments decode the generation, i.e. any ≤ N−K losses recover.
+//! (An exhaustive loss-pattern test in this file pins that — the
+//! previous plain-Vandermonde matrix was NOT MDS and silently lost
+//! data on some in-tolerance patterns, e.g. K=4, lose sources {0,1,3}.)
 //!
-//! Constraint: `N ≤ K + 255` because `v_p` must fit in a nonzero
-//! byte. `Encoder::new` enforces this via `n ≤ 255`.
+//! Constraint: `N ≤ 255` so every X/Y coordinate is a distinct GF(2^8)
+//! element. `Encoder::new` enforces this via `n ≤ 255`.
 //!
 //! ## Decoding
 //!
@@ -101,13 +105,12 @@ impl Encoder {
             });
         }
         let seg_len = self.seg_len.unwrap_or(0);
-        let v = (index - self.k + 1) as u8;
+        // Cauchy parity (MDS): this node's X-coordinate is its absolute `index` (disjoint from the
+        // sources' Y-coordinates 0..K), so out = Σ_j C[j]·source_j with C[j] = 1/(index ⊕ j).
+        let x = index as u8;
         let mut out = vec![0u8; seg_len];
-        // out = Σ_j v^j · source_j
-        let mut coeff = 1u8;
-        for source in &self.sources {
-            field::mul_add(&mut out, source, coeff);
-            coeff = field::mul(coeff, v);
+        for (j, source) in self.sources.iter().enumerate() {
+            field::mul_add(&mut out, source, field::inv(x ^ j as u8));
         }
         Ok(Bytes::from(out))
     }
@@ -191,11 +194,10 @@ impl Decoder {
         if index < self.k {
             coeffs[index as usize] = 1;
         } else {
-            let v = (index - self.k + 1) as u8;
-            let mut acc = 1u8;
-            for c in coeffs.iter_mut() {
-                *c = acc;
-                acc = field::mul(acc, v);
+            // Cauchy row for parity node `index` — must match Encoder::parity exactly.
+            let x = index as u8;
+            for (j, c) in coeffs.iter_mut().enumerate() {
+                *c = field::inv(x ^ j as u8);
             }
         }
         coeffs
@@ -282,9 +284,9 @@ mod tests {
     proptest! {
         /// Round-trips the systematic K-of-N FEC over random shapes: encode K
         /// sources into N coded segments (K systematic + parity), then absorb
-        /// all N in a random order and recover every source exactly. (The code
-        /// is systematic but not MDS, so recovery is asserted from the full N,
-        /// not from an arbitrary K-subset.)
+        /// all N in a random order and recover every source exactly. (The codec
+        /// is MDS — `cauchy_is_mds_every_k_subset_decodes` proves any K of the N
+        /// decode; this test additionally covers random shapes and absorb order.)
         #[test]
         fn fec_round_trips_over_random_shapes(
             k in 1u16..=16,
@@ -452,5 +454,52 @@ mod tests {
         let mut dec = Decoder::new(2, 4).unwrap();
         dec.absorb(0, Bytes::from_static(&[1, 2, 3])).unwrap();
         assert!(dec.absorb(1, Bytes::from_static(&[1, 2])).is_err());
+    }
+
+    #[test]
+    fn cauchy_is_mds_every_k_subset_decodes() {
+        // Exhaustive MDS check: for each shape, EVERY choice of K surviving segments (i.e. any
+        // ≤ N-K losses) must recover all K sources. The old plain-Vandermonde matrix failed this.
+        for (k, n) in [(2u16, 6u16), (3, 6), (4, 7), (5, 8)] {
+            let sources = source_segments(k, 24);
+            let mut enc = Encoder::new(k, n).unwrap();
+            for s in &sources {
+                enc.feed(s.clone()).unwrap();
+            }
+            let coded: Vec<Bytes> = (0..n)
+                .map(|i| if i < k { sources[i as usize].clone() } else { enc.parity(i).unwrap() })
+                .collect();
+            for mask in 0u32..(1u32 << n) {
+                if mask.count_ones() as u16 != k {
+                    continue;
+                }
+                let combo: Vec<u16> = (0..n).filter(|&i| mask & (1 << i) != 0).collect();
+                let mut dec = Decoder::new(k, n).unwrap();
+                for &i in &combo {
+                    dec.absorb(i, coded[i as usize].clone()).unwrap();
+                }
+                assert!(dec.is_complete(), "k={k} n={n} subset {combo:?}: not full rank (matrix not MDS)");
+                assert_eq!(dec.recover().unwrap(), sources, "k={k} n={n} subset {combo:?}: wrong recovery");
+            }
+        }
+    }
+
+    #[test]
+    fn regression_old_vandermonde_singular_pattern_recovers() {
+        // The exact in-tolerance pattern the red-team hand-computed as singular under the old
+        // Vandermonde matrix: K=4, N=7, lose sources {0,1,3}; survive source 2 + all three parity.
+        let (k, n) = (4u16, 7u16);
+        let sources = source_segments(k, 32);
+        let mut enc = Encoder::new(k, n).unwrap();
+        for s in &sources {
+            enc.feed(s.clone()).unwrap();
+        }
+        let mut dec = Decoder::new(k, n).unwrap();
+        for i in [2u16, 4, 5, 6] {
+            let seg = if i < k { sources[i as usize].clone() } else { enc.parity(i).unwrap() };
+            dec.absorb(i, seg).unwrap();
+        }
+        assert!(dec.is_complete());
+        assert_eq!(dec.recover().unwrap(), sources);
     }
 }
