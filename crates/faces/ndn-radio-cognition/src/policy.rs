@@ -328,9 +328,16 @@ impl RadioPolicy {
                 .total_cmp(&self.radio_score(a, ctx, broad))
         });
 
-        // Primary radio always; a second radio replicates (diversity) when the
-        // post-pooling deficit is high and a TX-capable alternative exists.
-        let replicate = deficit >= self.cfg.replicate_deficit && tx.len() >= 2;
+        // Primary radio always; a second radio replicates (diversity) when the post-pooling deficit is
+        // high and a TX-capable alternative exists. Replication SPENDS the second radio's airtime/duty
+        // budget, so it is gated on a REAL *measured* rank deficit — NOT on `deficit`'s receiver-count
+        // fallback (that fallback exists so the suppression gate above assumes work when nothing is
+        // measured; reusing it here made replicate fire on every multi-radio TX, `receivers >= 1`).
+        // Absent a diversity signal replication stays off; once a pooling producer feeds
+        // `observe_rank_deficit` it engages as designed (decided-but-unactuated until that producer exists).
+        let measured_deficit = demand.and_then(|d| d.rank_deficit.get());
+        let replicate =
+            measured_deficit.is_some_and(|md| md >= self.cfg.replicate_deficit) && tx.len() >= 2;
         let chosen = if replicate { 2 } else { 1 };
         why.broad = broad;
         why.replicate = replicate;
@@ -1193,6 +1200,32 @@ mod tests {
             p.allocations.len(),
             2,
             "should replicate across both radios"
+        );
+    }
+
+    /// Replication must be driven by a MEASURED rank deficit, not by the receiver-count fallback.
+    /// With two TX radios and a receiver but NO rank-deficit signal observed, the node must NOT
+    /// replicate — the old code read `deficit = receivers` and spent the second radio on every
+    /// transmission with a receiver. The moment a real deficit is observed, replication engages.
+    #[test]
+    fn unmeasured_deficit_does_not_replicate_but_a_measured_one_does() {
+        let mut m = hetero();
+        m.observe_rx(W, 0x11, Some(-70), 1_000); // a receiver ⇒ the old fallback deficit ≥ 1
+        // No observe_rank_deficit: the diversity signal is unmeasured.
+        let p = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
+        assert_eq!(
+            p.allocations.len(),
+            1,
+            "no measured rank deficit ⇒ one radio, not a wasted second-radio replicate"
+        );
+
+        // Contrast: feed a real deficit and the SAME setup replicates as designed.
+        m.observe_rank_deficit(0xAA, 2.0, 1_000);
+        let p2 = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
+        assert_eq!(
+            p2.allocations.len(),
+            2,
+            "a measured deficit engages the second radio"
         );
     }
 
