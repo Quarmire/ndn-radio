@@ -670,6 +670,22 @@ mod tests {
         assert_eq!(back.to_fields(), f);
     }
 
+    /// **Shared cross-implementation wide vector** — the SAME row pinned in the drivers repo's
+    /// `golden/tier0/vectors.txt` (`wide widev1`), reproduced by the LR2021 firmware and ath9k-htc C
+    /// ports. Uses the ASCII group key the golden file uses (`ndr/tier0-vec-01`), so this host, the
+    /// firmware, and the C port all agree byte-for-byte on one concrete (key, name) — the anti-drift
+    /// anchor for the wide profile.
+    #[test]
+    fn wide_profile_shared_vector_matches_the_ports() {
+        let key: [u8; 16] = *b"ndr/tier0-vec-01";
+        let f = WideFrame::of_name(&key, b"/ndn/test/v1", 0x37, 0x00).to_fields();
+        assert_eq!(f.addr1, [0x87, 0x00, 0x08, 0x00, 0xc1, 0x03]);
+        assert_eq!(f.addr2, [0x08, 0x82, 0x00, 0x40, 0x04, 0x00]);
+        assert_eq!(f.addr3, [0x80, 0x00, 0x00, 0x11, 0x37, 0x00]);
+        assert_eq!(f.addr4, [0x41, 0xa1, 0x42, 0x30, 0xd8, 0x80]);
+        assert_eq!(f.htc, [0x14, 0x86, 0xe9, 0x01], "fp=0xe98614 LE ‖ marker");
+    }
+
     /// The wide-profile wire mapping round-trips losslessly, and a base-only receiver still reads a
     /// valid base filter from addr1‖addr2‖addr3[0:4] (coexistence across hardware).
     #[test]
