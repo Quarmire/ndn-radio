@@ -37,11 +37,14 @@ pub struct NativeFrame {
 }
 
 /// A coded broadcast frame: the XOR of its members' payloads (zero-padded to
-/// the longest), plus the per-member `(id, native_length)` header a receiver
-/// needs to identify and trim the recovered native.
+/// the longest), plus the per-member `(id, next_hop, native_length)` header a
+/// receiver needs to identify, address-check, and trim the recovered native.
+/// The `next_hop` is the member's intended recipient — without it a bystander
+/// that overheard all-but-one member would recover and mis-deliver a native
+/// meant for someone else (COPE's decode gain must not become a mis-delivery).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodedFrame {
-    pub members: Vec<(FrameId, usize)>,
+    pub members: Vec<(FrameId, NeighborId, usize)>,
     pub payload: Bytes,
 }
 
@@ -129,7 +132,7 @@ impl CopeCoder {
         let mut members = Vec::with_capacity(frames.len());
         for f in &frames {
             xor_into(&mut payload, &f.payload);
-            members.push((f.id, f.payload.len()));
+            members.push((f.id, f.next_hop, f.payload.len()));
         }
         Some(CodedFrame {
             members,
@@ -141,27 +144,32 @@ impl CopeCoder {
 /// Decode a coded frame at a receiver that holds some of its members (the
 /// natives it overheard). Succeeds iff the receiver is missing **exactly
 /// one** member — it XORs the held members out and trims to the missing
-/// native's length, recovering `(missing_id, native_payload)`. `None` if it
-/// holds all members (nothing to recover) or misses more than one (cannot
-/// decode — COPE's "all but one" condition).
-pub fn decode(coded: &CodedFrame, held: &HashMap<FrameId, Bytes>) -> Option<(FrameId, Bytes)> {
-    let missing: Vec<&(FrameId, usize)> = coded
+/// native's length, recovering `(missing_id, missing_next_hop, native_payload)`.
+/// `None` if it holds all members (nothing to recover) or misses more than one
+/// (cannot decode — COPE's "all but one" condition). The returned `next_hop`
+/// lets the caller check whether the recovered native is addressed to it before
+/// delivering it up (a bystander keeps it only as side-info).
+pub fn decode(
+    coded: &CodedFrame,
+    held: &HashMap<FrameId, Bytes>,
+) -> Option<(FrameId, NeighborId, Bytes)> {
+    let missing: Vec<&(FrameId, NeighborId, usize)> = coded
         .members
         .iter()
-        .filter(|(id, _)| !held.contains_key(id))
+        .filter(|(id, _, _)| !held.contains_key(id))
         .collect();
     if missing.len() != 1 {
         return None;
     }
-    let (missing_id, missing_len) = *missing[0];
+    let (missing_id, missing_next_hop, missing_len) = *missing[0];
     let mut acc = coded.payload.to_vec();
-    for (id, _) in &coded.members {
+    for (id, _, _) in &coded.members {
         if let Some(p) = held.get(id) {
             xor_into(&mut acc, p);
         }
     }
     acc.truncate(missing_len);
-    Some((missing_id, Bytes::from(acc)))
+    Some((missing_id, missing_next_hop, Bytes::from(acc)))
 }
 
 /// `acc[i] ^= src[i]` for the overlap (acc is the longest, zero-padded).
@@ -199,13 +207,14 @@ pub fn encode_native(id: FrameId, payload: &[u8]) -> Bytes {
 }
 
 /// Frame a coded combination:
-/// `[TAG_CODED][count u16][ (id u64, len u32) * count ][xor payload]`.
+/// `[TAG_CODED][count u16][ (id u64, next_hop u64, len u32) * count ][xor payload]`.
 pub fn encode_coded(coded: &CodedFrame) -> Bytes {
-    let mut out = Vec::with_capacity(3 + coded.members.len() * 12 + coded.payload.len());
+    let mut out = Vec::with_capacity(3 + coded.members.len() * 20 + coded.payload.len());
     out.push(TAG_CODED);
     out.extend_from_slice(&(coded.members.len() as u16).to_be_bytes());
-    for (id, len) in &coded.members {
+    for (id, next_hop, len) in &coded.members {
         out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&next_hop.to_be_bytes());
         out.extend_from_slice(&(*len as u32).to_be_bytes());
     }
     out.extend_from_slice(&coded.payload);
@@ -264,13 +273,14 @@ pub fn decode_wire(bytes: &[u8]) -> Option<CopeWire> {
             let mut p = 2;
             let mut members = Vec::with_capacity(count);
             for _ in 0..count {
-                if rest.len() < p + 12 {
+                if rest.len() < p + 20 {
                     return None;
                 }
                 let id = u64::from_be_bytes(rest[p..p + 8].try_into().ok()?);
-                let len = u32::from_be_bytes(rest[p + 8..p + 12].try_into().ok()?) as usize;
-                members.push((id, len));
-                p += 12;
+                let next_hop = u64::from_be_bytes(rest[p + 8..p + 16].try_into().ok()?);
+                let len = u32::from_be_bytes(rest[p + 16..p + 20].try_into().ok()?) as usize;
+                members.push((id, next_hop, len));
+                p += 20;
             }
             Some(CopeWire::Coded(CodedFrame {
                 members,
@@ -314,12 +324,12 @@ mod tests {
         assert!(coded.is_coded(), "p1 and p2 coded together");
         assert_eq!(relay.pending_len(), 0);
 
-        // Alice holds p1 → recovers p2.
+        // Alice holds p1 → recovers p2 (which was addressed to Alice).
         let alice_held = HashMap::from([(1u64, p1.clone())]);
-        assert_eq!(decode(&coded, &alice_held), Some((2, p2.clone())));
-        // Bob holds p2 → recovers p1.
+        assert_eq!(decode(&coded, &alice_held), Some((2, ALICE, p2.clone())));
+        // Bob holds p2 → recovers p1 (addressed to Bob).
         let bob_held = HashMap::from([(2u64, p2.clone())]);
-        assert_eq!(decode(&coded, &bob_held), Some((1, p1.clone())));
+        assert_eq!(decode(&coded, &bob_held), Some((1, BOB, p1.clone())));
     }
 
     #[test]
@@ -333,7 +343,7 @@ mod tests {
             })
         );
         let coded = CodedFrame {
-            members: vec![(1, 4), (2, 6)],
+            members: vec![(1, ALICE, 4), (2, BOB, 6)],
             payload: Bytes::from_static(b"xxxxxx"),
         };
         let c = encode_coded(&coded);
@@ -404,9 +414,9 @@ mod tests {
         let coded = relay.encode_next().unwrap();
         assert_eq!(coded.members.len(), 3);
 
-        // Alice holds 2,3 → recovers 1.
+        // Alice holds 2,3 → recovers 1 (addressed to Alice).
         let alice = HashMap::from([(2u64, p2.clone()), (3u64, p3.clone())]);
-        assert_eq!(decode(&coded, &alice), Some((1, p1.clone())));
+        assert_eq!(decode(&coded, &alice), Some((1, ALICE, p1.clone())));
         // A node missing two members cannot decode.
         let missing_two = HashMap::from([(2u64, p2.clone())]);
         assert_eq!(decode(&coded, &missing_two), None);

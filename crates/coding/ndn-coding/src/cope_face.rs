@@ -100,7 +100,7 @@ impl<T: Transport> CopeBroadcastLink<T> {
                 self.inner.send_bytes(encode_coded(frame)).await?;
             } else {
                 // Single member → send the native uncoded (tagged with its id).
-                let (id, len) = frame.members[0];
+                let (id, _next_hop, len) = frame.members[0];
                 let payload = frame.payload.slice(..len.min(frame.payload.len()));
                 self.inner.send_bytes(encode_native(id, &payload)).await?;
             }
@@ -131,12 +131,19 @@ impl<T: Transport> CopeBroadcastLink<T> {
                 }
                 Some(CopeWire::Coded(coded)) => {
                     let snapshot: HashMap<FrameId, Bytes> = self.held.lock().await.clone();
-                    if let Some((id, native)) = decode(&coded, &snapshot) {
+                    if let Some((id, next_hop, native)) = decode(&coded, &snapshot) {
+                        // Recovered a native — always keep it as overheard side-info (it helps decode
+                        // future coded frames), but only DELIVER it up if it was addressed to us. A
+                        // bystander that overheard all-but-one member can decode a native meant for a
+                        // different next-hop; surfacing it would mis-deliver. This is what `me` is for.
                         self.held.lock().await.insert(id, native.clone());
-                        return Ok(CopeEvent::Native {
-                            id,
-                            payload: native,
-                        });
+                        if next_hop == self.me {
+                            return Ok(CopeEvent::Native {
+                                id,
+                                payload: native,
+                            });
+                        }
+                        // Addressed to someone else: retained as side-info, not delivered. Read on.
                     }
                     // Can't decode (missing >1) or already hold all members.
                 }
@@ -356,6 +363,60 @@ mod tests {
         assert_eq!((rid_a, got_a), (id2, p2));
         let (rid_b, got_b) = bob.recv_native().await.unwrap();
         assert_eq!((rid_b, got_b), (id1, p1));
+    }
+
+    /// A bystander that overheard all-but-one member can DECODE the missing native — but must NOT
+    /// deliver it up when it is addressed to a different next-hop. Without the `me` gate every
+    /// all-but-one overhearer on a broadcast medium mis-accepts another node's packet.
+    #[tokio::test]
+    async fn bystander_does_not_receive_a_native_addressed_to_someone_else() {
+        const DAVE: NeighborId = 3;
+        let mut eps = BroadcastBus::with_endpoints(4);
+        let relay_ep = eps.remove(3);
+        let dave_ep = eps.remove(2);
+        let bob_ep = eps.remove(1);
+        let alice_ep = eps.remove(0);
+
+        let dave = CopeBroadcastLink::new(DAVE, dave_ep);
+        let relay = CopeBroadcastLink::new(99, relay_ep);
+        // Keep Alice/Bob endpoints alive so the shared bus keeps their receivers (send is fan-out).
+        let _alice = CopeBroadcastLink::new(ALICE, alice_ep);
+        let _bob = CopeBroadcastLink::new(BOB, bob_ep);
+
+        let p1 = Bytes::from_static(b"native-packet-for-bob");
+        let p2 = Bytes::from_static(b"the-native-for-alice");
+
+        // Relay codes p1→Bob ⊕ p2→Alice (coding condition satisfied by the reports).
+        let id1 = relay.enqueue(BOB, p1.clone()).await;
+        let id2 = relay.enqueue(ALICE, p2.clone()).await;
+        relay.report(ALICE, id1).await;
+        relay.report(BOB, id2).await;
+
+        // Dave overheard p2 (Alice's) but NOT p1 — so it CAN decode p1, which is addressed to Bob.
+        dave.held.lock().await.insert(id2, p2.clone());
+
+        let (sent, coded) = relay.flush().await.unwrap();
+        assert_eq!((sent, coded), (1, 1), "one coded broadcast");
+
+        // Send Dave a native actually addressed to it, so recv_event has something to return AFTER it
+        // silently absorbs the mis-addressed decoded p1.
+        let p3 = Bytes::from_static(b"native-for-dave");
+        let id3 = relay.enqueue(DAVE, p3.clone()).await;
+        let (sent3, _) = relay.flush().await.unwrap();
+        assert_eq!(sent3, 1, "the follow-up native");
+
+        // Dave's first delivered native is p3 (its OWN), never the decoded p1 (Bob's).
+        let (rid, got) = dave.recv_native().await.unwrap();
+        assert_eq!(
+            (rid, got),
+            (id3, p3),
+            "the bystander delivers only the native addressed to it"
+        );
+        // …yet it DID recover p1 and kept it as side-info — recovered, not delivered.
+        assert!(
+            dave.held.lock().await.contains_key(&id1),
+            "the decoded-but-mis-addressed native is retained as side-info, not surfaced"
+        );
     }
 
     /// Without overhearing the relay can't code: it broadcasts the head native
