@@ -976,26 +976,14 @@ impl LinkServiceFeature for RadioControl {
 /// reads. Backends that don't support a knob inherit the trait's no-op default,
 /// so a less-capable radio is driven by the same actuator without special-casing.
 #[cfg(feature = "libusb-backend")]
-#[derive(Default, Clone, Copy, PartialEq)]
-struct AppliedKnobs {
-    channel: Option<(u8, u8)>, // (channel, bw_code)
-    csd: Option<bool>,
-    edcca: Option<bool>,
-    power: Option<u8>,
-    sf: Option<u8>,  // LoRa spreading factor
-    cr: Option<u8>,  // LoRa coding rate
-    bw: Option<u32>, // LoRa bandwidth (kHz)
-}
-
-#[cfg(feature = "libusb-backend")]
 pub struct LibUsbActuator {
     radio: RadioId,
     knobs: Arc<dyn crate::RadioKnobs>,
     planned: Arc<std::sync::RwLock<Option<ndn_radio_cognition::TxParams>>>,
     /// Last values actually pushed to the radio, so unchanged knobs are not
     /// re-applied every frame (a channel retune per frame is ~16 ms — it would
-    /// dominate, as the on-air run showed).
-    last: Mutex<AppliedKnobs>,
+    /// dominate, as the on-air run showed). Shared type with the `MediumActuator`.
+    last: Mutex<crate::medium::AppliedKnobs>,
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -1009,7 +997,7 @@ impl LibUsbActuator {
             radio,
             knobs,
             planned,
-            last: Mutex::new(AppliedKnobs::default()),
+            last: Mutex::new(crate::medium::AppliedKnobs::default()),
         }
     }
 }
@@ -1025,63 +1013,12 @@ impl RadioActuators for LibUsbActuator {
         let to_err = |e: crate::FaceError| ndn_radio_cognition::RadioError(e.to_string());
         let p = &alloc.params;
 
-        // Only push a stateful knob to the radio when it actually changed — a
-        // channel retune costs ~16 ms, so re-applying per frame would dominate.
+        // Only push a stateful knob to the radio when it actually changed — a channel retune costs
+        // ~16 ms, so re-applying per frame would dominate. Delegated to the shared `apply_knobs` so
+        // this path can no longer diverge from the MediumActuator (it used to lack the dBm-power
+        // branch entirely, dropping every absolute-power decision on a dBm-capable radio).
         let mut last = self.last.lock().unwrap();
-
-        // Stateful: retune channel + bandwidth together.
-        if let Some(ch) = alloc.channel {
-            let bw_code = p.bw().unwrap_or(0);
-            if last.channel != Some((ch, bw_code)) {
-                let bw = crate::Bandwidth::from_code(bw_code);
-                self.knobs.set_channel(ch, bw).map_err(to_err)?;
-                last.channel = Some((ch, bw_code));
-            }
-        }
-        // Stateful: CSD (the 1-stream cyclic-shift antenna path; no-op on radios
-        // without a per-frame CSD knob, e.g. mt76x2).
-        if last.csd != Some(p.csd()) {
-            self.knobs.set_tx_csd(p.csd()).map_err(to_err)?;
-            last.csd = Some(p.csd());
-        }
-        if last.edcca != Some(p.edcca_ignore) {
-            self.knobs
-                .set_edcca_ignore(p.edcca_ignore)
-                .map_err(to_err)?;
-            last.edcca = Some(p.edcca_ignore);
-        }
-        // Power: only when the plane asks to back off — `None` preserves the
-        // hard-won calibrated/regulatory/PA-backoff power.
-        if let Some(idx) = p.tx_power
-            && last.power != Some(idx)
-        {
-            self.knobs.set_tx_power(idx as u32).map_err(to_err)?;
-            last.power = Some(idx);
-        }
-        // LoRa reach/rate dials (no-op on Wi-Fi radios). Each change is a ~1s AT retune of the
-        // dongle, so gate strictly on a changed value — cognition emits these every decision, but
-        // we only actuate when the spreading factor / coding rate actually moves.
-        if let Some(sf) = p.spreading_factor()
-            && last.sf != Some(sf)
-        {
-            self.knobs.set_spreading_factor(sf).map_err(to_err)?;
-            last.sf = Some(sf);
-        }
-        if let Some(cr) = p.coding_rate()
-            && last.cr != Some(cr)
-        {
-            self.knobs.set_coding_rate(cr).map_err(to_err)?;
-            last.cr = Some(cr);
-        }
-        // LoRa bandwidth: the rate/airtime lever (policy widens to 250 kHz on strong Bulk links).
-        // The actuator existed but neither apply path called it, so the decided width never reached
-        // the dongle; gate strictly on a changed value like sf/cr (each set is a ~1s AT retune).
-        if let Some(bw) = p.bandwidth_khz()
-            && last.bw != Some(bw)
-        {
-            self.knobs.set_bandwidth_khz(bw).map_err(to_err)?;
-            last.bw = Some(bw);
-        }
+        crate::medium::apply_knobs(&mut last, self.knobs.as_ref(), alloc).map_err(to_err)?;
         drop(last);
 
         // Per-frame: hand the decided params to the face's send path.

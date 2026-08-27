@@ -342,9 +342,12 @@ impl SignalStore<FaceId> for LinkSignalStore {
 }
 
 /// The last knob values pushed to a radio, so an unchanged knob is not re-applied
-/// every tick (a channel retune is ~16 ms — it would dominate the loop).
-#[derive(Default)]
-struct AppliedKnobs {
+/// every tick (a channel retune is ~16 ms — it would dominate the loop). Shared by
+/// BOTH actuator paths ([`MediumActuator`] and `LibUsbActuator`) via [`apply_knobs`],
+/// so a knob wired into one is never forgotten in the other — the divergence that once
+/// dropped absolute-dBm power on the libusb backend and forced two copies of every dial.
+#[derive(Default, Clone, Copy, PartialEq)]
+pub(crate) struct AppliedKnobs {
     channel: Option<(u8, u8)>, // (channel, bw_code)
     csd: Option<bool>,
     edcca: Option<bool>,
@@ -353,6 +356,80 @@ struct AppliedKnobs {
     sf: Option<u8>,  // LoRa spreading factor
     cr: Option<u8>,  // LoRa coding rate
     bw: Option<u32>, // LoRa bandwidth (kHz)
+}
+
+/// Push a plan's stateful control knobs to `knobs`, applying only values that CHANGED since the
+/// last call (tracked in `last`). This is the ONE definition both actuators call: [`MediumActuator`]
+/// (loopback/af-packet knobs) and `LibUsbActuator` (libusb chip knobs). Keeping it single is what
+/// stops the two paths from drifting — the libusb path used to lack the dBm-power branch entirely,
+/// silently dropping every absolute-power decision on a radio that has a dBm scale.
+pub(crate) fn apply_knobs(
+    last: &mut AppliedKnobs,
+    knobs: &dyn RadioKnobs,
+    alloc: &RadioAllocation,
+) -> Result<(), FaceError> {
+    let p = &alloc.params;
+    // Channel + bandwidth retune together (the ~16 ms cost the change-gating exists for).
+    if let Some(ch) = alloc.channel {
+        let bw_code = p.bw().unwrap_or(0);
+        if last.channel != Some((ch, bw_code)) {
+            knobs.set_channel(ch, Bandwidth::from_code(bw_code))?;
+            last.channel = Some((ch, bw_code));
+        }
+    }
+    if last.csd != Some(p.csd()) {
+        knobs.set_tx_csd(p.csd())?;
+        last.csd = Some(p.csd());
+    }
+    if last.edcca != Some(p.edcca_ignore) {
+        knobs.set_edcca_ignore(p.edcca_ignore)?;
+        last.edcca = Some(p.edcca_ignore);
+    }
+    // TX power: prefer the absolute dBm scale when the radio has one, since it is what the policy
+    // actually decided (the index is a lossy rendering of the same back-off). A radio without dBm
+    // control falls back to the index; a radio with it skips the index, so the two never fight over
+    // one knob. Dedupe on the REQUEST, not what the radio reported applying — a firmware/regulatory
+    // clamp (30 dBm → 27) makes the applied value differ from the request, which would otherwise
+    // re-push a write on every tick forever.
+    let dbm_applied = match p.tx_power_dbm {
+        Some(dbm) if last.power_dbm != Some(dbm) => match knobs.set_tx_power_dbm(dbm) {
+            Ok(_applied) => {
+                last.power_dbm = Some(dbm);
+                true
+            }
+            Err(_) => false, // unsupported on this radio — fall through to the index scale
+        },
+        Some(_) => true, // already applied
+        None => false,
+    };
+    if !dbm_applied
+        && let Some(idx) = p.tx_power
+        && last.power != Some(idx)
+    {
+        knobs.set_tx_power(idx as u32)?;
+        last.power = Some(idx);
+    }
+    // LoRa reach/rate dials (no-op on Wi-Fi radios): spreading factor, coding rate, bandwidth. Each
+    // is a ~1 s AT retune of the dongle, so gate strictly on a changed value.
+    if let Some(sf) = p.spreading_factor()
+        && last.sf != Some(sf)
+    {
+        knobs.set_spreading_factor(sf)?;
+        last.sf = Some(sf);
+    }
+    if let Some(cr) = p.coding_rate()
+        && last.cr != Some(cr)
+    {
+        knobs.set_coding_rate(cr)?;
+        last.cr = Some(cr);
+    }
+    if let Some(bw) = p.bandwidth_khz()
+        && last.bw != Some(bw)
+    {
+        knobs.set_bandwidth_khz(bw)?;
+        last.bw = Some(bw);
+    }
+    Ok(())
 }
 
 /// The medium's **actuator**: applies one radio's slice of a [`RadioPlan`] each tick.
@@ -427,78 +504,13 @@ impl RadioActuators for MediumActuator {
             );
         }
 
-        // The stateful control knobs — only pushed when changed.
+        // The stateful control knobs — only pushed when changed, via the shared `apply_knobs` both
+        // actuators use (so no knob is wired here and forgotten on the libusb path).
         let Some(knobs) = &self.knobs else {
             return Ok(());
         };
         let mut last = self.last.lock().unwrap();
-        if let Some(ch) = alloc.channel {
-            let bw_code = p.bw().unwrap_or(0);
-            if last.channel != Some((ch, bw_code)) {
-                knobs
-                    .set_channel(ch, Bandwidth::from_code(bw_code))
-                    .map_err(to_err)?;
-                last.channel = Some((ch, bw_code));
-            }
-        }
-        if last.csd != Some(p.csd()) {
-            knobs.set_tx_csd(p.csd()).map_err(to_err)?;
-            last.csd = Some(p.csd());
-        }
-        if last.edcca != Some(p.edcca_ignore) {
-            knobs.set_edcca_ignore(p.edcca_ignore).map_err(to_err)?;
-            last.edcca = Some(p.edcca_ignore);
-        }
-        // TX power: prefer the absolute dBm scale when the radio has one, since
-        // it is what the policy actually decided (the index is a lossy rendering
-        // of the same back-off through a chip-independent dB-per-step constant).
-        // A radio without dBm control falls back to the index; a radio with it
-        // skips the index entirely, so the two can never fight over one knob.
-        let dbm_applied = match p.tx_power_dbm {
-            Some(dbm) if last.power_dbm != Some(dbm) => match knobs.set_tx_power_dbm(dbm) {
-                Ok(_applied) => {
-                    // Dedupe on the *request*, not on what the radio reported
-                    // applying. A firmware/regulatory clamp (30 dBm -> 27) means
-                    // the applied value never equals the request, so keying on it
-                    // would make an unchanged decision look changed and re-push a
-                    // write on every single tick, forever.
-                    last.power_dbm = Some(dbm);
-                    true
-                }
-                // Unsupported on this radio — fall through to the index scale.
-                Err(_) => false,
-            },
-            Some(_) => true, // already applied
-            None => false,
-        };
-        if !dbm_applied
-            && let Some(idx) = p.tx_power
-            && last.power != Some(idx)
-        {
-            knobs.set_tx_power(idx as u32).map_err(to_err)?;
-            last.power = Some(idx);
-        }
-        if let Some(sf) = p.spreading_factor()
-            && last.sf != Some(sf)
-        {
-            knobs.set_spreading_factor(sf).map_err(to_err)?;
-            last.sf = Some(sf);
-        }
-        if let Some(cr) = p.coding_rate()
-            && last.cr != Some(cr)
-        {
-            knobs.set_coding_rate(cr).map_err(to_err)?;
-            last.cr = Some(cr);
-        }
-        // LoRa bandwidth: the cognition's rate/airtime lever (policy widens to 250 kHz on strong
-        // Bulk links — ~2× rate, half the airtime). The actuator existed but nothing called it, so
-        // the decided width died in the plan; gate on a changed value like the other LoRa dials.
-        if let Some(bw) = p.bandwidth_khz()
-            && last.bw != Some(bw)
-        {
-            knobs.set_bandwidth_khz(bw).map_err(to_err)?;
-            last.bw = Some(bw);
-        }
+        apply_knobs(&mut last, knobs.as_ref(), alloc).map_err(to_err)?;
         Ok(())
     }
 }
