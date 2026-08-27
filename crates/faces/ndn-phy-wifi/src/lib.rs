@@ -227,6 +227,10 @@ pub(crate) struct RadioFecPin {
     pub src: [u8; 6],
     /// addr3 — the doctrine §2 nonce when Tier-0 displaced it out of addr2.
     pub addr3: Option<[u8; 6]>,
+    /// addr4 — the wide-profile extra Blur, when this generation rides the wide profile.
+    pub addr4: Option<[u8; 6]>,
+    /// HT Control — the wide-profile fingerprint + marker, paired with `addr4`.
+    pub htc: Option<[u8; 4]>,
     /// The transmit intent (so the medium's legacy-rate gate reaches coded frames too).
     pub intent: TxIntent,
     /// The exact rate, when the bearer takes one per frame (`WifiPhy`). `None` where rate is
@@ -252,8 +256,8 @@ impl GenerationSink for RadioFecSink {
                 dst: pin.dst,
                 src: pin.src,
                 addr3: pin.addr3,
-                addr4: None,
-                htc: None,
+                addr4: pin.addr4,
+                htc: pin.htc,
             };
             let _ = match pin.mcs {
                 Some(mcs) => self.radio.inject_at(frame, mcs).await,
@@ -303,15 +307,9 @@ pub(crate) fn bloom_key64(key: &GroupKey) -> &[u8; 16] {
     &key.0
 }
 
-/// The 12 wire bytes (`addr1 ‖ addr2`) of the Tier-0 filter for the NDN name inside an LP wire frame
-/// (first fragment / bare packet). `None` when the wire carries no name (a non-first fragment) — the
-/// caller falls back to broadcast, which every receiver's filter admits (a safe over-accept).
-pub(crate) fn bloom_wire_for_wire(key: &GroupKey, wire: &[u8]) -> Option<[u8; 16]> {
-    let name = inner_name(wire)?;
-    let mut f = PrefixFilter::new();
-    f.insert_name(bloom_key64(key), &ndn_name_to_slash(name));
-    Some(f.to_wire())
-}
+// The name→wire-filter compilation now lives in `Tier0Addresser::compute` (it must branch on the
+// base vs wide profile and share the fragment cache), so the old free `bloom_wire_for_wire` helper
+// is gone — there is exactly one place that turns a name into addressing bytes.
 
 /// **How the next frame's exact rate is chosen** — shared by both faces (#82).
 ///
@@ -425,9 +423,27 @@ impl RatePolicy {
 /// relay. Entries are dropped when the object's last fragment goes out, and a hard cap covers the
 /// case where that fragment never arrives (a torn-down peer, a reordered tail). Evicting early is
 /// safe: a miss falls back to broadcast, which over-accepts rather than dropping.
+/// The addressing fields one outgoing object contributes to the frame: the 16-byte base Blur
+/// (`addr1‖addr2‖addr3[0:4]`) always, plus — on the **wide** profile — the additive `addr4` extra
+/// Blur and the 24-bit exact-match fingerprint (for HT Control). Cached whole per fragmented object,
+/// so every fragment of one object carries identical addressing (a receiver that admits the object
+/// admits all its fragments and its parity).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TxWire {
+    pub base: [u8; 16],
+    /// `Some(addr4)` on the wide profile — the extra Blur projection. `None` on the base profile.
+    pub extra: Option<[u8; 6]>,
+    /// The wide-profile fingerprint (0 on the base profile — unused when `extra` is `None`).
+    pub fp: u32,
+}
+
 pub(crate) struct Tier0Addresser {
     key: GroupKey,
-    cache: Mutex<HashMap<u64, [u8; 16]>>,
+    /// When true, this face emits the **wide** profile: a 4-address QoS+HTC frame carrying the extra
+    /// Blur (`addr4`) and the fingerprint (HT Control) on top of the base Blur. The base region is
+    /// byte-identical either way, so a base receiver reads a wide frame with zero false negatives.
+    wide: bool,
+    cache: Mutex<HashMap<u64, TxWire>>,
 }
 
 /// Cap on in-flight fragmented objects tracked at once. Generous next to any real fragment window;
@@ -438,6 +454,17 @@ impl Tier0Addresser {
     pub(crate) fn new(key: GroupKey) -> Self {
         Self {
             key,
+            wide: false,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A **wide-profile** addresser (see [`TxWire`]): identical base Blur, plus the additive extra
+    /// Blur + fingerprint. Paired with [`RxFilter::WideBloom`] by [`RadioMediumFace::with_wide_bloom`].
+    pub(crate) fn new_wide(key: GroupKey) -> Self {
+        Self {
+            key,
+            wide: true,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -448,17 +475,44 @@ impl Tier0Addresser {
         self.cache.lock().unwrap().len()
     }
 
-    /// The 12-byte filter (`addr1 ‖ addr2`) for this outgoing wire, or `None` to address it
-    /// broadcast — no name and no cached object, a safe over-accept.
-    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<[u8; 16]> {
+    /// Compute the addressing fields for a wire that carries a name (base, and — when wide — the
+    /// extra Blur + fingerprint). The base region is [`PrefixFilter`] either way, so the two profiles
+    /// agree byte-for-byte on `addr1‖addr2‖addr3[0:4]`.
+    fn compute(&self, wire: &[u8]) -> Option<TxWire> {
+        let name = inner_name(wire)?;
+        let slash = ndn_name_to_slash(name);
+        let key = bloom_key64(&self.key);
+        if self.wide {
+            // `WideFrame::of_name`'s id/flags land in addr3[4:6], which the medium fills from its own
+            // deconfliction state — so pass 0 here and take only the blur (base+extra) + fingerprint.
+            let wf = crate::tier0::WideFrame::of_name(key, &slash, 0, 0);
+            Some(TxWire {
+                base: wf.blur.base().to_wire(),
+                extra: Some(*wf.blur.extra_bytes()),
+                fp: wf.fingerprint,
+            })
+        } else {
+            let mut f = PrefixFilter::new();
+            f.insert_name(key, &slash);
+            Some(TxWire {
+                base: f.to_wire(),
+                extra: None,
+                fp: 0,
+            })
+        }
+    }
+
+    /// The addressing fields for this outgoing wire, or `None` to address it broadcast — no name and
+    /// no cached object, a safe over-accept every receiver's filter admits.
+    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<TxWire> {
         let Some(h) = ndn_packet::lp::extract_fragment(wire) else {
             // Unfragmented: the name is right here, nothing to remember.
-            return bloom_wire_for_wire(&self.key, wire);
+            return self.compute(wire);
         };
         let base = h.sequence.wrapping_sub(h.frag_index);
         let last = h.frag_index + 1 >= h.frag_count;
         if h.frag_index == 0 {
-            let w = bloom_wire_for_wire(&self.key, wire)?;
+            let w = self.compute(wire)?;
             if !last {
                 let mut c = self.cache.lock().unwrap();
                 if c.len() >= TIER0_CACHE_CAP
@@ -1581,6 +1635,49 @@ mod tests {
                  reassembles addr1‖addr2 and drops it otherwise (addr1={a1:02x?} addr2={a2:02x?})"
             );
         }
+    }
+
+    /// **Wide TX and wide RX are one profile, not two halves.** A wide-enabled addresser produces the
+    /// extra Blur + fingerprint; the wide RX gate admits the result on both regions; a base receiver
+    /// still admits it from the byte-identical base region (coexistence, zero false negatives). This
+    /// pins that `with_wide_bloom` does not emit base frames its own RX filter is stricter than —
+    /// the TX/RX fracture this change removes.
+    #[test]
+    fn wide_tx_addresser_and_wide_gate_are_one_profile() {
+        let key = OPEN_GROUP_KEY;
+        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
+
+        let wide = Tier0Addresser::new_wide(key);
+        let tw = wide.wire_for(&wire).expect("named wire → addressing");
+        let extra = tw.extra.expect("the wide addresser sets the extra Blur");
+
+        // Reconstruct the frame fields exactly as the medium does.
+        let a1: [u8; 6] = tw.base[..6].try_into().unwrap();
+        let a2: [u8; 6] = tw.base[6..12].try_into().unwrap();
+        let a3 = [tw.base[12], tw.base[13], tw.base[14], tw.base[15], 0, 0];
+        let htc = [
+            tw.fp as u8,
+            (tw.fp >> 8) as u8,
+            (tw.fp >> 16) as u8,
+            crate::tier0::WIDE_PROFILE_MARKER,
+        ];
+
+        // A wide receiver registered on /x admits it on BOTH regions.
+        let wide_gate = NameGate::new(RxFilter::WideBloom(wide_bloom_masks_for(&key, &["/x"])), None);
+        assert!(
+            wide_gate.admits_wide(Some(a1), Some(a2), Some(a3), Some(extra), Some(htc), b""),
+            "the wide gate must admit the wide addresser's own frame"
+        );
+        // A base receiver admits it from the base region alone — no false negative.
+        let base_gate = NameGate::new(RxFilter::Bloom(bloom_masks_for(&key, &["/x"])), None);
+        assert!(
+            base_gate.admits_wide(Some(a1), Some(a2), Some(a3), None, None, b""),
+            "a commodity base receiver must still admit a wide sender's frame"
+        );
+        // The base region is byte-identical to a base addresser's — the coexistence floor.
+        let base_tw = Tier0Addresser::new(key).wire_for(&wire).unwrap();
+        assert_eq!(tw.base, base_tw.base, "wide and base agree on the base Blur");
+        assert!(base_tw.extra.is_none(), "the base addresser sets no extra Blur");
     }
 
     /// **The Tier-0 fragment cache must not grow without bound.** The original was a `HashMap` that

@@ -578,6 +578,10 @@ pub struct RadioMediumFace {
     /// filter in `addr1 ‖ addr2`, with the ephemeral nonce displaced to `addr3`. `None` ⇒ broadcast
     /// `addr1` and the nonce in `addr2`.
     tx_bloom: Option<crate::GroupKey>,
+    /// When true, TX emits the **wide** profile (4-address QoS+HTC: extra Blur in `addr4`, fingerprint
+    /// in HT Control) instead of the base 3-address frame. Set by [`with_wide_bloom`](Self::with_wide_bloom)
+    /// so a wide face's transmit and receive halves match; the base region stays identical either way.
+    tx_wide: bool,
     /// **RX** name filtering: the shared [`NameGate`](crate::NameGate)'s two halves — the Tier-0
     /// filter (or the NDN-NIC baseline) and an optional Tier-1.
     ///
@@ -753,6 +757,7 @@ impl RadioMediumFace {
             fec: None,
             legacy_gate: None,
             tx_bloom: None,
+            tx_wide: false,
             rx_gate: None,
             group_table: None,
             amsdu: None,
@@ -812,6 +817,7 @@ impl RadioMediumFace {
     ) -> Self {
         let masks = crate::wide_bloom_masks_for(key, registered_prefixes);
         self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
+        self.tx_wide = true; // TX emits the wide profile too, so this face's halves match
         self.with_tx_bloom(*key)
             .with_rx_gate(Arc::new(crate::NameGate::new(
                 crate::RxFilter::WideBloom(masks),
@@ -1102,28 +1108,46 @@ impl TxBearer {
         // nonce rotation off, silently. Computing the address before the branch is what makes the
         // two paths incapable of disagreeing (#82).
         let nonce = self.source.current(super::now_ms() as u64);
-        let (dst, src, addr3) = match self.tier0.as_ref().and_then(|t| t.wire_for(&wire)) {
+        let (dst, src, addr3, addr4, htc) = match self.tier0.as_ref().and_then(|t| t.wire_for(&wire)) {
             // The 126-bit Blur spans addr1‖addr2‖addr3[0..4] (wire-format-spec §5.3). addr3's last two
             // bytes carry the **8-bit ephemeral ID** and the **flags byte** — the ID displaced out of
             // addr2 by the widened filter. `nonce[1]` is a full-entropy byte of the rotating ephemeral
             // source (nonce[0] has forced local/individual bits); flags = 0 today. NOTE: the PFS/DAR
             // deconfliction (`ephemeral_id.rs`) is not yet fed from RX — that integration is the
             // remaining follow-up; the wire format is complete.
-            Some(bf) => {
+            Some(tw) => {
+                let bf = tw.base;
                 // The 8-bit ephemeral ID (+ flags) from the PFS/DAR allocator: normally our own ID with
                 // clear flags; when a conflict hint is pending it rides this frame (conflicted ID +
                 // FLAG_ID_COLLISION) so the aliasing senders rotate (`ephemeral_id.rs`).
                 let (id, flags) = self.dedup.lock().unwrap().tx_id();
                 let a3 = [bf[12], bf[13], bf[14], bf[15], id, flags];
+                // Wide profile: the extra Blur rides addr4 and the fingerprint (+ marker) rides HT
+                // Control. `build_dot11` promotes the frame to 4-address QoS+HTC when both are set; a
+                // base receiver still reads the byte-identical base Blur from addr1‖addr2‖addr3[0:4].
+                let (a4, htc) = match tw.extra {
+                    Some(extra) => (
+                        Some(extra),
+                        Some([
+                            tw.fp as u8,
+                            (tw.fp >> 8) as u8,
+                            (tw.fp >> 16) as u8,
+                            crate::tier0::WIDE_PROFILE_MARKER,
+                        ]),
+                    ),
+                    None => (None, None),
+                };
                 (
                     bf[..6].try_into().unwrap(),
                     bf[6..12].try_into().unwrap(),
                     Some(a3),
+                    a4,
+                    htc,
                 )
             }
             // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
             // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
-            None => (BROADCAST, nonce, None),
+            None => (BROADCAST, nonce, None, None, None),
         };
 
         // The rate this frame should ride, if any is decided. Computed BEFORE the FEC branch so a
@@ -1175,6 +1199,8 @@ impl TxBearer {
                         dst,
                         src,
                         addr3,
+                        addr4,
+                        htc,
                         intent,
                         mcs: decided,
                     },
@@ -1195,12 +1221,12 @@ impl TxBearer {
             dst,
             src,
             addr3,
-            // The medium's default addresser emits the base 3-address profile — a valid, universally-
-            // admitted frame. Wide-profile TX (addr4 extra Blur + HT Control fingerprint) is a caller-
-            // driven capability of `build_dot11`, kept out of this hot path to avoid a wide/FEC/A-MSDU
-            // fragment-consistency split; the RX side (`admits_wide` + `RxFilter::WideBloom`) reads it.
-            addr4: None,
-            htc: None,
+            // Wide profile (when this face was built with `with_wide_bloom`): the addresser produced
+            // the extra Blur + fingerprint above, fragment-consistently, and the FEC path carries the
+            // same via the pin — so a wide face's every frame (direct, coded, or A-MSDU-eligible) is
+            // wide. A base face leaves these `None` and emits the 3-address frame. No TX/RX split.
+            addr4,
+            htc,
         };
         // A-MSDU bundling (#82 part 2): a non-robust data frame is coalesced instead of injected
         // one at a time. Robust control frames fall through — a report or time beacon must reach the
@@ -1324,6 +1350,7 @@ impl RunningMedium {
             fec,
             legacy_gate,
             tx_bloom,
+            tx_wide,
             rx_gate,
             amsdu,
             rate,
@@ -1356,7 +1383,13 @@ impl RunningMedium {
 
         // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
         // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
-        let tier0 = tx_bloom.map(|k| Arc::new(crate::Tier0Addresser::new(k)));
+        let tier0 = tx_bloom.map(|k| {
+            Arc::new(if tx_wide {
+                crate::Tier0Addresser::new_wide(k)
+            } else {
+                crate::Tier0Addresser::new(k)
+            })
+        });
 
         for b in bearers {
             // #83: the radio's self-description outranks the caller's assertion, and a mismatch is
