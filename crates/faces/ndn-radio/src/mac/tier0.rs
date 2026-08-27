@@ -1192,6 +1192,29 @@ mod golden_vectors {
                 f.popcount()
             ));
         }
+        // ── WIDE profile (#39): generated from the same algorithm, so the shared file stays the
+        // arbiter for the wide layout too — the firmware (Rust) and ath9k-htc (C) ports reproduce it.
+        out.push_str("# ── WIDE profile (#39): 4-address QoS+HTC frame. The base Blur (addr1‖addr2‖addr3[0:4]) is byte-\n");
+        out.push_str("# identical to the base rows above; addr4 carries the additive 48-bit extra projection (key XOR\n");
+        out.push_str("# \"ndn/tier0-xtra!\"); HT Control carries the 24-bit name fingerprint (low bits of the keyed name hash,\n");
+        out.push_str("# little-endian) ‖ marker 0x01. Reproduced by the firmware (Rust) and ath9k-htc (C) ports.\n");
+        out.push_str("wide-params fp_bits=24 extra_bytes=6 extra_domain=ndn/tier0-xtra! marker=0x01 htc=fp_le24_then_marker\n");
+        out.push_str("# wide <label> <key> <name> <id-hex> <flags-hex> <fp-hex> <addr1‖addr2‖addr3‖addr4 hex(24B)> <htc hex(4B)>\n");
+        let wname = b"/ndn/test/v1".as_slice();
+        let wf = WideFrame::of_name(&VK, wname, 0x37, 0x00);
+        let wfields = wf.to_fields();
+        let cat = |a: &[u8]| a.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        out.push_str(&format!(
+            "wide widev1 {} {} 37 00 {:06x} {}{}{}{} {}\n",
+            std::str::from_utf8(&VK).unwrap(),
+            std::str::from_utf8(wname).unwrap(),
+            wf.fingerprint,
+            cat(&wfields.addr1),
+            cat(&wfields.addr2),
+            cat(&wfields.addr3),
+            cat(&wfields.addr4),
+            cat(&wfields.htc)
+        ));
         out
     }
 
