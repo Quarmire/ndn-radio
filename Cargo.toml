@@ -28,6 +28,7 @@ todo = "warn"
 unimplemented = "warn"
 
 [workspace.dependencies]
+ndn-radio = { path = "crates/faces/ndn-radio" }
 portable-atomic = { version = "1.11", default-features = false, features = ["fallback", "std"] }
 # NDN workspace crates — grouped by subdirectory layer
 ndn-foundation-types = { path = "../ndn-rs/crates/core/ndn-foundation-types", default-features = false }

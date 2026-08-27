@@ -175,7 +175,7 @@ pub mod measure;
 pub mod gcs;
 pub mod name_gate;
 pub mod ndn_nic;
-pub mod tier0;
+pub use ndn_radio::mac::tier0;
 pub mod tier1;
 pub use tier0::PrefixFilter;
 

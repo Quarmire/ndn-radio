@@ -1,8 +1,8 @@
 //! **Name → filter-input derivation** — the named-data radio's one canonical path from an on-air
 //! frame to the `/`-joined normalized name that every in-frame name filter is computed over.
 //!
-//! This is a #44 keyspace primitive, peer to [`prefix_hash`](crate::prefix_hash) and the filter
-//! codecs ([`gcs`](crate::gcs), the address Blur): a producer compiling its name into a filter and a
+//! This is a #44 keyspace primitive, peer to [`prefix_hash`](crate::mac::prefix_hash) and the filter
+//! codecs ([`gcs`](crate::mac::gcs), the address Blur): a producer compiling its name into a filter and a
 //! receiver registering a `/`-string prefix **must** derive their bytes here so the two agree. It
 //! lives in the shared control-plane crate — not in any one bearer's face — precisely so no bearer
 //! grows a private copy that can drift (the failure the golden-vector oracle exists to catch). Every

@@ -46,16 +46,13 @@
 //! `LinkServiceFeature` seam, **not** here, so the logic stays unit-testable and
 //! face-agnostic.
 
-pub use ndn_radio::mac::{coop, dos, ephemeral_id};
+pub use ndn_radio::mac::{coop, dos, ephemeral_id, gcs, name, prefix_hash, schedule};
 mod calibrate;
 mod contextual;
 mod demand;
-pub mod gcs;
-pub mod name;
 mod plan;
 mod policy;
 mod report;
-pub mod schedule;
 mod sense;
 mod strategy;
 
@@ -92,20 +89,3 @@ pub use strategy::RadioStrategy;
 /// `LinkSignals` into [`MediumState::observe_rx`] inputs.
 pub use ndn_signals_core::LinkSignals;
 
-/// Canonical prefix-hash (FNV-1a over the name components, with a separator) — the
-/// opaque key that ties demand, the sense bus, `NameContext`, and the consistency
-/// digest together. The forwarder uses this to turn a `Name` prefix into the key
-/// the control plane is keyed on.
-pub fn prefix_hash(components: &[&[u8]]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for c in components {
-        for &b in *c {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        // component separator so ["ab","c"] ≠ ["a","bc"]
-        h ^= 0x2f;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}

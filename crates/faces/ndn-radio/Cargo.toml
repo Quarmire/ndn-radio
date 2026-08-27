@@ -11,6 +11,10 @@ classification = "extension"
 [dependencies]
 ndn-transport = { workspace = true }
 ndn-packet    = { workspace = true, features = ["std"] }
+ndn-radio-hal = { workspace = true }
+ndn-frame-io = { workspace = true }
+ndn-tlv      = { workspace = true }
+ndn-time     = { workspace = true }
 async-trait   = { workspace = true }
 bytes         = { workspace = true, features = ["std"] }
 smallvec      = { workspace = true }

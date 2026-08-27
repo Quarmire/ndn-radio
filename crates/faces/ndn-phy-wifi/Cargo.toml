@@ -22,6 +22,7 @@ serial-radio = ["dep:ndn-radio-drivers", "ndn-radio-drivers/serial-radio"]
 dev-examples = []
 
 [dependencies]
+ndn-radio = { workspace = true }
 portable-atomic = { workspace = true }
 ndn-transport    = { workspace = true }
 ndn-frame-io     = { workspace = true }

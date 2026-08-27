@@ -5,14 +5,14 @@
 //! shared `ndn_time::RadioHwClock`. This module is the pure decision logic; the face gates its TX
 //! choke point on it, reading the epoch from the disciplined hardware clock.
 //!
-//! Everything here keys on the name-group's [`prefix_hash`](crate::prefix_hash) — the *one* shared
+//! Everything here keys on the name-group's [`prefix_hash`](crate::mac::prefix_hash) — the *one* shared
 //! keyspace (§44) that already keys demand, the sense bus, and the consistency digest — so a slot /
 //! channel is a pure function of `(name, clock)` with **no coordinator, no host identity, no announced
 //! schedule** (doctrine §5). Every node holding the name computes the same answer.
 //!
 //! The two axes compose: a name owns `(slot, channel)` — the [`SlotSchedule`] grants the medium in
 //! time, the [`HopSchedule`] picks the carrier, both from the same name + clock. The within-slot
-//! election (several nodes holding one name's data) is CCLF ([`crate::coop`]), not part of this
+//! election (several nodes holding one name's data) is CCLF ([`crate::mac::coop`]), not part of this
 //! computed grant.
 
 /// A name-owned time-slice schedule over a common-view clock (the #61 time-slice MAC).
@@ -366,7 +366,7 @@ impl HopSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefix_hash;
+    use crate::mac::prefix_hash;
 
     #[test]
     fn owner_is_a_pure_function_of_name() {
