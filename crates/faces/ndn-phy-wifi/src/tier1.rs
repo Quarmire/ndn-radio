@@ -37,7 +37,14 @@
 //! [`tests::sync_never_opens_a_false_negative_window`] checks the invariant after each individual
 //! bit write, not merely at the end.
 
-use crate::tier0::{for_each_prefix, name_hash};
+use crate::tier0::{FP_BITS, for_each_prefix, name_fingerprint};
+
+/// splitmix64 finalizer — spreads a small key into a well-distributed 64-bit value.
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 /// Counter width for the software CBF. 8 bits is far more than the paper needs (it uses 4) and costs
 /// nothing here — this side is not gate-limited, and saturation would silently break removal.
@@ -70,13 +77,21 @@ impl Table {
         }
     }
 
-    fn positions(&self, name: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    /// Positions from the carried `FP_BITS` **fingerprint** — so the fast path probes with the value
+    /// the frame already carries, no parse. The 24-bit fp is spread into two independent 64-bit
+    /// streams; two names with the same fingerprint collide at `2^-FP_BITS`, negligible on top of the
+    /// Bloom FP.
+    fn positions_fp(&self, fp: u32) -> impl Iterator<Item = usize> + '_ {
         let m = self.counts.len() as u64;
-        let h1 = name_hash(&self.key, name);
-        let mut key2 = self.key;
-        key2[0] ^= 0x5a;
-        let h2 = name_hash(&key2, name) | 1;
+        let h1 = mix64((fp as u64) | (1 << FP_BITS));
+        let h2 = mix64((fp as u64) | (2 << FP_BITS)) | 1;
         (0..self.k).map(move |i| (h1.wrapping_add((i as u64).wrapping_mul(h2)) % m) as usize)
+    }
+
+    /// Name-keyed positions route through the fingerprint, so a name insert and a carried-fingerprint
+    /// probe land on the SAME bits — one keyspace, name-keyed and fp-keyed unified.
+    fn positions(&self, name: &[u8]) -> impl Iterator<Item = usize> + '_ {
+        self.positions_fp(name_fingerprint(&self.key, name))
     }
 
     /// Add one key to the counting filter. Does **not** touch the mirror — call [`sync`](Self::sync).
@@ -156,6 +171,14 @@ impl Table {
     /// The fast-path test: is `name` possibly present? Reads the mirror only.
     pub fn may_contain(&self, name: &[u8]) -> bool {
         self.positions(name)
+            .all(|p| self.mirror[p / 8] & (1 << (p % 8)) != 0)
+    }
+
+    /// **Parse-free** fast-path test by a carried fingerprint — the frame already carries this value,
+    /// so no name parse is needed. Equivalent to [`may_contain`](Self::may_contain) of the name whose
+    /// fingerprint is `fp`.
+    pub fn may_contain_fp(&self, fp: u32) -> bool {
+        self.positions_fp(fp)
             .all(|p| self.mirror[p / 8] & (1 << (p % 8)) != 0)
     }
 
@@ -294,6 +317,24 @@ impl Tier1 {
         }
     }
 
+    /// **Parse-free Tier-1 probe by the frame's carried fingerprint** (the (a)-actuation the wire
+    /// design promises). The fingerprint is `name_fingerprint(full frame name)`:
+    /// - PIT-exact: a Data whose fp equals an outstanding Interest's — `self.pit`.
+    /// - CS: for a CanBePrefix Interest, its own name IS the prefix sought; `cache` inserted every
+    ///   cached name's prefixes, so the Interest's fp probes `self.cs` directly — this is exactly the
+    ///   direction-(b) CanBePrefix-CS match, with no name parse.
+    ///
+    /// FIB (direction a, prefix) is answered in-frame by the Blur and needs the parsed prefixes, so it
+    /// is left to [`lookup`](Self::lookup); this fast path is the exact + CanBePrefix-CS subset the
+    /// carried fingerprint alone can decide.
+    pub fn probe_fingerprint(&self, fp: u32) -> Verdict {
+        Verdict {
+            fib: false, // FIB prefix-match is the Blur's job (in-frame), not a single-fp probe
+            pit: self.pit.may_contain_fp(fp),
+            cs: self.cs.may_contain_fp(fp),
+        }
+    }
+
     /// Cached names skipped by the Basic CS rule.
     pub fn cs_skipped(&self) -> u32 {
         self.cs_skipped
@@ -310,6 +351,33 @@ mod tests {
 
     fn t1() -> Tier1 {
         Tier1::new(&KEY, BITS, K)
+    }
+
+    /// **Parse-free probe by the carried fingerprint** — CanBePrefix-CS and PIT-exact decided from the
+    /// value the frame already carries, no name parse, agreeing with the name-keyed path.
+    #[test]
+    fn fingerprint_probe_matches_name_lookup_no_parse() {
+        use crate::tier0::name_fingerprint;
+        let mut t = t1();
+        t.cache(b"/a/b/c/d"); // inserts every prefix, incl. /a/b
+        t.add_pit(b"/x/y/seg7");
+        t.sync();
+
+        // CanBePrefix-CS: the Interest /a/b's OWN fingerprint probes the CS (which holds /a/b as a
+        // cached prefix) — direction (b), parse-free.
+        let fp_ab = name_fingerprint(&KEY, b"/a/b");
+        assert!(t.probe_fingerprint(fp_ab).cs, "CanBePrefix /a/b hits cached /a/b/c/d, no parse");
+        // …and it agrees with the name-keyed lookup.
+        assert_eq!(t.probe_fingerprint(fp_ab).cs, t.lookup(b"/a/b").cs);
+
+        // PIT-exact: the Data's fingerprint hits the outstanding Interest.
+        let fp_pit = name_fingerprint(&KEY, b"/x/y/seg7");
+        assert!(t.probe_fingerprint(fp_pit).pit, "Data satisfies the outstanding Interest, no parse");
+
+        // A name we neither cache nor await: no hit.
+        let fp_none = name_fingerprint(&KEY, b"/z/nope");
+        let v = t.probe_fingerprint(fp_none);
+        assert!(!v.cs && !v.pit);
     }
 
     /// **Direction (b) — the case Tier-0 cannot answer at all.**
