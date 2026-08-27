@@ -176,7 +176,43 @@ fn main() {
             w, m, e, em, es, pm, ps, tm, ts, fn_total
         );
     }
+    // ── WIDE profile: full 126-bit Blur (NEVER shrunk) + a SEPARATE 24-bit fingerprint (in HTC) ──
+    {
+        let (m, w) = (126usize, 24u32);
+        let mut tt = Vec::new();
+        let mut fn_total = 0usize;
+        for cfg in 0..CFGS {
+            let fp_set: std::collections::HashSet<u64> =
+                wanted_b.iter().map(|n| fingerprint(cfg, n, w)).collect();
+            let admit = |name: &[u8]| {
+                let blur = Blur::of_name(cfg, name, m); // exact names are OFF the Blur; masks = FIB only
+                fib.iter().any(|mp| blur.admits(mp)) || fp_set.contains(&fingerprint(cfg, name, w))
+            };
+            fn_total += wanted_b.iter().filter(|n| !admit(n)).count();
+            let mut r = Rng(0x9999u64.wrapping_add(cfg));
+            let mut fp = 0usize;
+            for _ in 0..N {
+                let ex = format!("/svc{}/ep{}/v{}/seg{}", r.u(4000), r.u(64), r.u(8), r.u(256));
+                let px = format!("/zz{}/blk{}", r.u(4000), r.u(64));
+                if admit(ex.as_bytes()) {
+                    fp += 1;
+                }
+                if admit(px.as_bytes()) {
+                    fp += 1;
+                }
+            }
+            tt.push(fp as f64 / (2 * N) as f64 * 100.0);
+        }
+        let mean = tt.iter().sum::<f64>() / tt.len() as f64;
+        let sd = (tt.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / tt.len() as f64).sqrt();
+        println!("  ────────────────────────────────────────────────────────────────────────");
+        println!(
+            "  WIDE   126     3    fp separate in HTC                    {:>6.3}±{:<5.3}%  {}",
+            mean, sd, fn_total
+        );
+    }
     println!("\n  w=0 = today's design (50 exact names carried as Blur masks, E=53).");
-    println!("  A w-bit fingerprint: exact-FP falls as ≈1−(1−2⁻ʷ)^50, and E collapses 53→3.");
-    println!("  Optimum w is where the fingerprint term drops below the (rising) Blur term.");
+    println!("  compact (w>0) carves the fp from the 126 → Blur shrinks to 126−w (LoRa fallback).");
+    println!("  WIDE keeps the FULL 126-bit Blur AND a separate fingerprint (802.11 pushed header):");
+    println!("    full Blur precision + near-zero exact-FP + E collapses 53→3 — the best of all.");
 }

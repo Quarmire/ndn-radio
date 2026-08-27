@@ -174,6 +174,22 @@ const KEY2_DOMAIN: [u8; 16] = *b"ndn/tier0-h2\0\0\0\0";
 /// FNV-1a output measured 1.3–3.4× worse at depths 4–8 — FNV's high bits are its weak half, so using
 /// them as the double-hashing stride correlates the K positions.
 pub fn positions(key: &[u8; 16], prefix: &[u8]) -> [u8; K as usize] {
+    // The base 126-bit case — positions are < 126, so they fit `u8`; keeps every existing caller and
+    // the golden vectors unchanged.
+    let p = positions_m(key, prefix, M_BITS);
+    let mut out = [0u8; K as usize];
+    for (o, &x) in out.iter_mut().zip(p.iter()) {
+        *o = x as u8;
+    }
+    out
+}
+
+/// **Parameterized** by the Blur width `m_blur`, so ONE algorithm serves every profile: 126 bits on
+/// the base 3-address 802.11 frame, wider when the pushed header (addr4/QoS) is available. The Blur
+/// width is a parameter, never a constant to be shrunk — the Fingerprint rides its own field. Returns
+/// `u16` positions so a wider-than-255-bit Blur is representable. `positions` is the `M_BITS` case,
+/// bit-identical to the golden-vector-pinned original.
+pub fn positions_m(key: &[u8; 16], prefix: &[u8], m_blur: u32) -> [u16; K as usize] {
     let mut key2 = *key;
     for (b, d) in key2.iter_mut().zip(KEY2_DOMAIN.iter()) {
         *b ^= *d;
@@ -181,11 +197,37 @@ pub fn positions(key: &[u8; 16], prefix: &[u8]) -> [u8; K as usize] {
     let h1 = name_hash(key, prefix) as u32;
     // `| 1` keeps the stride odd, so the K positions cannot collapse onto one bit.
     let h2 = (name_hash(&key2, prefix) as u32) | 1;
-    let mut out = [0u8; K as usize];
+    let mut out = [0u16; K as usize];
     for (i, o) in out.iter_mut().enumerate() {
-        *o = (h1.wrapping_add((i as u32).wrapping_mul(h2)) % M_BITS) as u8;
+        *o = (h1.wrapping_add((i as u32).wrapping_mul(h2)) % m_blur) as u16;
     }
     out
+}
+
+/// Blur width on the **base** 802.11 frame — the 3 address fields (`addr1‖addr2‖addr3[0:4]`), the
+/// universal coexistence floor EVERY NDR receiver can read. Equals [`M_BITS`]. This region is
+/// invariant across profiles: a wide sender fills it with exactly the same [`positions`] a base
+/// sender would, so a commodity base-only receiver reads a valid (coarser) filter from it.
+pub const WIFI_BASE_BLUR: u32 = M_BITS; // 126
+/// **Additive** Blur bits on the **wide** profile — a SECOND, independent projection carried in
+/// `addr4` (48) + QoS Control (16), refining the base for wide-capable receivers. It is NOT a single
+/// `mod-190` Blur (that would change the base 126 bits and break coexistence): the base region is
+/// fixed, and these bits are layered on top. The Fingerprint rides HT Control, separately again.
+pub const WIFI_WIDE_EXTRA_BLUR: u32 = 48 + 16; // 64
+
+/// The exact-match **Fingerprint** width. A *separate* companion field (it rides HT Control on the
+/// pushed 802.11 header, or a body TLV on bit-starved bearers) — it is NEVER carved out of the Blur,
+/// so the Blur never shrinks to make room for it. `w = 24` was picked by measurement
+/// (`ndn-phy-wifi/examples/tier0_fingerprint_eval.rs`): the collision term `1−(1−2⁻ʷ)^P` stays
+/// negligible even as the outstanding-Interest count `P` grows, at `2⁻²⁴ ≈ 6e-8` per name.
+pub const FP_BITS: u32 = 24;
+
+/// The `FP_BITS`-wide exact-match fingerprint of a full name — the low bits of the keyed name hash.
+/// Same SipHash-under-key pipeline as the Blur (one hash family, #44), a different projection: it
+/// answers PIT-exact, CS-exact, AND CanBePrefix-CS (a CanBePrefix Interest's *own* name is the prefix
+/// sought, so its fingerprint probes a CS-BF that pre-inserted every cached prefix — no parse).
+pub fn name_fingerprint(key: &[u8; 16], name: &[u8]) -> u32 {
+    (name_hash(key, name) as u32) & ((1u32 << FP_BITS) - 1)
 }
 
 /// Iterate the prefixes of a `/`-separated name, root first, capped at [`MAX_DEPTH`].
@@ -323,6 +365,7 @@ impl PrefixFilter {
     pub fn from_wire(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
 }
 
 #[cfg(test)]
@@ -331,6 +374,38 @@ mod tests {
 
     /// Group key for the tests; any fixed value. The filter is keyed so a private group is unlinkable.
     const KEY: [u8; 16] = *b"ndn/tier0-testk!";
+
+    /// The parameterized algorithm agrees with the base at `M_BITS`, and a wider Blur puts positions
+    /// in the wider range — so ONE algorithm serves every profile, never a shrink.
+    #[test]
+    fn positions_m_parameterizes_the_blur_width() {
+        let pfx = b"/video/ep1".as_slice();
+        // base wrapper == general algorithm at M_BITS (v1 stays bit-identical).
+        let base = positions(&KEY, pfx);
+        let param = positions_m(&KEY, pfx, M_BITS);
+        for i in 0..K as usize {
+            assert_eq!(base[i] as u16, param[i]);
+            assert!(param[i] < M_BITS as u16);
+        }
+        // a wider Blur (base 126 + additive extra) spreads into the wider range.
+        let wide = positions_m(&KEY, pfx, WIFI_BASE_BLUR + WIFI_WIDE_EXTRA_BLUR);
+        assert!(wide.iter().all(|&p| (p as u32) < WIFI_BASE_BLUR + WIFI_WIDE_EXTRA_BLUR));
+    }
+
+    /// The exact-match Fingerprint is a SEPARATE `FP_BITS`-wide value (not carved from the Blur):
+    /// distinct names get distinct fingerprints, and it is a pure function of the key + full name.
+    #[test]
+    fn fingerprint_is_exact_and_separate() {
+        let a = name_fingerprint(&KEY, b"/video/ep7/v3/seg41");
+        let b = name_fingerprint(&KEY, b"/video/ep7/v3/seg42");
+        assert_ne!(a, b, "distinct exact names ⇒ distinct fingerprints");
+        assert!(a < (1 << FP_BITS), "fingerprint fits FP_BITS");
+        assert_eq!(a, name_fingerprint(&KEY, b"/video/ep7/v3/seg41"), "deterministic");
+        // Different key ⇒ different fingerprint (keyed, unlinkable).
+        let mut k2 = KEY;
+        k2[0] ^= 0xff;
+        assert_ne!(a, name_fingerprint(&k2, b"/video/ep7/v3/seg41"));
+    }
 
     /// `/p0/p1/.../p{depth-1}` with a varying 4-hex-digit leaf, so component length is constant and
     /// depth is the only variable — mirrors the on-device `m7_filter_test::make_name`. Non-leaf
