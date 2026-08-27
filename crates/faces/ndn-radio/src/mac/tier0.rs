@@ -215,6 +215,36 @@ pub const WIFI_BASE_BLUR: u32 = M_BITS; // 126
 /// fixed, and these bits are layered on top. The Fingerprint rides HT Control, separately again.
 pub const WIFI_WIDE_EXTRA_BLUR: u32 = 48 + 16; // 64
 
+/// **Graduated / importance-weighted k.** Instead of a uniform [`K`] bits per prefix level, spend a
+/// per-level budget so low-entropy shared heads (`/ndn`) earn few bits — they discriminate almost
+/// nothing — and the discriminative levels earn more. A `KSchedule` is the per-depth `k`, shared
+/// sender↔receiver like the width profile (both ends MUST use the same schedule or a receiver querying
+/// with more bits than the sender set would false-negative). Depth drives FP (`bits ≈ Σ k_level`), so
+/// tapering the schedule lowers saturation and FP at zero FN. Chosen by measurement — see
+/// `ndn-phy-wifi/examples/tier0_kschedule_eval.rs`.
+pub const K_MAX: usize = 4;
+/// Per-depth `k`, index 0 = root … [`MAX_DEPTH`]-1. Each entry in `1..=K_MAX`.
+pub type KSchedule = [u8; MAX_DEPTH];
+/// The legacy uniform schedule (`k = K` at every level) — the v1 behaviour.
+pub const K_UNIFORM: KSchedule = [K as u8; MAX_DEPTH];
+
+/// The `k` bit positions for one prefix, `k ≤ K_MAX` — [`positions_m`] with a per-level count. Only
+/// the first `k` entries of the returned array are valid.
+pub fn positions_k(key: &[u8; 16], prefix: &[u8], m_blur: u32, k: u8) -> ([u16; K_MAX], usize) {
+    let mut key2 = *key;
+    for (b, d) in key2.iter_mut().zip(KEY2_DOMAIN.iter()) {
+        *b ^= *d;
+    }
+    let h1 = name_hash(key, prefix) as u32;
+    let h2 = (name_hash(&key2, prefix) as u32) | 1;
+    let k = (k as usize).clamp(1, K_MAX);
+    let mut out = [0u16; K_MAX];
+    for (i, o) in out.iter_mut().enumerate().take(k) {
+        *o = (h1.wrapping_add((i as u32).wrapping_mul(h2)) % m_blur) as u16;
+    }
+    (out, k)
+}
+
 /// The exact-match **Fingerprint** width. A *separate* companion field (it rides HT Control on the
 /// pushed 802.11 header, or a body TLV on bit-starved bearers) — it is NEVER carved out of the Blur,
 /// so the Blur never shrinks to make room for it. `w = 24` was picked by measurement
@@ -390,6 +420,23 @@ mod tests {
         // a wider Blur (base 126 + additive extra) spreads into the wider range.
         let wide = positions_m(&KEY, pfx, WIFI_BASE_BLUR + WIFI_WIDE_EXTRA_BLUR);
         assert!(wide.iter().all(|&p| (p as u32) < WIFI_BASE_BLUR + WIFI_WIDE_EXTRA_BLUR));
+    }
+
+    /// Per-level `k` (the graduated/compact Blur, for bit-starved bearers): returns exactly `k`
+    /// positions, and at `k = K` agrees with the uniform [`positions`]. Measurement
+    /// (`tier0_kschedule_eval`) shows graduated k trades bits for compactness at ~equal FP — a LoRa/GCS
+    /// airtime lever, NOT a WiFi FP lever (WiFi keeps uniform, bits are free in the fixed budget).
+    #[test]
+    fn positions_k_is_variable_width_and_matches_uniform_at_k() {
+        let pfx = b"/ndn/edu".as_slice();
+        let (pk, n) = positions_k(&KEY, pfx, M_BITS, K as u8);
+        assert_eq!(n, K as usize);
+        let uni = positions_m(&KEY, pfx, M_BITS);
+        assert_eq!(&pk[..K as usize], &uni[..]); // k=K ⇒ same positions as the uniform path
+        let (_, n2) = positions_k(&KEY, pfx, M_BITS, 2);
+        assert_eq!(n2, 2, "a smaller k yields fewer positions");
+        let (_, n3) = positions_k(&KEY, pfx, M_BITS, 0); // clamped to ≥1
+        assert_eq!(n3, 1);
     }
 
     /// The exact-match Fingerprint is a SEPARATE `FP_BITS`-wide value (not carved from the Blur):
