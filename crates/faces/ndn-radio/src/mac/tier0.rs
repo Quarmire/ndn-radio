@@ -496,6 +496,92 @@ impl<const EXTRA: usize> WideBlur<EXTRA> {
     pub fn extra_bytes(&self) -> &[u8; EXTRA] {
         &self.extra
     }
+
+    /// Reconstruct from a base filter and extra bytes (RX side of the wire mapping).
+    pub fn from_parts(base: PrefixFilter, extra: [u8; EXTRA]) -> Self {
+        Self { base, extra }
+    }
+}
+
+/// Profile marker in `HT Control[3]` announcing the wide layout. Base-only receivers ignore HTC.
+pub const WIDE_PROFILE_MARKER: u8 = 0x01;
+
+/// A wide-profile frame's filter fields, laid out to the pushed 802.11 header. A base-only receiver
+/// reads `addr1‖addr2‖addr3[0:4]` as the 126-bit base Blur (coexistence) and ignores the rest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WideFields {
+    pub addr1: [u8; 6],
+    pub addr2: [u8; 6],
+    pub addr3: [u8; 6], // base[12:16] ‖ ID ‖ flags
+    pub addr4: [u8; 6],
+    pub qos: [u8; 2],
+    pub htc: [u8; 4], // fingerprint (24 bits) ‖ profile marker
+}
+
+/// The wide 802.11 profile: layered Blur + exclusive fingerprint + ephemeral ID + flags, and its
+/// EXACT mapping to the pushed header fields. `to_fields`/`from_fields` round-trip losslessly; the
+/// frame builder emits these as a 4-address QoS+HTC data frame (that integration + on-air validation
+/// is chip-gated), and a commodity base-only receiver still reads the base from `addr1‖2‖3`.
+pub struct WideFrame {
+    pub blur: WideBlur<8>, // 16-byte base + 8 extra bytes (addr4 ‖ QoS)
+    pub fingerprint: u32,  // FP_BITS
+    pub id: u8,
+    pub flags: u8,
+}
+
+impl WideFrame {
+    /// Build the wide-profile filter for one name.
+    pub fn of_name(key: &[u8; 16], name: &[u8], id: u8, flags: u8) -> Self {
+        let mut blur = WideBlur::<8>::new();
+        blur.insert_name(key, name);
+        Self {
+            blur,
+            fingerprint: name_fingerprint(key, name),
+            id,
+            flags,
+        }
+    }
+
+    /// Pack into the pushed 802.11 header fields.
+    pub fn to_fields(&self) -> WideFields {
+        let base = self.blur.base().to_wire(); // 16 bytes, reserved bits fixed
+        let extra = self.blur.extra_bytes();
+        let mut f = WideFields::default();
+        f.addr1.copy_from_slice(&base[0..6]);
+        f.addr2.copy_from_slice(&base[6..12]);
+        f.addr3[0..4].copy_from_slice(&base[12..16]);
+        f.addr3[4] = self.id;
+        f.addr3[5] = self.flags;
+        f.addr4.copy_from_slice(&extra[0..6]);
+        f.qos.copy_from_slice(&extra[6..8]);
+        f.htc[0] = self.fingerprint as u8;
+        f.htc[1] = (self.fingerprint >> 8) as u8;
+        f.htc[2] = (self.fingerprint >> 16) as u8;
+        f.htc[3] = WIDE_PROFILE_MARKER;
+        f
+    }
+
+    /// Unpack from the received header fields.
+    pub fn from_fields(f: &WideFields) -> Self {
+        let mut base = [0u8; 16];
+        base[0..6].copy_from_slice(&f.addr1);
+        base[6..12].copy_from_slice(&f.addr2);
+        base[12..16].copy_from_slice(&f.addr3[0..4]);
+        let mut extra = [0u8; 8];
+        extra[0..6].copy_from_slice(&f.addr4);
+        extra[6..8].copy_from_slice(&f.qos);
+        Self {
+            blur: WideBlur::<8>::from_parts(PrefixFilter::from_wire(base), extra),
+            fingerprint: f.htc[0] as u32 | (f.htc[1] as u32) << 8 | (f.htc[2] as u32) << 16,
+            id: f.addr3[4],
+            flags: f.addr3[5],
+        }
+    }
+
+    /// Is this a wide-profile frame (RX peek at the HTC marker)?
+    pub fn is_wide(fields: &WideFields) -> bool {
+        fields.htc[3] == WIDE_PROFILE_MARKER
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +623,33 @@ mod tests {
         assert_eq!(n2, 2, "a smaller k yields fewer positions");
         let (_, n3) = positions_k(&KEY, pfx, M_BITS, 0); // clamped to ≥1
         assert_eq!(n3, 1);
+    }
+
+    /// The wide-profile wire mapping round-trips losslessly, and a base-only receiver still reads a
+    /// valid base filter from addr1‖addr2‖addr3[0:4] (coexistence across hardware).
+    #[test]
+    fn wide_frame_round_trips_and_stays_base_readable() {
+        let name = b"/video/ep7/v3/seg41".as_slice();
+        let wf = WideFrame::of_name(&KEY, name, 0x42, 0x00);
+        let fields = wf.to_fields();
+        assert!(WideFrame::is_wide(&fields));
+
+        // Round-trip: unpack recovers the blur, fingerprint, ID, flags.
+        let back = WideFrame::from_fields(&fields);
+        assert_eq!(back.fingerprint, wf.fingerprint);
+        assert_eq!(back.fingerprint, name_fingerprint(&KEY, name));
+        assert_eq!(back.id, 0x42);
+        assert!(back.blur.may_match(&WideBlur::<8>::mask_for(&KEY, b"/video")));
+
+        // Coexistence: a base-only (commodity) receiver reads addr1‖addr2‖addr3[0:4] and admits.
+        let mut base = [0u8; 16];
+        base[0..6].copy_from_slice(&fields.addr1);
+        base[6..12].copy_from_slice(&fields.addr2);
+        base[12..16].copy_from_slice(&fields.addr3[0..4]);
+        assert!(
+            PrefixFilter::from_wire(base).may_match(&PrefixFilter::mask_for(&KEY, b"/video")),
+            "commodity base-only receiver still admits under /video from addr1‖2‖3"
+        );
     }
 
     /// The layered wide Blur: base region byte-identical to a base-only frame (coexistence), and the
