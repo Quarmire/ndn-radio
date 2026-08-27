@@ -628,6 +628,28 @@ mod tests {
         assert_eq!(n3, 1);
     }
 
+    /// **Golden wire vector** for the wide profile — every implementation (this host, the LR2021
+    /// firmware, the ath9k-htc C port) MUST reproduce these exact bytes for this `(key, name)`, so
+    /// drift is a red test rather than a silent on-air false negative.
+    #[test]
+    fn wide_profile_golden_vector() {
+        const GKEY: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let wf = WideFrame::of_name(&GKEY, b"/ndn/test/v1", 0x37, 0x00);
+        let f = wf.to_fields();
+        // key = 00..0f, name = "/ndn/test/v1", id = 0x37, flags = 0x00.
+        assert_eq!(wf.fingerprint, 0x004e_38d0, "24-bit fingerprint");
+        assert_eq!(f.addr1, [0x03, 0x80, 0x84, 0x00, 0x01, 0x00], "base Blur bytes 0..6");
+        assert_eq!(f.addr2, [0x08, 0x00, 0x81, 0x00, 0x05, 0x01], "base Blur bytes 6..12");
+        assert_eq!(f.addr3, [0x00, 0xc0, 0x81, 0x00, 0x37, 0x00], "base[12..16] ‖ id ‖ flags");
+        assert_eq!(f.addr4, [0x54, 0x02, 0x88, 0x92, 0x6a, 0x10], "extra Blur (48 bits)");
+        assert_eq!(f.htc, [0xd0, 0x38, 0x4e, 0x01], "fingerprint LE ‖ WIDE_PROFILE_MARKER");
+        // Round-trips back to the same fields.
+        let back = WideFrame::from_fields(&f);
+        assert_eq!(back.fingerprint, wf.fingerprint);
+        assert_eq!(back.id, 0x37);
+        assert_eq!(back.to_fields(), f);
+    }
+
     /// The wide-profile wire mapping round-trips losslessly, and a base-only receiver still reads a
     /// valid base filter from addr1‖addr2‖addr3[0:4] (coexistence across hardware).
     #[test]
