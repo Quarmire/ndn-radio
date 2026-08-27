@@ -279,15 +279,16 @@ impl LearnedPhyPolicy {
 
     fn key(&self, wire: &[u8]) -> Option<u64> {
         let name = wire_name(wire)?;
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for comp in name.components().iter().take(self.prefix_depth) {
-            for b in comp.value.as_ref() {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x0100_0000_01b3);
-            }
-            h ^= 0x2f;
-        }
-        Some(h)
+        // The canonical prefix hash — do NOT hand-inline it. A copy here had silently dropped the
+        // post-separator `wrapping_mul` that `mac::prefix_hash` applies, so it read as the canonical
+        // key but produced different values; harmless only because this map is process-local.
+        let comps: Vec<&[u8]> = name
+            .components()
+            .iter()
+            .take(self.prefix_depth)
+            .map(|c| c.value.as_ref())
+            .collect();
+        Some(crate::mac::prefix_hash(&comps))
     }
 
     fn decay(&self, r: &mut LearnedReach) {

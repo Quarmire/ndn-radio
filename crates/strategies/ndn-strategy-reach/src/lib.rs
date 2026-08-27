@@ -246,7 +246,11 @@ impl SoftPrefixReachStrategy {
     }
 
     /// FNV-1a of the name's first `prefix_depth` components — the registered-prefix granularity the reach
-    /// prior keys on (see `Params::prefix_depth`).
+    /// prior keys on (see `Params::prefix_depth`). A faithful mirror of `ndn_radio::mac::prefix_hash`
+    /// (same constants + separator + post-separator multiply); this crate deliberately does not depend
+    /// on the radio face crate (a strategy is bearer-agnostic), so the algorithm is kept in sync here
+    /// rather than shared. It keys only a process-local map, so exact cross-crate agreement is not
+    /// required — but matching avoids the divergence trap of *looking* like the canonical yet differing.
     fn prefix_key(&self, ctx: &StrategyContext<'_>) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for comp in ctx.name.components().iter().take(self.params.prefix_depth) {
@@ -255,6 +259,7 @@ impl SoftPrefixReachStrategy {
                 h = h.wrapping_mul(0x0100_0000_01b3);
             }
             h ^= 0x2f; // component separator so /p/1 and /p1 differ
+            h = h.wrapping_mul(0x0100_0000_01b3);
         }
         h
     }
