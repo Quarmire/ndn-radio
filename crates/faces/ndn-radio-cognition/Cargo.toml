@@ -11,6 +11,15 @@ license.workspace = true
 # face/engine I/O lives in the LinkServiceFeature seam, not here.
 classification = "extension"
 
+[features]
+default = ["occupancy-sampler"]
+# The one carve-out from this crate's sans-IO purity: `spawn_occupancy_sampler`
+# runs a background poll of `RadioKnobs::read_channel_activity`, so it needs a
+# runtime. It lives here (not in a PHY crate) because it is bearer-agnostic — see
+# `src/occupancy.rs`. Everything else in the crate stays pure and runtime-free;
+# a consumer that wants only the pure core takes `default-features = false`.
+occupancy-sampler = ["dep:tokio", "dep:tracing"]
+
 [dependencies]
 ndn-radio = { path = "../ndn-radio" }
 ndn-frame-io = { workspace = true }
@@ -20,6 +29,9 @@ ndn-signals-core = { workspace = true }
 # The shared radio HAL contract — home of the `RadioCapability` descriptor +
 # `Band`/`RadioKind`/`TimingModel` (re-exported through `src/sense.rs`).
 ndn-radio-hal    = { workspace = true }
+# `occupancy-sampler` only — the background frame-free occupancy poll (see [features]).
+tokio   = { workspace = true, features = ["rt", "time"], optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Drives the live LoRa radio in examples/lora_cognition.rs (moved here from

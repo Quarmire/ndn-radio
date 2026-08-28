@@ -40,6 +40,19 @@ pub struct TxParams {
     pub tx_power_dbm: Option<i8>,
     /// Bearer-specific PHY rate/robustness knobs.
     pub rate: RateParams,
+    /// **The modulation itself** — the `SetPacketType` mode this transmission wants the radio in.
+    ///
+    /// One level up from [`rate`](Self::rate): `rate` says how fast to run *within* a modulation,
+    /// this says *which* modulation. The two are not independent — an LR2021 in
+    /// [`PhyMode::Flrc`](crate::PhyMode) has no spreading factor at all, while the same silicon in
+    /// [`PhyMode::Lora`](crate::PhyMode) has SF7..SF12 — which is why a switch replaces the radio's
+    /// whole capability rather than patching a field of it.
+    ///
+    /// `None` = **leave the radio's current modulation untouched**, and that is the default and the
+    /// behaviour of every plan that predates this axis. A value here is only ever a mode the radio
+    /// ADVERTISED (`EVT_CAP.phy_bitmap`); [`PhyDial`](crate::PhyDial) is what decides it, with the
+    /// hysteresis a disruptive, un-negotiated, both-ends-must-move switch demands.
+    pub phy: Option<crate::PhyMode>,
 }
 
 // NO per-name frame-length / MTU knob lives here, and that is a measured decision
@@ -127,8 +140,8 @@ pub struct LoraRate {
 /// above it, and a duplicated `BASE[10]` literal in the phy-wifi scorer.
 pub fn mcs_base_rate_mbps(mcs: u8) -> f32 {
     match mcs {
-        8 => 78.0,    // VHT MCS8 (256-QAM 3/4), 1SS 20 MHz LGI — beyond the HT-only HAL table
-        9 => 87.75,   // VHT MCS9 (256-QAM 5/6)
+        8 => 78.0,  // VHT MCS8 (256-QAM 3/4), 1SS 20 MHz LGI — beyond the HT-only HAL table
+        9 => 87.75, // VHT MCS9 (256-QAM 5/6)
         m => ndn_radio_hal::mcs_phy_rate_bps(m) as f32 / 1_000_000.0, // HT 0–7, canonical
     }
 }
@@ -237,6 +250,16 @@ impl TxParams {
             None
         }
     }
+
+    /// The decided modulation, if this plan names one. `None` = leave the radio where it is.
+    ///
+    /// A plain field read rather than a variant match, because this axis is **not** keyed by
+    /// bearer: an SX1262 does LoRa + GFSK, an SX1276 does LoRa + FSK + OOK and an LR2021 does
+    /// fourteen modes, so "which modulation" is a question every one of them answers, while
+    /// "which spreading factor" is a question only some of them have.
+    pub fn phy(&self) -> Option<crate::PhyMode> {
+        self.phy
+    }
     /// Mutable access to the Wi-Fi rate (e.g. for the Minstrel-style probe bump), if this is Wi-Fi.
     pub fn wifi_mut(&mut self) -> Option<&mut WifiRate> {
         if let RateParams::Wifi(w) = &mut self.rate {
@@ -310,6 +333,13 @@ pub struct DataPlaneConfig {
     /// monitor-wifi face now actuates FHSS from it (`ndn_phy_wifi::FaceScheduler`,
     /// `NDN_SCHED_HOP`). This firmware flag stays off until the *firmware* carries its own common-view
     /// clock (a separate port), not the host's — hence still gated here.
+    ///
+    /// ★ **This is not the only hop path any more, and it is no longer the interesting one.** A
+    /// radio with its own hop sequencer takes a whole `(carrier, period)` TABLE
+    /// ([`crate::name_hop_plan`] → [`RadioKnobs::set_hop_plan`](ndn_radio_hal::RadioKnobs)) and
+    /// walks it *inside a packet*, at a dwell no host command and no firmware `hop_channel` call
+    /// could reach. That path needs no firmware clock at all — the sequencer keeps its own time —
+    /// which is why it, and not this flag, is where name-keyed hopping actually landed.
     pub hop: bool,
 }
 

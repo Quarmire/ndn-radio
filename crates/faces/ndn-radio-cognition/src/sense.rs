@@ -16,7 +16,15 @@ use crate::report::ReceptionReport;
 // reference (`Band::`, `RadioKind::`, `RadioCapability`, used by
 // this module, `policy.rs`, and the `lib.rs` re-export) still resolves through
 // `crate::sense::…` / `crate::…` unchanged.
-pub use ndn_radio_hal::{Band, RadioCapability, RadioKind, RateCapability};
+/// The capability descriptor and its axes live in the shared HAL crate. The **modulation axis**
+/// ([`PhyMode`] / [`PhyModeSet`]) and the **autonomous-hop axis** ([`HopCapability`] /
+/// [`HopControl`] / [`HopPeriodUnit`]) come from there too — cognition adds the *model* on top of
+/// them (`src/phy.rs`, `src/hop.rs`) rather than a second vocabulary.
+#[allow(unused_imports)]
+pub use ndn_radio_hal::{
+    Band, HopCapability, HopControl, HopPeriodUnit, PhyMode, PhyModeSet, RadioCapability, RadioKind,
+    RateCapability,
+};
 
 /// Identifies one physical radio / face on this node. The degenerate single-radio
 /// case is just one `RadioId`.

@@ -11,7 +11,7 @@ classification = "extension"
 [dependencies]
 ndn-transport       = { workspace = true }
 ndn-radio-hal       = { workspace = true }
-ndn-radio-cognition = { workspace = true }
+ndn-radio-cognition = { workspace = true, features = ["occupancy-sampler"] }
 ndn-coding          = { path = "../../coding/ndn-coding", default-features = false, features = ["link-fec-bridge"] }
 bytes               = { workspace = true, features = ["std"] }
 tracing             = { workspace = true }
@@ -27,6 +27,8 @@ tokio               = { workspace = true, features = ["sync", "rt", "macros", "t
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
+# Test doubles implement `FrameIo`, which is an `#[async_trait]` trait.
+async-trait  = { workspace = true }
 ndn-frame-io = { workspace = true }
 # `examples/lora_face_node.rs`: a real NDN Interest/Data roundtrip through LoraPhy -> Face ->
 # ForwarderEngine, over the loopback bus (self-test, no hardware) or a real serial dongle.

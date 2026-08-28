@@ -50,6 +50,9 @@ pub use ndn_radio::mac::{coop, dos, ephemeral_id, gcs, name, prefix_hash, schedu
 mod calibrate;
 mod contextual;
 mod demand;
+mod hop;
+mod occupancy;
+mod phy;
 mod plan;
 mod policy;
 mod report;
@@ -65,6 +68,14 @@ pub use contextual::{
     reward,
 };
 pub use demand::DemandTracker;
+pub use hop::{HOP_KEY_DOMAIN, HopPlan, MAX_HOP_COUPLES, carrier_grid, name_hop_plan};
+#[cfg(feature = "occupancy-sampler")]
+pub use occupancy::spawn_occupancy_sampler;
+pub use occupancy::{OccupancySink, activity_rate};
+pub use phy::{
+    PhyDial, PhyDialConfig, PhyHold, PhyRole, fastest_phy, parse_phy_mode, phy_mode_name,
+    phy_peak_bps, phy_role, ranked_phys, rendezvous_phy,
+};
 pub use plan::{
     AllocRole, DataPlaneConfig, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan,
     RateParams, TxParams, WifiRate, mcs_base_rate_mbps,
@@ -79,9 +90,9 @@ pub use report::{
 };
 pub use schedule::{HopSchedule, LeaseClass, SlotSchedule, wifi_airtime_us};
 pub use sense::{
-    Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, LinkResidual,
-    MediumState, MediumView, NeighborReport, RadioCapability, RadioId, RadioKind, RateCapability,
-    lora_airtime_ms,
+    Band, ChannelOccupancy, DEFAULT_SATURATION_FPS, DUTY_WINDOW_MS, Demand, Ewma, HopCapability,
+    HopControl, HopPeriodUnit, LinkResidual, MediumState, MediumView, NeighborReport, PhyMode,
+    PhyModeSet, RadioCapability, RadioId, RadioKind, RateCapability, lora_airtime_ms,
 };
 pub use strategy::RadioStrategy;
 

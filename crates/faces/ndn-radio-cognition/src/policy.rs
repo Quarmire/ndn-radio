@@ -26,8 +26,10 @@ use crate::plan::{
     AllocRole, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams, TxParams,
     WifiRate,
 };
-use crate::sense::{MediumView, RadioCapability, RadioId, RadioKind};
+use crate::phy::{PhyDial, PhyHold};
+use crate::sense::{MediumView, PhyMode, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
+use std::sync::Arc;
 
 /// Delivery priority derived from the name / Interest (urgency, freshness, trust).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -169,6 +171,11 @@ pub struct RadioRationale {
     pub channel_busy_pct: Option<u8>,
     /// Weakest wanted-receiver RSSI (dBm) driving the MCS + power pick.
     pub rssi_dbm: Option<i8>,
+    /// The modulation this allocation names, if the PHY axis is in play (`None` = the radio's
+    /// current mode is left alone).
+    pub phy: Option<PhyMode>,
+    /// Why the modulation dial is where it is — a switch, or which brake held it.
+    pub phy_hold: Option<PhyHold>,
     // Tombstone: `link_per` removed with its always-empty sensor (`LinkResidual::link_per`).
     /// Replicate vs Split role of this allocation.
     pub role: AllocRole,
@@ -182,6 +189,11 @@ pub struct RadioPolicy {
     /// Learned per-SF operating thresholds for LoRa (shared with a [`crate::SfCalibrator`]).
     /// `None` ⇒ use the static preset.
     learned_sf: Option<SfThresholds>,
+    /// The **modulation dial** ([`PhyDial`]) — the hysteresis behind the PHY axis, shared so its
+    /// state (current mode, confirmation count, cool-down, failed-excursion penalty) survives
+    /// across decisions. `None` ⇒ no PHY is ever decided and every plan leaves the radio's
+    /// modulation untouched, which is the behaviour of every caller that predates this axis.
+    phy_dial: Option<Arc<PhyDial>>,
 }
 
 impl Default for RadioPolicy {
@@ -196,6 +208,7 @@ impl RadioPolicy {
             cfg,
             learned: None,
             learned_sf: None,
+            phy_dial: None,
         }
     }
 
@@ -211,6 +224,66 @@ impl RadioPolicy {
     pub fn with_learned_sf_thresholds(mut self, thresholds: SfThresholds) -> Self {
         self.learned_sf = Some(thresholds);
         self
+    }
+
+    /// **Decide the modulation too** — attach the [`PhyDial`] that owns the PHY axis.
+    ///
+    /// Without it the policy decides SF/CR/BW/power exactly as before and never names a
+    /// modulation, so attaching this is the whole opt-in. Share ONE dial per radio: its state
+    /// *is* the hysteresis (confirmation count, cool-down, failed-excursion penalty), and a
+    /// dial rebuilt per decision would have none.
+    pub fn with_phy_dial(mut self, dial: Arc<PhyDial>) -> Self {
+        self.phy_dial = Some(dial);
+        self
+    }
+
+    /// The attached dial, for a caller that wants to read the committed mode or the hold reason.
+    pub fn phy_dial(&self) -> Option<&Arc<PhyDial>> {
+        self.phy_dial.as_ref()
+    }
+
+    /// The **anchor** the PHY dial states its crossover against: the operating threshold of the
+    /// reach modulation's *fastest* rung (SF7), learned if a calibrator is attached.
+    ///
+    /// Stated as a relation to this ladder rather than as an absolute FLRC sensitivity because
+    /// this ladder is the one this crate actually measures and calibrates — and nobody here has
+    /// measured an FLRC threshold. See [`PhyDial`] on why that matters.
+    fn phy_anchor_dbm(&self) -> f32 {
+        match &self.learned_sf {
+            Some(cell) => cell.read().unwrap()[7],
+            None => STATIC_REQ_RSSI_SF[7],
+        }
+    }
+
+    /// Ask the dial for this radio's modulation. `None` (no dial, nothing advertised, or a
+    /// radio whose offer holds fewer than two rankable modes) ⇒ the plan names no mode and the
+    /// radio stays where it is.
+    fn decide_phy(
+        &self,
+        radio: RadioId,
+        cap: &RadioCapability,
+        ctx: &NameContext,
+        view: &dyn MediumView,
+        now_ms: u64,
+    ) -> Option<PhyMode> {
+        let dial = self.phy_dial.as_ref()?;
+        dial.evaluate(
+            // The radio's own words: what it advertises and what it says it is running. An
+            // empty set means "it has not said", and the dial then names nothing.
+            cap.phy_modes,
+            cap.phy_current,
+            // The MEASURED weakest receiver, never `demand_set_rssi`'s proxy fallback: a
+            // modulation is a rendezvous parameter of the strongest kind (a mismatch is
+            // deafness, not slowness), so it moves only on a number both ends can see.
+            view.weakest_rssi(radio, now_ms),
+            self.phy_anchor_dbm(),
+            ctx.priority,
+            // Heard peers, not wanted receivers: the peer-silence escape hatch asks "did anyone
+            // follow us", which only reception can answer.
+            view.receiver_count(now_ms) > 0,
+            now_ms,
+        )
+        .0
     }
 
     /// Highest MCS the current thresholds allow at `rssi` (learned if present), capped by the
@@ -362,6 +435,11 @@ impl RadioPolicy {
                 channel,
                 channel_busy_pct: channel.and_then(|ch| view.busy_pct(*radio, ch)),
                 rssi_dbm: self.demand_set_rssi(*radio, view, now_ms),
+                // Read back off the params rather than re-asking the dial: a second `evaluate`
+                // would advance the confirmation counter and make the trace itself change the
+                // decision it is reporting on.
+                phy: params.phy,
+                phy_hold: self.phy_dial.as_ref().map(|d| d.last_hold()),
                 role,
             });
             allocations.push(RadioAllocation {
@@ -482,6 +560,9 @@ impl RadioPolicy {
                 Some(125)
             };
             return TxParams {
+                // The modulation itself — decided one level above SF, from the same measured
+                // inputs, and constrained to what this radio advertised.
+                phy: self.decide_phy(radio, cap, ctx, view, now_ms),
                 rate: RateParams::Lora(LoraRate {
                     spreading_factor: Some(sf),
                     coding_rate: Some(cr),
@@ -576,6 +657,10 @@ impl RadioPolicy {
         };
 
         TxParams {
+            // 802.11 has no `SetPacketType` axis: HT/VHT/HE and the MCS index below already say
+            // everything there is to say about its modulation, so a Wi-Fi radio advertises no
+            // PHY set and this stays `None` — the axis is per-radio, not universal.
+            phy: None,
             rate: RateParams::Wifi(WifiRate {
                 mcs: Some(mcs),
                 // HE and VHT are alternative modes — when the HE reach corner fires, the frame is HE, not VHT.
@@ -1187,6 +1272,139 @@ mod tests {
             bulk_busy > bulk_clear,
             "correlated (busy) loss must undo the discount: busy {bulk_busy} > clear {bulk_clear}"
         );
+    }
+
+    // ── E1: the modulation axis reaches the PLAN ─────────────────────────────────────────
+
+    /// A LoRa-only medium whose radio advertises LoRa **and** FLRC and is running LoRa — the
+    /// LR2021 case, and the whole reason this axis exists.
+    fn agile_lora(rssi_dbm: i8) -> MediumState {
+        let mut m = MediumState::new();
+        let cap = RadioCapability::lora_with(
+            RadioKind::Lora,
+            vec![crate::Band::Sub1GHz],
+            vec![65],
+            crate::RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12,
+            },
+            200,
+            1.0,
+        )
+        .with_phy(
+            crate::PhyModeSet::single(crate::PhyMode::Lora).with(crate::PhyMode::Flrc),
+            crate::PhyMode::Lora,
+        );
+        m.register_radio(L, cap);
+        m.observe_rx(L, 0x1234, Some(rssi_dbm), 1_000);
+        m
+    }
+
+    fn bulk(hash: u64) -> NameContext {
+        NameContext {
+            priority: Priority::Bulk,
+            ..NameContext::new(hash)
+        }
+    }
+
+    /// **The opt-in is total.** With no dial attached the plan names no modulation, so every
+    /// caller that predates this axis leaves the radio exactly where it booted.
+    #[test]
+    fn without_a_dial_no_plan_names_a_modulation() {
+        let m = agile_lora(-40);
+        let plan = RadioPolicy::default().decide(&bulk(0xAA), &m, 5_000);
+        assert_eq!(plan.allocations[0].params.phy(), None);
+    }
+
+    /// **E1 end to end** — a strong, measured, bulk link moves the PLAN onto the rate PHY, and
+    /// only after the dial's confirmations. The proof the decision is reachable, not just
+    /// computable (the failure mode this whole stack is named for).
+    #[test]
+    fn a_strong_bulk_link_plans_the_rate_phy() {
+        let m = agile_lora(-40);
+        let dial = Arc::new(PhyDial::new(None));
+        let p = RadioPolicy::default().with_phy_dial(dial.clone());
+
+        let first = p.decide(&bulk(0xAA), &m, 5_000);
+        assert_eq!(
+            first.allocations[0].params.phy(),
+            Some(crate::PhyMode::Lora),
+            "the first decision must not switch — it names where the radio already is"
+        );
+        let mut planned = first.allocations[0].params.phy();
+        for i in 1..20u64 {
+            planned = p.decide(&bulk(0xAA), &m, 5_000 + i).allocations[0]
+                .params
+                .phy();
+        }
+        assert_eq!(planned, Some(crate::PhyMode::Flrc));
+    }
+
+    /// A weak link keeps the reach PHY however many times it is asked, and an `Urgent` name never
+    /// leaves it at all — reach beats rate for the traffic that needs reach.
+    #[test]
+    fn a_weak_link_and_an_urgent_name_both_stay_on_the_reach_phy() {
+        let weak = agile_lora(-105);
+        let dial = Arc::new(PhyDial::new(None));
+        let p = RadioPolicy::default().with_phy_dial(dial);
+        for i in 0..40u64 {
+            let plan = p.decide(&bulk(0xAA), &weak, 5_000 + i * 1_000);
+            assert_eq!(plan.allocations[0].params.phy(), Some(crate::PhyMode::Lora));
+        }
+
+        let strong = agile_lora(-40);
+        let p2 = RadioPolicy::default().with_phy_dial(Arc::new(PhyDial::new(None)));
+        for i in 0..40u64 {
+            let plan = p2.decide(&NameContext::new(0xBB), &strong, 5_000 + i * 1_000);
+            assert_eq!(
+                plan.allocations[0].params.phy(),
+                Some(crate::PhyMode::Lora),
+                "a non-bulk name must not spend the switch"
+            );
+        }
+    }
+
+    /// **A radio that has described no modes gets no mode named** — and a Wi-Fi radio, which has
+    /// no `SetPacketType` axis at all, never does either.
+    #[test]
+    fn a_silent_radio_and_a_wifi_radio_are_never_given_a_mode() {
+        let mut quiet = MediumState::new();
+        quiet.register_radio(L, RadioCapability::lora_with(
+            RadioKind::Lora,
+            vec![crate::Band::Sub1GHz],
+            vec![65],
+            crate::RateCapability::Lora { min_sf: 7, max_sf: 12 },
+            200,
+            1.0,
+        ));
+        quiet.observe_rx(L, 0x1234, Some(-40), 1_000);
+        let p = RadioPolicy::default().with_phy_dial(Arc::new(PhyDial::new(None)));
+        for i in 0..20u64 {
+            let plan = p.decide(&bulk(0xAA), &quiet, 5_000 + i * 1_000);
+            assert_eq!(plan.allocations[0].params.phy(), None);
+        }
+
+        let w = wifi_only();
+        let plan = RadioPolicy::default()
+            .with_phy_dial(Arc::new(PhyDial::new(None)))
+            .decide(&bulk(0xAA), &w, 5_000);
+        assert_eq!(plan.allocations[0].params.phy(), None);
+    }
+
+    /// The rationale carries the mode AND the brake that is holding it, so a trace shows the
+    /// *why* of a modulation rather than only the modulation.
+    #[test]
+    fn the_rationale_carries_the_modulation_and_its_brake() {
+        let m = agile_lora(-40);
+        let p = RadioPolicy::default().with_phy_dial(Arc::new(PhyDial::new(None)));
+        let (_, why) = p.decide_traced(&bulk(0xAA), &m, 5_000);
+        assert_eq!(why.radios[0].phy, Some(crate::PhyMode::Lora));
+        assert_eq!(why.radios[0].phy_hold, Some(crate::PhyHold::Confirming));
+
+        // With no dial there is no hold to report — the axis is simply not in play.
+        let (_, why) = RadioPolicy::default().decide_traced(&bulk(0xAA), &m, 5_000);
+        assert_eq!(why.radios[0].phy, None);
+        assert_eq!(why.radios[0].phy_hold, None);
     }
 
     #[test]

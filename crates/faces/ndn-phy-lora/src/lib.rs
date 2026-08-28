@@ -39,6 +39,7 @@
 //! [`ndn-phy-ble`]: https://docs.rs/ndn-phy-ble
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -47,9 +48,14 @@ use ndn_coding::link_fec_bridge::{GenerationSink, LinkFecBridge};
 pub use ndn_radio_cognition::TxParams;
 use ndn_radio_cognition::gcs::{BODY_PREFIX_TLV, GCS_MAX_BYTES, GcsFilter};
 use ndn_radio_cognition::name::{inner_name, ndn_name_to_slash};
+/// The bearer-agnostic frame-free occupancy sampler (#30), re-exported so a wiring site can
+/// attach one to this face without naming the cognition crate. It used to live in
+/// `ndn-phy-wifi`, which made a LoRa node depend on the *Wi-Fi* crate to sense its own
+/// channel; see [`LoraPhy::start_occupancy_sampling`].
+pub use ndn_radio_cognition::{OccupancySink, RadioId, activity_rate, spawn_occupancy_sampler};
 use ndn_radio_hal::{
-    Bandwidth, FaceError, FrameIo, InjectFrame, RadioKnobs, RadioProfile, RadioTime,
-    RateCapability, TxIntent,
+    Bandwidth, ClockDomainId, FaceError, FrameIo, HopControl, InjectFrame, PhyMode, RadioKnobs,
+    RadioProfile, RadioTime, RadioTimeSource, RateCapability, TxDiscipline, TxIntent,
 };
 pub use ndn_radio_hal::{OpenRadio, RadioCapability};
 use ndn_transport::{
@@ -62,6 +68,13 @@ use ndn_transport::{
 /// direct dependency on the cognition crate (which depends, in turn, on `ndn-radio` — the wiring
 /// site is usually inside it).
 pub use ndn_radio_cognition::{LoraRate, RateParams};
+/// The name-keyed hop plan (#40). Re-exported so a wiring site can build and read one without
+/// naming the cognition crate — see [`LoraPhy::install_name_hop_plan`].
+pub use ndn_radio_cognition::{HopPlan, carrier_grid, name_hop_plan};
+/// The modulation axis a plan can name: the HAL's [`PhyMode`] vocabulary plus cognition's
+/// name↔mode mapping, re-exported for the same reason — a wiring site sets `TxParams::phy`
+/// without depending on either crate directly.
+pub use ndn_radio_cognition::{parse_phy_mode, phy_mode_name};
 
 /// The face's own **frame-payload ceiling** — the most this bearer will ever put in one
 /// frame, whatever a radio declares.
@@ -93,6 +106,41 @@ const LORA_FEC_K: usize = 2;
 /// a frame can take ~1 s at SF12, so a tight window would flush half-empty
 /// generations constantly. The face's caller can override via [`with_link_fec`].
 const LORA_FEC_WINDOW: Duration = Duration::from_secs(3);
+
+/// **When** a frame is allowed on air — the output of a slot gate, and the one thing a
+/// hardware-scheduling radio needs in order to place the frame itself.
+///
+/// Two shapes because the two `FrameIo` scheduling seams are genuinely different:
+///
+/// * [`After`](Self::After) is a *delay against the device's own timebase*, which is what
+///   makes it **reconcile-free**: the offset between the scheduler's clock and the radio's TX
+///   clock cancels, so no cross-domain mapping has to be learned first. Prefer it.
+/// * [`AtClock`](Self::AtClock) is an *absolute instant in a named clock domain*, for a caller
+///   that already holds a disciplined mapping into that domain (`ndn-time`).
+///
+/// The face never invents one of these — a caller supplies it through
+/// [`LoraPhy::with_slot_gate`], from whatever lease/schedule it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotTiming {
+    /// Transmit `delay_us` microseconds from now, on the radio's own clock. `0` = now.
+    After {
+        /// Microseconds from now.
+        delay_us: u64,
+    },
+    /// Transmit at absolute `tick` in `domain`. Requires a radio that schedules TX in
+    /// hardware — the host cannot honour a foreign clock domain's instant by sleeping.
+    AtClock {
+        /// The target counter value, in `domain`'s own units/epoch.
+        tick: u64,
+        /// Which counter `tick` is expressed in.
+        domain: ClockDomainId,
+    },
+}
+
+/// A slot gate: given the outbound wire, when may it go on air? `None` ⇒ not slot-schedulable
+/// (no name-group, no schedule, a control frame) — transmit now, which is the pre-existing
+/// behaviour and the default for a face with no gate installed.
+pub type SlotGate = dyn Fn(&[u8]) -> Option<SlotTiming> + Send + Sync;
 
 /// The LoRa injection specifics the bearer-agnostic [`LinkFecBridge`] delegates:
 /// put each coded frame of a generation on the air via the serial radio. LoRa has
@@ -177,6 +225,9 @@ enum SfPolicy {
 /// value is pure cost — on a serial bridge, a blocking command round-trip per frame.
 #[derive(Default, Clone, Copy, PartialEq)]
 struct AppliedRate {
+    /// The modulation last commanded — and, on success, the one the radio REPORTED back, not the
+    /// one we asked for (a chip may refuse a mode the node advertises).
+    phy: Option<PhyMode>,
     sf: Option<u8>,
     cr: Option<u8>,
     bw_khz: Option<u32>,
@@ -194,6 +245,12 @@ struct AppliedRate {
 /// See [`AppliedRate::refused`].
 #[derive(Default, Clone, Copy, PartialEq)]
 struct Refused {
+    /// The modulation the radio refused, if one has been. **A mode, not a flag**: unlike every
+    /// other knob here, a refusal is a property of the `(radio, mode)` pair rather than of the
+    /// radio, and latching a bare boolean would take the whole axis out of service after one
+    /// unreachable mode. Latched at all because the alternative is a blocking serial round trip
+    /// on every single send, for an answer that cannot change.
+    phy: Option<PhyMode>,
     sf: bool,
     cr: bool,
     bw: bool,
@@ -226,12 +283,21 @@ pub struct LoraPhy {
     time: Option<Arc<dyn RadioTime>>,
     /// The radio's self-description. Governs the MTU and the SF policy.
     profile: Option<Arc<dyn RadioProfile>>,
-    /// The capability read from `profile` **once**, at construction: `send_mtu` and the
-    /// per-frame actuator both consult it, and a per-send `capability()` call would be a
-    /// lock (or a device round-trip) on the hot path. Re-read by rebuilding the face.
-    cap: Option<RadioCapability>,
-    /// Derived from `cap` + the GCS headroom — see [`LORA_MTU`].
-    mtu: usize,
+    /// The capability read from `profile`: `send_mtu` and the per-frame actuator both consult
+    /// it, and a per-send `capability()` call would be a lock (or a device round-trip) on the
+    /// hot path, so it is cached here.
+    ///
+    /// Behind a lock rather than plain, because of ONE event: a successful
+    /// [`RadioKnobs::set_phy`] **invalidates the whole capability** — payload cap, rate model,
+    /// SF span, scheduling granularity and even the band are per-PHY. So the actuator re-reads
+    /// the profile and replaces this wholesale ([`refresh_capability`](Self::refresh_capability)),
+    /// which it cannot do through a plain field on `&self`. Without that, a face that switched
+    /// modulation would go on fragmenting to the *old* MTU and hand the driver frames it now
+    /// rejects — invisible loss rather than an error.
+    cap: RwLock<Option<RadioCapability>>,
+    /// Derived from `cap` + the GCS headroom — see [`LORA_MTU`]. Recomputed whenever `cap` is,
+    /// so the two can never disagree about the frame size.
+    mtu: AtomicUsize,
     egress: Egress,
     /// Recovered payloads awaiting `recv_bytes` (FEC decode can yield 0/1/many).
     pending: Mutex<VecDeque<Bytes>>,
@@ -245,6 +311,10 @@ pub struct LoraPhy {
     gcs: Option<GcsCfg>,
     /// Last values pushed through `knobs`, so an unchanged plan costs nothing.
     applied: Mutex<AppliedRate>,
+    /// The named airtime lease's reach into this bearer: when may this wire go on air?
+    /// `None` ⇒ ungated (transmit on call), which is the default and the historical behaviour.
+    /// See [`with_slot_gate`](LoraPhy::with_slot_gate).
+    slot_gate: Option<Arc<SlotGate>>,
 }
 
 impl LoraPhy {
@@ -261,13 +331,14 @@ impl LoraPhy {
             knobs: None,
             time: None,
             profile: None,
-            cap: None,
-            mtu: LORA_MTU,
+            cap: RwLock::new(None),
+            mtu: AtomicUsize::new(LORA_MTU),
             egress: Egress::Direct,
             pending: Mutex::new(VecDeque::new()),
             planned: None,
             gcs: None,
             applied: Mutex::new(AppliedRate::default()),
+            slot_gate: None,
         }
     }
 
@@ -284,7 +355,7 @@ impl LoraPhy {
         me.knobs = r.knobs;
         me.time = r.time;
         if let Some(p) = r.profile {
-            me.cap = Some(p.capability());
+            *me.cap.get_mut().unwrap() = Some(p.capability());
             me.profile = Some(p);
         }
         me.recompute_mtu();
@@ -307,7 +378,7 @@ impl LoraPhy {
 
     /// Attach the radio's self-description — and take the MTU and the SF policy from it.
     pub fn with_profile(mut self, profile: Arc<dyn RadioProfile>) -> Self {
-        self.cap = Some(profile.capability());
+        *self.cap.get_mut().unwrap() = Some(profile.capability());
         self.profile = Some(profile);
         self.recompute_mtu();
         self
@@ -318,6 +389,115 @@ impl LoraPhy {
     /// on-device name filter. `None` when the radio has no reachable knobs.
     pub fn knobs(&self) -> Option<Arc<dyn RadioKnobs>> {
         self.knobs.clone()
+    }
+
+    /// **Start frame-free occupancy sensing on this radio** (#30) — the LoRa end of the
+    /// sampler that used to be reachable only through `ndn-phy-wifi`.
+    ///
+    /// Spawns [`spawn_occupancy_sampler`] over this face's own [`knobs`](Self::knobs), so the
+    /// same radio that ACTs also SENSEs its medium; the readings land in `sink` (a shared
+    /// `Mutex<MediumState>`, or any [`OccupancySink`]) and the policy then decides on measured
+    /// channel load instead of a guess. On the 7E-A5 fleet this is the `CMD_SENSE` opcode, and
+    /// a node whose `cmd_bitmap` lacks it answers `Ok(None)` — the sampler then polls once and
+    /// exits, so an incapable radio costs one round-trip, not a permanent task.
+    ///
+    /// `None` when this face has no reachable knobs (built from a bare `FrameIo`): there is
+    /// nothing to poll, and returning a handle to a task that can never sample would be the
+    /// fake success this stack refuses.
+    pub fn start_occupancy_sampling<S>(
+        &self,
+        sink: Arc<S>,
+        radio: RadioId,
+        channel: u8,
+        interval: Duration,
+        now_ms: impl Fn() -> u64 + Send + 'static,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        S: OccupancySink + ?Sized,
+    {
+        let knobs = self.knobs.clone()?;
+        Some(spawn_occupancy_sampler(
+            sink, radio, channel, knobs, interval, now_ms,
+        ))
+    }
+
+    /// **Install the named airtime lease's gate on this bearer** (#61/#40).
+    ///
+    /// `gate` answers *when* an outbound wire may go on air; the face then answers *how* that
+    /// is enforced, and that is the whole point of this seam:
+    ///
+    /// * a radio that really schedules TX (`FrameIo::schedules_tx` **and**
+    ///   [`TxDiscipline::ScheduledAt`]) gets the timing handed to `inject_after` /
+    ///   `inject_at_clock`, so the MCU places the frame and the host never sleeps;
+    /// * every other radio gets the software gate — the host sleeps out the delay and then
+    ///   injects, exactly as before.
+    ///
+    /// With no gate installed the face is byte-for-byte unchanged: every `send_bytes` injects
+    /// on call. See [`schedules_tx_in_hardware`](Self::schedules_tx_in_hardware).
+    pub fn with_slot_gate<F>(mut self, gate: F) -> Self
+    where
+        F: Fn(&[u8]) -> Option<SlotTiming> + Send + Sync + 'static,
+    {
+        self.slot_gate = Some(Arc::new(gate));
+        self
+    }
+
+    /// **Does this radio place TX in time itself?** Both halves are required, and the second is
+    /// the one that bites: `TxDiscipline::ScheduledAt` is a *label* a backend can declare
+    /// without implementing the seam, and the HAL default for `inject_after` is *inject now*.
+    /// Trusting the label alone would skip the software gate AND drop the delay — the frame
+    /// leaves immediately with no slot discipline at all, strictly worse than never having
+    /// claimed the discipline. (Measured live case on Wi-Fi: the AR9271 declares
+    /// `ScheduledAt{1 µs}` and implements neither seam.) `FrameIo::schedules_tx` is overridden
+    /// only alongside a real `inject_after`, so requiring both makes the fallback safe for
+    /// every present and future backend.
+    ///
+    /// A face with no knobs attached cannot read a discipline, so it reports `false` and takes
+    /// the software gate — an honest answer, not a guess.
+    pub fn schedules_tx_in_hardware(&self) -> bool {
+        self.radio.schedules_tx()
+            && self
+                .knobs
+                .as_ref()
+                .is_some_and(|k| matches!(k.tx_discipline(), TxDiscipline::ScheduledAt { .. }))
+    }
+
+    /// **A clock this face could name an absolute transmit instant in** — the best link clock the
+    /// radio exposes that can be *read now*, monotonically.
+    ///
+    /// Both properties are required and neither is cosmetic. Without `read_now` there is no way to
+    /// relate an instant to the present at all; without `monotonic` (a beacon-resynced port TSF,
+    /// say) the counter can step backwards between the arm and the deadline, and a schedule built
+    /// on it places frames at times that never arrive.
+    ///
+    /// ⚠ **This is a hint for a caller building a gate, not the gate's own capability test.** A
+    /// radio may be able to *schedule* in a domain it does not advertise a source for — MEASURED
+    /// in this fleet: the Waveshare SX1262 stamps with a firmware software counter, which the
+    /// backend rightly refuses to advertise as a link clock (promoting it would make two nodes
+    /// difference their firmware main-loop latencies and call it a clock offset), yet
+    /// `CMD_READ_CLOCK` reads that same counter and `CMD_TX_AT` schedules against it. Judging the
+    /// scheduling path by this list would refuse a radio that works.
+    pub fn tx_clock_domain(&self) -> Option<ClockDomainId> {
+        self.best_clock().map(|s| s.domain)
+    }
+
+    /// The best read-now monotonic source, if any. `time_sources()` is best-first.
+    fn best_clock(&self) -> Option<RadioTimeSource> {
+        self.time
+            .as_ref()?
+            .time_sources()
+            .into_iter()
+            .find(|s| s.read_now && s.monotonic)
+    }
+
+    /// The advertised source for `domain`, if the radio has one — needed to convert ticks into a
+    /// wall-clock wait, and therefore required by the **software** absolute gate (and only by it).
+    fn clock_for(&self, domain: ClockDomainId) -> Option<RadioTimeSource> {
+        self.time
+            .as_ref()?
+            .time_sources()
+            .into_iter()
+            .find(|s| s.domain == domain && s.read_now && s.monotonic)
     }
 
     /// This radio's link clocks, for a timekeeping consumer. `None` when it has none.
@@ -334,7 +514,7 @@ impl LoraPhy {
     /// nothing). This is what governs the MTU and the SF policy — the *radio's* claim,
     /// not an assertion made on its behalf here.
     pub fn capability(&self) -> Option<RadioCapability> {
-        self.cap.clone()
+        self.cap.read().ok().and_then(|c| c.clone())
     }
 
     /// The data plane, for a caller that needs to share the radio (a second reader, a
@@ -360,10 +540,39 @@ impl LoraPhy {
 
     /// MTU = the radio's declared payload cap, never above this face's own measured
     /// ceiling, less the room a body-prefix filter needs. See [`LORA_MTU`].
-    fn recompute_mtu(&mut self) {
-        let declared = self.cap.as_ref().map_or(LORA_MTU, |c| c.max_payload);
+    fn recompute_mtu(&self) {
+        let declared = self
+            .cap
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.max_payload))
+            .unwrap_or(LORA_MTU);
         let head = if self.gcs.is_some() { GCS_HEADROOM } else { 0 };
-        self.mtu = LORA_MTU.min(declared).saturating_sub(head).max(1);
+        self.mtu.store(
+            LORA_MTU.min(declared).saturating_sub(head).max(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// **Re-read the radio's self-description and replace what we hold** — the mandatory
+    /// follow-up to a successful modulation change.
+    ///
+    /// `EVT_CAP` describes the CURRENT PHY, so a switch does not change one field of the
+    /// capability, it replaces all of them: an LR2021 in FLRC carries 47 bytes and has no
+    /// spreading factor, while the same silicon in LoRa carries far more and spans SF7..SF12.
+    /// Patching the field we think moved would leave the rest quietly describing a radio that no
+    /// longer exists — so this takes the profile's word wholesale and recomputes the MTU from it.
+    ///
+    /// A face with no [`RadioProfile`] has nothing to re-read and keeps what it had, which is the
+    /// same (conservative) answer it started with.
+    fn refresh_capability(&self) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        if let Ok(mut slot) = self.cap.write() {
+            *slot = Some(profile.capability());
+        }
+        self.recompute_mtu();
     }
 
     /// Enable **plan-driven link FEC**: source frames batch into generations of `k`
@@ -445,10 +654,113 @@ impl LoraPhy {
     /// Does this radio *have* a spreading factor, and over what span? Read from the
     /// declared capability, never assumed from the crate's name.
     fn sf_policy(&self) -> SfPolicy {
-        match self.cap.as_ref().map(|c| c.rate) {
+        match self.capability().map(|c| c.rate) {
             None => SfPolicy::Unknown,
             Some(RateCapability::Lora { min_sf, max_sf }) => SfPolicy::Span(min_sf, max_sf),
             Some(_) => SfPolicy::NotLora,
+        }
+    }
+
+    /// May this face command `want`? The guard in front of [`RadioKnobs::set_phy`].
+    ///
+    /// **A plan must never name a mode the node did not offer**, so the check is against the
+    /// radio's own [`RadioCapability::phy_modes`] — not against what the crate is called, and not
+    /// against a table keyed on a part number. Three refusals, each a different mistake:
+    ///
+    /// * the radio has described no modes at all (`is_empty`) — "I cannot say" is not "yes";
+    /// * it described exactly one (`!is_agile`) — modulation is a *fact* about that radio, and
+    ///   commanding it is at best a no-op round trip;
+    /// * it described several and `want` is not among them — the plan is wrong, and finding that
+    ///   out on the air (as a dead link) is the expensive way.
+    ///
+    /// A face with no capability at all refuses too: this is the one knob where "let the driver
+    /// be the authority" is not safe, because a wrong answer costs the whole link rather than
+    /// one frame.
+    fn phy_switch_allowed(&self, want: PhyMode) -> Result<(), &'static str> {
+        let Some(cap) = self.capability() else {
+            return Err("no declared capability: this face cannot know which modes exist");
+        };
+        if cap.phy_modes.is_empty() {
+            return Err("the radio has not described its modulations");
+        }
+        if !cap.phy_modes.is_agile() {
+            return Err("the radio runs a single modulation — it is not a knob here");
+        }
+        if !cap.phy_modes.contains(want) {
+            return Err("the radio did not advertise this modulation");
+        }
+        Ok(())
+    }
+
+    /// **Install a name-keyed hop plan on the radio's own sequencer** (#40) — the actuator the
+    /// hop derivation has never had.
+    ///
+    /// Derives the plan from `name` under the shared #44 `key` over `carriers_hz` (the group's
+    /// band plan), truncates it to what this radio's sequencer accepts, and arms it. Returns the
+    /// plan that was installed, so a caller can log or cross-check what the peer should derive.
+    ///
+    /// Both ends compute the SAME list from the same name + key + band plan and nothing is
+    /// negotiated, which is what makes this work on a broadcast bearer — see
+    /// [`name_hop_plan`](ndn_radio_cognition::name_hop_plan) for the inputs that may and may not
+    /// enter that derivation (local occupancy may not).
+    ///
+    /// `period` is in the radio's own unit
+    /// ([`HopCapability::period_unit`](ndn_radio_hal::HopCapability)): **LoRa symbols** on a
+    /// LoRa-modulation radio, microseconds elsewhere. It is passed through untouched rather than
+    /// converted, because a wall-clock dwell in symbols moves with SF and bandwidth.
+    ///
+    /// Errors — never a quiet success — when this face has no knobs, when the radio declares no
+    /// hop sequencer (`RadioCapability::hop == None`), or when the plan derives empty. A silent
+    /// "ok" on a radio that cannot hop would leave a planner believing a name's frames are spread
+    /// across a band they never left, which is exactly the co-band problem this exists to fix.
+    pub fn install_name_hop_plan(
+        &self,
+        key: &[u8; 16],
+        name: &[u8],
+        carriers_hz: &[u32],
+        period: u16,
+    ) -> Result<HopPlan, FaceError> {
+        let unsupported = |m: &str| {
+            FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                m.to_string(),
+            ))
+        };
+        let knobs = self
+            .knobs
+            .as_ref()
+            .ok_or_else(|| unsupported("this LoRa face has no RadioKnobs attached"))?;
+        let hop = self
+            .capability()
+            .and_then(|c| c.hop)
+            .ok_or_else(|| unsupported("this radio declares no autonomous hop sequencer"))?;
+        let plan = name_hop_plan(key, name, carriers_hz, period, hop.max_list_len as usize);
+        if plan.is_empty() {
+            return Err(unsupported(
+                "the derived hop plan is empty (no carriers declared)",
+            ));
+        }
+        knobs.set_hop_plan(HopControl::On, plan.period(), plan.freqs_hz())?;
+        tracing::info!(
+            target: "named_radio",
+            face = self.id.0,
+            hops = plan.len(),
+            period = plan.period(),
+            intra_packet = hop.intra_packet,
+            "installed a name-keyed hop plan"
+        );
+        Ok(plan)
+    }
+
+    /// Disarm hopping and return the radio to its tuned carrier. The installed list stays loaded
+    /// (that is [`HopControl::Off`]'s contract), so re-arming does not need a re-derivation.
+    pub fn clear_hop_plan(&self) -> Result<(), FaceError> {
+        match self.knobs.as_ref() {
+            Some(k) => k.set_hop_plan(HopControl::Off, 0, &[]),
+            None => Err(FaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this LoRa face has no RadioKnobs attached",
+            ))),
         }
     }
 
@@ -464,6 +776,58 @@ impl LoraPhy {
             return;
         };
         let mut cur = self.applied.lock().unwrap();
+
+        // ── The modulation, BEFORE anything else ──────────────────────────────────────────
+        // Order is load-bearing, not stylistic: `set_phy` resets the modem, so a spreading
+        // factor or a power pushed before it would be wiped by it. The HAL says so outright —
+        // "it must re-assert its intended channel/rate/power: none of them survives a
+        // modulation change" — so on a switch we clear the whole applied-knob cache and let the
+        // rest of this function push everything again against the new PHY.
+        if let Some(want) = tp.phy
+            && cur.phy != Some(want)
+            && cur.refused.phy != Some(want)
+        {
+            match self.phy_switch_allowed(want) {
+                Err(reason) => {
+                    // A mode the radio never advertised is a plan bug, not a radio failure:
+                    // refuse it here rather than commanding it and finding out on the air.
+                    cur.refused.phy = Some(want);
+                    tracing::warn!(target: "named_radio", face = self.id.0, phy = ?want, reason, "lora set_phy refused before it reached the radio");
+                }
+                Ok(()) => match knobs.set_phy(want) {
+                    // Believe the APPLIED mode, not the request: a chip may refuse a mode its
+                    // node advertises (a band/PA combination it cannot serve).
+                    Ok(applied) => {
+                        let changed = cur.phy != Some(applied);
+                        cur.phy = Some(applied);
+                        if changed {
+                            // Every other knob is now unset as far as the radio is concerned.
+                            let phy = cur.phy;
+                            *cur = AppliedRate {
+                                phy,
+                                ..Default::default()
+                            };
+                            // And the capability we hold describes the PHY we just left.
+                            drop(cur);
+                            self.refresh_capability();
+                            cur = self.applied.lock().unwrap();
+                        }
+                        if applied != want {
+                            // The chip would not go where the node said it could. Latch THAT
+                            // mode so the next frame does not buy the same refusal again.
+                            cur.refused.phy = Some(want);
+                            tracing::warn!(target: "named_radio", face = self.id.0, wanted = ?want, applied = ?applied, "lora set_phy landed on a different mode");
+                        }
+                    }
+                    Err(e) => {
+                        if is_unsupported(&e) {
+                            cur.refused.phy = Some(want);
+                        }
+                        tracing::warn!(target: "named_radio", face = self.id.0, phy = ?want, error = %e, "lora set_phy failed")
+                    }
+                },
+            }
+        }
 
         // Spreading factor + coding rate: LoRa's reach/rate dial. Only on a radio that
         // declares an SF span (or one that has declared nothing, where the driver is the
@@ -517,8 +881,7 @@ impl LoraPhy {
         // into it — the plan only ever backs OFF below the ceiling), else the opaque index.
         if let Some(dbm) = tp.tx_power_dbm {
             let dbm = self
-                .cap
-                .as_ref()
+                .capability()
                 .and_then(|c| c.tx_power_dbm)
                 .map_or(dbm, |r| r.clamp(dbm));
             if cur.dbm != Some(dbm) && !cur.refused.dbm {
@@ -554,6 +917,111 @@ impl LoraPhy {
                     cur.refused.edcca = is_unsupported(&e);
                     tracing::warn!(target: "named_radio", face = self.id.0, error = %e, "lora set_edcca_ignore failed")
                 }
+            }
+        }
+    }
+
+    /// **Put one frame on air, honouring `timing`.**
+    ///
+    /// `None` (no gate, or a wire the gate does not schedule) is plain `inject` — the unchanged
+    /// default path, and the whole behaviour of a face with no gate installed.
+    ///
+    /// ## Absolute beats relative, and that is a measurement
+    ///
+    /// [`SlotTiming::AtClock`] goes to [`FrameIo::inject_at_clock`] whenever the radio really
+    /// schedules **and** owns the clock the instant is named in. Preferring it is not taste:
+    ///
+    /// * MEASURED on the LR2021 absolute-boundary slot train — 45/45 slots fired, mean gap
+    ///   2 399 818 ticks against 2 400 000 nominal (within 11 µs over 44 slots). **Accuracy is
+    ///   excellent.** But **jitter came out at sd 553 µs / p2p 1875 µs** against a declared 50 µs
+    ///   `sched_gran_ns`, because the *relative* arm counts its delay from the moment the
+    ///   FIRMWARE processes the command — so the whole host→device serial latency lands inside
+    ///   the placement. The corroboration is exact: that node's `CMD_GET_INFO` round trip is p2p
+    ///   **550 µs**, the same number.
+    /// * As exercised that way, host-armed scheduled TX is *worse* than the software gate
+    ///   (sd 553 µs vs 155 µs) because it pays an extra round trip for the privilege. An
+    ///   **absolute** instant has no such term: the deadline is a value on the device's own
+    ///   timebase, so serial latency only has to be *smaller than the lead time*, not stable.
+    ///
+    /// Relative timing is still exactly right when the *caller* thinks in delays — it is
+    /// reconcile-free (the clock offset cancels) — so [`SlotTiming::After`] is passed through as
+    /// a delay and never silently converted. Converting one to the other would mean reading the
+    /// device clock per frame, which re-introduces the very round trip the absolute path exists
+    /// to remove.
+    ///
+    /// ## When the radio cannot schedule
+    ///
+    /// A delay falls back to the host's own sleep, exactly as before — unchanged for every
+    /// non-scheduling radio. An **absolute** instant falls back to the software gate too, but
+    /// only where it can be honoured honestly: the radio must expose that clock domain
+    /// `read_now`, so the host can ask what time it is *there* and sleep the difference. That is
+    /// coarse (it costs one clock round trip and the sleep's own jitter) but it is real.
+    ///
+    /// The one case that still ERRORS rather than degrading: a non-scheduling radio handed an
+    /// absolute instant in a domain it does not describe. The host holds no mapping into it and
+    /// the radio cannot honour it, so transmitting now would silently discard the discipline —
+    /// and this stack's rule is that a knob the hardware cannot do must error, never quietly
+    /// succeed. Callers with no disciplined domain should emit [`SlotTiming::After`], which
+    /// always works.
+    async fn inject_scheduled(
+        &self,
+        frame: InjectFrame,
+        timing: Option<SlotTiming>,
+    ) -> Result<(), FaceError> {
+        let Some(t) = timing else {
+            return self.radio.inject(frame).await;
+        };
+        match t {
+            SlotTiming::After { delay_us } => {
+                if self.schedules_tx_in_hardware() {
+                    self.radio.inject_after(frame, delay_us).await
+                } else {
+                    if delay_us > 0 {
+                        tokio::time::sleep(Duration::from_micros(delay_us)).await;
+                    }
+                    self.radio.inject(frame).await
+                }
+            }
+            SlotTiming::AtClock { tick, domain } => {
+                if self.schedules_tx_in_hardware() {
+                    // ★ The BACKEND owns the domain check, and must: only it knows which counter
+                    // is its own. The LoRa family's `inject_at_clock` compares against its device
+                    // domain and falls back to plain injection for a foreign tick, and it accepts
+                    // instants in counters it deliberately does not advertise as *link clocks*
+                    // (the Waveshare's firmware software counter — readable and schedulable, but
+                    // not a common-view source). Re-deciding that here from `time_sources()` would
+                    // refuse radios that work; see `tx_clock_domain`.
+                    return self.radio.inject_at_clock(frame, tick, domain).await;
+                }
+                // The radio cannot place it at all — but if the host can READ that domain, and the
+                // radio has described its tick, the instant can still be honoured by sleeping the
+                // remainder on the radio's own clock. Coarse (a clock round trip plus the sleep's
+                // own jitter), and strictly better than the error this used to be.
+                let Some(src) = self.clock_for(domain) else {
+                    return Err(FaceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "SlotTiming::AtClock names a clock domain this radio does not expose as a \
+                         readable monotonic counter, so neither the radio nor the host can honour \
+                         it — use SlotTiming::After for a reconcile-free delay, or name the domain \
+                         from LoraPhy::tx_clock_domain()",
+                    )));
+                };
+                let now = self
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.read_clock(domain).ok().flatten());
+                if let Some(now) = now
+                    && tick > now
+                {
+                    let ticks = tick - now;
+                    let us = ticks.saturating_mul(src.tick_ns.max(1) as u64) / 1_000;
+                    if us > 0 {
+                        tokio::time::sleep(Duration::from_micros(us)).await;
+                    }
+                }
+                // A deadline already past (or a clock read that failed) transmits now, which is
+                // what a software gate can do about a slot it is already inside.
+                self.radio.inject(frame).await
             }
         }
     }
@@ -632,7 +1100,7 @@ impl Transport for LoraPhy {
     /// The radio's declared payload cap, capped by this face's own ceiling and less the
     /// body-prefix headroom — **not** a constant. See [`LORA_MTU`].
     fn send_mtu(&self) -> Option<usize> {
-        Some(self.mtu)
+        Some(self.mtu.load(Ordering::Relaxed))
     }
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
@@ -641,8 +1109,11 @@ impl Transport for LoraPhy {
         self.actuate_planned();
         match &self.egress {
             Egress::Direct => {
-                self.radio
-                    .inject(InjectFrame {
+                // WHEN before WHAT: the gate reads the *wire* (where the NDN name is), not the
+                // GCS-prefixed payload, so the lease keys on the same name the receiver filters on.
+                let timing = self.slot_gate.as_ref().and_then(|g| g(&wire));
+                self.inject_scheduled(
+                    InjectFrame {
                         payload: self.body_prefix_prepend(wire),
                         tx: TxIntent::CONSERVATIVE,
                         dst: [0xff; 6],
@@ -650,12 +1121,20 @@ impl Transport for LoraPhy {
                         addr3: None,
                         addr4: None,
                         htc: None,
-                    })
-                    .await
+                    },
+                    timing,
+                )
+                .await
             }
             // The plan's redundancy rides in with the frame (same pattern as the
             // Wi-Fi face's MCS): the bridge applies it at the next generation
             // boundary, because R is a whole-generation property.
+            //
+            // Deliberately NOT slot-gated: `send` here only *enqueues* into the open
+            // generation, and the coded frames leave later, from the bridge's own task, at the
+            // generation boundary. Gating this call would delay the enqueue and leave the
+            // actual transmission ungated — a lease that looks enforced and is not. Gating a
+            // FEC generation belongs in the sink, and is not claimed here.
             Egress::Fec(bridge) => bridge.send(wire, (), self.planned_redundancy()),
         }
     }
@@ -715,7 +1194,9 @@ mod tests {
     use super::*;
     use ndn_frame_io::LoopbackMonitorBus;
     use ndn_radio_cognition::{LoraRate, RateParams};
-    use ndn_radio_hal::{Band, CsiSupport, DbmRange, RadioKind};
+    use ndn_radio_hal::{
+        Band, CsiSupport, DbmRange, HopCapability, HopPeriodUnit, PhyModeSet, RadioKind,
+    };
     use ndn_transport::Transport;
 
     /// A K=2 generation with the plan forcing R=2 must put 4 frames on air, and the
@@ -851,6 +1332,16 @@ mod tests {
         /// When set, `set_bandwidth_khz` answers `Unsupported` — what the LoRa serial backend
         /// now does on a node whose `CMD_SET_MOD` triple is not a LoRa one (an FLRC LR2021).
         refuse_bw: bool,
+        /// Modulations commanded through `set_phy`, in order.
+        phy: Mutex<Vec<PhyMode>>,
+        /// Hop plans installed through `set_hop_plan`: `(ctrl, period, carriers)`.
+        hops: Mutex<Vec<(HopControl, u16, Vec<u32>)>>,
+        /// The capability this radio reports **after** a successful `set_phy` — the wholesale
+        /// replacement a real node's `EVT_CAP` performs on a mode change.
+        cap_after_phy: Mutex<Option<RadioCapability>>,
+        /// A mode the CHIP refuses even though the node advertises it (a band/PA combination it
+        /// cannot serve) — the case the per-mode refusal latch exists for.
+        refuse_phy: Mutex<Option<PhyMode>>,
     }
 
     impl SpyRadio {
@@ -870,6 +1361,33 @@ mod tests {
     impl RadioKnobs for SpyRadio {
         fn set_channel(&self, channel: u8, _bw: Bandwidth) -> Result<(), FaceError> {
             self.ch.lock().unwrap().push(channel);
+            Ok(())
+        }
+        fn set_phy(&self, mode: PhyMode) -> Result<PhyMode, FaceError> {
+            self.phy.lock().unwrap().push(mode);
+            if *self.refuse_phy.lock().unwrap() == Some(mode) {
+                return Err(FaceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "this chip cannot serve that mode on this band",
+                )));
+            }
+            // A real node re-describes itself after a switch; mimic that so the face's
+            // capability-refresh path is genuinely exercised.
+            if let Some(next) = self.cap_after_phy.lock().unwrap().clone() {
+                *self.cap.lock().unwrap() = Some(next);
+            }
+            Ok(mode)
+        }
+        fn set_hop_plan(
+            &self,
+            ctrl: HopControl,
+            period: u16,
+            freqs_hz: &[u32],
+        ) -> Result<(), FaceError> {
+            self.hops
+                .lock()
+                .unwrap()
+                .push((ctrl, period, freqs_hz.to_vec()));
             Ok(())
         }
         fn set_spreading_factor(&self, sf: u8) -> Result<(), FaceError> {
@@ -905,6 +1423,10 @@ mod tests {
             rate,
             channels: vec![65],
             max_tx_power: 22,
+            // A LoRa part drives the dBm knob directly, so the index scale is never rendered here.
+            min_tx_power: None,
+            db_per_power_idx: None,
+            power_actuated: true,
             tx_power_dbm: Some(DbmRange::new(10, 22)),
             retune_us: None,
             rx_only: false,
@@ -912,6 +1434,11 @@ mod tests {
             max_payload,
             half_duplex: true,
             csi: CsiSupport::None,
+            // The modulation axis: a radio that has said nothing about its modes, which is the
+            // right default for a fixture — `phy_switch_allowed` must refuse it.
+            phy_modes: PhyModeSet::empty(),
+            phy_current: None,
+            hop: None,
         }
     }
 
@@ -1121,5 +1648,721 @@ mod tests {
             "a tune with no knobs must be an error, never a silent Ok"
         );
         assert!(face.knobs().is_none() && face.capability().is_none());
+    }
+
+    // ── E1: frame-free occupancy sensing reaches this bearer ──────────────────────────────
+
+    /// A radio that can sense its channel (`CMD_SENSE` on the 7E-A5 fleet) and counts up
+    /// every time it is asked. `read_channel_activity` is the only knob under test.
+    #[derive(Default)]
+    struct SenseRadio {
+        counter: Mutex<u16>,
+        /// `false` ⇒ the honest "this radio has no such counter" answer.
+        can_sense: bool,
+    }
+
+    impl RadioKnobs for SenseRadio {
+        fn set_channel(&self, _c: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+            Ok(())
+        }
+        fn read_channel_activity(&self) -> Result<Option<u16>, FaceError> {
+            if !self.can_sense {
+                return Ok(None); // exactly what a node without CMD_SENSE reports
+            }
+            let mut c = self.counter.lock().unwrap();
+            *c = c.wrapping_add(25); // 25 frames per 100 ms window ⇒ 250 fps ⇒ saturated
+            Ok(Some(*c))
+        }
+    }
+
+    /// **E1** — a LoRa face samples its own channel into the shared sense bus, with no Wi-Fi
+    /// type anywhere in the path. Before the move this was impossible without depending on
+    /// `ndn-phy-wifi`; the sink here is a bare `Mutex<MediumState>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lora_face_samples_occupancy_into_the_shared_sense_bus() {
+        let bus_io = LoopbackMonitorBus::new();
+        let radio = Arc::new(SenseRadio {
+            can_sense: true,
+            ..Default::default()
+        });
+        let face = LoraPhy::new(FaceId(1), Arc::new(bus_io.endpoint(1, -60))).with_knobs(radio);
+
+        let sense: Arc<Mutex<ndn_radio_cognition::MediumState>> =
+            Arc::new(Mutex::new(ndn_radio_cognition::MediumState::new()));
+        let handle = face
+            .start_occupancy_sampling(
+                sense.clone(),
+                RadioId(0),
+                65,
+                Duration::from_millis(20),
+                || 0,
+            )
+            .expect("a face with knobs can sample");
+
+        // Two ticks are needed before a rate exists (a rate is a difference of two reads).
+        let mut busy = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            busy = OccupancySink::busy_pct(sense.as_ref(), RadioId(0), 65);
+            if busy.is_some() {
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            busy.is_some_and(|b| b > 0),
+            "the sampled activity rate must reach the sense bus as busy% (got {busy:?})"
+        );
+    }
+
+    /// A radio that answers `Ok(None)` is polled once and the sampler exits — an incapable
+    /// node costs one round-trip, never a permanent task feeding the bus fabricated zeros.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_radio_that_cannot_sense_stops_the_sampler_and_reports_nothing() {
+        let bus_io = LoopbackMonitorBus::new();
+        let face = LoraPhy::new(FaceId(1), Arc::new(bus_io.endpoint(1, -60)))
+            .with_knobs(Arc::new(SenseRadio::default()));
+        let sense: Arc<Mutex<ndn_radio_cognition::MediumState>> =
+            Arc::new(Mutex::new(ndn_radio_cognition::MediumState::new()));
+        let handle = face
+            .start_occupancy_sampling(
+                sense.clone(),
+                RadioId(0),
+                65,
+                Duration::from_millis(5),
+                || 0,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the sampler must exit, not spin")
+            .unwrap();
+        assert_eq!(
+            OccupancySink::busy_pct(sense.as_ref(), RadioId(0), 65),
+            None,
+            "no counter ⇒ no occupancy claim at all (None, never a plausible 0)"
+        );
+    }
+
+    /// No knobs ⇒ nothing to poll ⇒ `None`, not a handle to a task that can never sample.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn occupancy_sampling_without_knobs_is_refused_not_faked() {
+        let bus_io = LoopbackMonitorBus::new();
+        let face = LoraPhy::new(FaceId(1), Arc::new(bus_io.endpoint(1, -60)));
+        let sense: Arc<Mutex<ndn_radio_cognition::MediumState>> =
+            Arc::new(Mutex::new(ndn_radio_cognition::MediumState::new()));
+        assert!(
+            face.start_occupancy_sampling(sense, RadioId(0), 65, Duration::from_millis(5), || 0)
+                .is_none()
+        );
+    }
+
+    // ── E1: the modulation is a knob, and only where the radio said so ────────────────────
+
+    /// A capability for an **agile** node: it advertises `modes`, runs `current`, and (when
+    /// `hop` is set) has a sequencer of its own.
+    fn agile_cap(modes: PhyModeSet, current: PhyMode, hop: Option<HopCapability>) -> RadioCapability {
+        let mut c = lora_cap(200);
+        c.phy_modes = modes;
+        c.phy_current = Some(current);
+        c.hop = hop;
+        c
+    }
+
+    fn lora_flrc() -> PhyModeSet {
+        PhyModeSet::single(PhyMode::Lora).with(PhyMode::Flrc)
+    }
+
+    fn plan_with_phy(phy: Option<PhyMode>) -> Arc<RwLock<Option<TxParams>>> {
+        Arc::new(RwLock::new(Some(TxParams {
+            phy,
+            rate: RateParams::Lora(LoraRate {
+                spreading_factor: Some(9),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })))
+    }
+
+    /// **E1** — a decided modulation reaches `RadioKnobs::set_phy`, once, and is not re-pushed
+    /// while it is unchanged (a knob is bearer state, and on a serial bridge every push is a
+    /// blocking round trip).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decided_modulation_reaches_the_radio_once() {
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+        let spy = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, None));
+        let face = LoraPhy::new(FaceId(1), io)
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone())
+            .with_planned_params(plan_with_phy(Some(PhyMode::Flrc)));
+
+        for _ in 0..4 {
+            face.send_bytes(Bytes::from_static(b"x")).await.unwrap();
+        }
+        assert_eq!(*spy.phy.lock().unwrap(), vec![PhyMode::Flrc], "pushed once");
+    }
+
+    /// **The rule.** A mode the radio never advertised is refused *before* it reaches the
+    /// hardware — as is a radio that advertised nothing, and one that runs a single modulation
+    /// (where modulation is a fact, not a knob). Finding this out on the air, as a dead link, is
+    /// the expensive way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modulation_the_radio_never_advertised_is_never_commanded() {
+        let bus = LoopbackMonitorBus::new();
+        for cap in [
+            // advertises LoRa + FLRC, asked for BLE
+            agile_cap(lora_flrc(), PhyMode::Lora, None),
+            // advertises nothing at all
+            lora_cap(200),
+            // advertises exactly one mode
+            agile_cap(PhyModeSet::single(PhyMode::Lora), PhyMode::Lora, None),
+        ] {
+            let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+            let spy = SpyRadio::with_cap(cap);
+            let face = LoraPhy::new(FaceId(1), io)
+                .with_knobs(spy.clone())
+                .with_profile(spy.clone())
+                .with_planned_params(plan_with_phy(Some(PhyMode::Ble)));
+            face.send_bytes(Bytes::from_static(b"x")).await.unwrap();
+            assert!(
+                spy.phy.lock().unwrap().is_empty(),
+                "an unadvertised mode must never be commanded"
+            );
+        }
+    }
+
+    /// **A switch replaces the capability wholesale.** The same silicon in FLRC carries 47 bytes
+    /// and has no spreading factor; in LoRa it carries far more and spans SF7..SF12. So after a
+    /// successful `set_phy` the face re-reads the profile and the MTU follows — without this it
+    /// would keep fragmenting to the OLD payload cap and hand the driver frames it now rejects,
+    /// which is invisible loss rather than an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_phy_switch_replaces_the_capability_and_the_mtu() {
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+        let spy = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, None));
+        // What the node reports once it is in FLRC: a 47-byte frame and no spreading factor.
+        let mut flrc = agile_cap(lora_flrc(), PhyMode::Flrc, None);
+        flrc.max_payload = 47;
+        flrc.rate = RateCapability::None;
+        *spy.cap_after_phy.lock().unwrap() = Some(flrc);
+
+        let face = LoraPhy::new(FaceId(1), io)
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone())
+            .with_planned_params(plan_with_phy(Some(PhyMode::Flrc)));
+        assert_eq!(face.send_mtu(), Some(200), "the LoRa-mode payload cap");
+
+        face.send_bytes(Bytes::from_static(b"x")).await.unwrap();
+        assert_eq!(*spy.phy.lock().unwrap(), vec![PhyMode::Flrc]);
+        assert_eq!(
+            face.send_mtu(),
+            Some(47),
+            "the MTU must follow the capability the switch replaced"
+        );
+        assert_eq!(
+            face.capability().map(|c| c.rate),
+            Some(RateCapability::None),
+            "and so must the rate model — an FLRC node has no spreading factor"
+        );
+        // Nothing survives a modulation change, so the SF the plan asks for is re-asserted
+        // against the new PHY rather than being assumed still set. (It is skipped here because
+        // the replacement capability declares no SF span at all — which is the point.)
+        assert!(
+            spy.sf.lock().unwrap().len() <= 1,
+            "SF must not be pushed at a radio that no longer has one"
+        );
+    }
+
+    /// A chip that refuses a mode its node advertises is asked **once**, and the refusal is
+    /// latched against THAT MODE — not against the axis. A bare boolean here would take
+    /// modulation out of service for the rest of the face's life after one unreachable mode;
+    /// re-asking every frame would buy a blocking serial round trip for an answer that cannot
+    /// change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_mode_is_asked_once_and_does_not_disable_the_axis() {
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+        let modes = lora_flrc().with(PhyMode::Fsk);
+        let spy = SpyRadio::with_cap(agile_cap(modes, PhyMode::Lora, None));
+        *spy.refuse_phy.lock().unwrap() = Some(PhyMode::Flrc);
+
+        let plan = plan_with_phy(Some(PhyMode::Flrc));
+        let face = LoraPhy::new(FaceId(1), io)
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone())
+            .with_planned_params(plan.clone());
+        for _ in 0..5 {
+            face.send_bytes(Bytes::from_static(b"x")).await.unwrap();
+        }
+        assert_eq!(
+            *spy.phy.lock().unwrap(),
+            vec![PhyMode::Flrc],
+            "a refusal must be latched, not re-bought every frame"
+        );
+
+        // A DIFFERENT advertised mode is still reachable.
+        *plan.write().unwrap() = Some(TxParams {
+            phy: Some(PhyMode::Fsk),
+            ..Default::default()
+        });
+        face.send_bytes(Bytes::from_static(b"x")).await.unwrap();
+        assert_eq!(
+            *spy.phy.lock().unwrap(),
+            vec![PhyMode::Flrc, PhyMode::Fsk],
+            "one unreachable mode must not disable the whole axis"
+        );
+    }
+
+    // ── E2: the name-keyed hop plan reaches the radio's sequencer ─────────────────────────
+
+    fn hop_cap() -> HopCapability {
+        HopCapability {
+            intra_packet: true,
+            max_list_len: 40,
+            period_unit: HopPeriodUnit::LoraSymbols,
+        }
+    }
+
+    /// **E2** — a name's hop plan is derived under the shared #44 key and written to the radio's
+    /// own sequencer, armed, truncated to what that sequencer accepts.
+    #[test]
+    fn a_name_keyed_hop_plan_reaches_the_sequencer() {
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+        let spy = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, Some(hop_cap())));
+        let face = LoraPhy::new(FaceId(1), io)
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone());
+
+        let key = *b"ndn/wl-lora-gcs1";
+        let carriers = carrier_grid(902_000_000, 928_000_000, 1_000_000);
+        let plan = face
+            .install_name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12)
+            .expect("a radio with a sequencer installs a plan");
+
+        let installed = spy.hops.lock().unwrap().clone();
+        assert_eq!(installed.len(), 1);
+        let (ctrl, period, freqs) = &installed[0];
+        assert_eq!(*ctrl, HopControl::On, "the plan must be armed, not just loaded");
+        assert_eq!(*period, 12);
+        assert_eq!(freqs, plan.freqs_hz());
+        assert_eq!(freqs.len(), 27, "the whole declared band plan fits in 40 slots");
+        for f in freqs {
+            assert!(carriers.contains(f), "invented carrier {f}");
+        }
+        // ★ The property both ends depend on: the peer derives the same list from the same name
+        // and key, with nothing negotiated on air.
+        assert_eq!(
+            plan.freqs_hz(),
+            name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12, 40).freqs_hz(),
+            "the peer must derive a byte-identical list"
+        );
+
+        face.clear_hop_plan().unwrap();
+        assert_eq!(spy.hops.lock().unwrap()[1].0, HopControl::Off);
+    }
+
+    /// A radio with no sequencer ERRORS rather than reporting a plan it never installed — a
+    /// silent success would leave a planner believing a name's frames are spread across a band
+    /// they never left, which is exactly the co-band problem hopping exists to fix.
+    #[test]
+    fn a_radio_with_no_sequencer_refuses_a_hop_plan() {
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -60));
+        let spy = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, None));
+        let face = LoraPhy::new(FaceId(1), io)
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone());
+        let carriers = carrier_grid(902_000_000, 928_000_000, 1_000_000);
+        assert!(
+            face.install_name_hop_plan(b"0123456789abcdef", b"/a", &carriers, 8)
+                .is_err()
+        );
+        assert!(spy.hops.lock().unwrap().is_empty());
+
+        // …and so does a face with no knobs at all, and one handed no carriers.
+        let bare = LoraPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -60)));
+        assert!(
+            bare.install_name_hop_plan(b"0123456789abcdef", b"/a", &carriers, 8)
+                .is_err()
+        );
+        let spy2 = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, Some(hop_cap())));
+        let face2 = LoraPhy::new(FaceId(3), Arc::new(bus.endpoint(3, -60)))
+            .with_knobs(spy2.clone())
+            .with_profile(spy2.clone());
+        assert!(
+            face2
+                .install_name_hop_plan(b"0123456789abcdef", b"/a", &[], 8)
+                .is_err(),
+            "no carriers declared is not a plan"
+        );
+    }
+
+    /// A shorter sequencer gets a PREFIX of the same derived sequence, so two nodes that agree
+    /// on the length still agree on the hops.
+    #[test]
+    fn a_short_sequencer_gets_a_prefix_of_the_same_sequence() {
+        let bus = LoopbackMonitorBus::new();
+        let mut hop = hop_cap();
+        hop.max_list_len = 8;
+        let spy = SpyRadio::with_cap(agile_cap(lora_flrc(), PhyMode::Lora, Some(hop)));
+        let face = LoraPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -60)))
+            .with_knobs(spy.clone())
+            .with_profile(spy.clone());
+        let key = *b"ndn/wl-lora-gcs1";
+        let carriers = carrier_grid(902_000_000, 928_000_000, 1_000_000);
+        let short = face
+            .install_name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12)
+            .unwrap();
+        assert_eq!(short.len(), 8);
+        let full = name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12, 40);
+        assert_eq!(short.freqs_hz(), &full.freqs_hz()[..8]);
+    }
+
+    // ── E3: a slot-scheduled send reaches the hardware scheduler ──────────────────────────
+
+    /// Which injection seam a frame actually left through.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Sent {
+        Now,
+        After(u64),
+        AtClock(u64, u32),
+    }
+
+    /// A radio whose scheduling *seam* and declared *discipline* are set independently — the
+    /// two are separate on real hardware, and the gap is the bug this dispatch guards against.
+    struct SchedRadio {
+        seam: bool,
+        discipline: TxDiscipline,
+        sent: Mutex<Vec<Sent>>,
+        /// The clock this radio owns, if any — an absolute instant may only be named in it.
+        clock: Option<(ClockDomainId, u64)>,
+    }
+
+    const SCHED_DOMAIN: ClockDomainId = ClockDomainId(9);
+
+    impl SchedRadio {
+        /// A radio that owns [`SCHED_DOMAIN`], reading `now` ticks (1 µs each).
+        fn new(seam: bool, discipline: TxDiscipline) -> Arc<Self> {
+            Arc::new(Self {
+                seam,
+                discipline,
+                sent: Mutex::new(Vec::new()),
+                clock: Some((SCHED_DOMAIN, 0)),
+            })
+        }
+        /// A radio with a clock of its own at `now`, for the software-gate path.
+        fn with_clock(seam: bool, discipline: TxDiscipline, now: u64) -> Arc<Self> {
+            Arc::new(Self {
+                seam,
+                discipline,
+                sent: Mutex::new(Vec::new()),
+                clock: Some((SCHED_DOMAIN, now)),
+            })
+        }
+        /// A radio that exposes no readable clock at all.
+        fn clockless(seam: bool, discipline: TxDiscipline) -> Arc<Self> {
+            Arc::new(Self {
+                seam,
+                discipline,
+                sent: Mutex::new(Vec::new()),
+                clock: None,
+            })
+        }
+    }
+
+    impl RadioTime for SchedRadio {
+        fn time_sources(&self) -> Vec<RadioTimeSource> {
+            self.clock
+                .iter()
+                .map(|(d, _)| RadioTimeSource {
+                    kind: ndn_radio_hal::RadioClockKind::FreeRunRxStamp,
+                    domain: *d,
+                    latch: ndn_radio_hal::LatchPoint::MacDone,
+                    precision_ns: 1_000,
+                    tick_ns: 1_000,
+                    monotonic: true,
+                    read_now: true,
+                })
+                .collect()
+        }
+        fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
+            Ok(self
+                .clock
+                .filter(|(d, _)| *d == domain)
+                .map(|(_, now)| now))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FrameIo for SchedRadio {
+        async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+            self.sent.lock().unwrap().push(Sent::Now);
+            Ok(())
+        }
+        async fn inject_after(&self, _f: InjectFrame, delay_us: u64) -> Result<(), FaceError> {
+            self.sent.lock().unwrap().push(Sent::After(delay_us));
+            Ok(())
+        }
+        async fn inject_at_clock(
+            &self,
+            _f: InjectFrame,
+            target_tick: u64,
+            domain: ClockDomainId,
+        ) -> Result<(), FaceError> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push(Sent::AtClock(target_tick, domain.0));
+            Ok(())
+        }
+        fn schedules_tx(&self) -> bool {
+            self.seam
+        }
+        async fn recv_frame(&self) -> Result<ndn_radio_hal::CapturedFrame, FaceError> {
+            std::future::pending().await
+        }
+    }
+
+    impl RadioKnobs for SchedRadio {
+        fn set_channel(&self, _c: u8, _bw: Bandwidth) -> Result<(), FaceError> {
+            Ok(())
+        }
+        fn tx_discipline(&self) -> TxDiscipline {
+            self.discipline
+        }
+    }
+
+    const SCHEDULED: TxDiscipline = TxDiscipline::ScheduledAt {
+        granularity_ns: 1_000,
+    };
+
+    /// **E3** — on a radio that really schedules (seam + declared discipline), a slot-gated
+    /// send goes out through `inject_after` with the delay intact, and the host does **not**
+    /// sleep: the MCU places the frame. This is the path that was unreachable from the face.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scheduling_radio_places_the_frame_in_hardware() {
+        let r = SchedRadio::new(true, SCHEDULED);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_slot_gate(|_| Some(SlotTiming::After { delay_us: 750_000 }));
+        assert!(face.schedules_tx_in_hardware());
+
+        let t0 = std::time::Instant::now();
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::After(750_000)]);
+        assert!(
+            t0.elapsed() < Duration::from_millis(300),
+            "the host must not sleep out a delay the hardware is placing"
+        );
+    }
+
+    /// An absolute instant reaches `inject_at_clock` with its domain intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_slot_reaches_inject_at_clock() {
+        let r = SchedRadio::new(true, SCHEDULED);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 0xDEAD_BEEF,
+                    domain: SCHED_DOMAIN,
+                })
+            });
+        assert_eq!(face.tx_clock_domain(), Some(SCHED_DOMAIN));
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::AtClock(0xDEAD_BEEF, 9)]);
+    }
+
+    /// **The domain belongs to the BACKEND to check.** `inject_at_clock` takes a tick in a named
+    /// domain, and only the backend knows which counter is its own — the LoRa family's compares
+    /// against its device domain and falls back to plain injection for a foreign tick. It also
+    /// schedules against counters it deliberately does not advertise as *link clocks* (the
+    /// Waveshare's firmware software counter is readable and schedulable but is not a common-view
+    /// source), so a face that re-decided this from `time_sources()` would refuse radios that
+    /// work. The domain is therefore passed through intact rather than vetted here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scheduling_radio_is_handed_the_domain_intact() {
+        let r = SchedRadio::new(true, SCHEDULED);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 1_000,
+                    domain: ClockDomainId(77), // a domain this face never advertised
+                })
+            });
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::AtClock(1_000, 77)]);
+    }
+
+    /// A **non-scheduling** radio handed an instant in a domain it does not describe still errors:
+    /// nothing here can honour it, and transmitting now would silently discard the discipline the
+    /// caller asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_scheduling_radio_refuses_an_undescribed_domain() {
+        let r = SchedRadio::with_clock(false, TxDiscipline::BestEffort, 1_000);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 9_000,
+                    domain: ClockDomainId(77), // the OTHER dongle's counter
+                })
+            });
+        assert!(face.send_bytes(Bytes::from_static(b"slot")).await.is_err());
+        assert!(
+            r.sent.lock().unwrap().is_empty(),
+            "nothing may go on air on a discipline nobody can honour"
+        );
+    }
+
+    /// **E3, the software gate for an absolute instant.** A radio that cannot place the frame
+    /// but CAN be read in that domain is still honoured: the host asks what time it is *there*
+    /// and sleeps the difference. Coarse (a clock round trip plus the sleep's own jitter), but
+    /// real — and strictly better than the error this used to be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_slot_falls_back_to_the_software_gate_when_the_clock_is_readable() {
+        // No seam: the radio cannot schedule. Its clock reads 1_000_000 ticks (1 µs each), and
+        // the slot is 120 ms later.
+        let r = SchedRadio::with_clock(false, TxDiscipline::BestEffort, 1_000_000);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 1_120_000,
+                    domain: SCHED_DOMAIN,
+                })
+            });
+        assert!(!face.schedules_tx_in_hardware());
+        let t0 = std::time::Instant::now();
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::Now]);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(90),
+            "the host must wait out the instant on the radio's own clock"
+        );
+    }
+
+    /// A deadline already in the past transmits now — a software gate cannot un-miss a slot it
+    /// is already inside, and pretending otherwise would stall the face forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_slot_already_past_transmits_now() {
+        let r = SchedRadio::with_clock(false, TxDiscipline::BestEffort, 5_000_000);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 1_000,
+                    domain: SCHED_DOMAIN,
+                })
+            });
+        let t0 = std::time::Instant::now();
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::Now]);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+
+    /// A radio with no readable clock at all keeps the old behaviour: an absolute instant is an
+    /// error, because nothing here can honour it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_slot_on_a_clockless_radio_still_errors() {
+        let r = SchedRadio::clockless(false, TxDiscipline::BestEffort);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_time(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 1_000,
+                    domain: SCHED_DOMAIN,
+                })
+            });
+        assert_eq!(face.tx_clock_domain(), None);
+        assert!(face.send_bytes(Bytes::from_static(b"slot")).await.is_err());
+        assert!(r.sent.lock().unwrap().is_empty());
+    }
+
+    /// **The trap this dispatch exists to avoid.** A backend may declare `ScheduledAt` and not
+    /// implement the seam (measured live on Wi-Fi: the AR9271). Believing the label would skip
+    /// the software gate AND drop the delay — the frame leaves immediately, ungated. So the
+    /// seam is required, and this radio software-gates: the delay is really waited out, then a
+    /// plain `inject`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declared_discipline_without_the_seam_still_software_gates() {
+        let r = SchedRadio::new(false, SCHEDULED); // says ScheduledAt, implements nothing
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_slot_gate(|_| Some(SlotTiming::After { delay_us: 120_000 }));
+        assert!(
+            !face.schedules_tx_in_hardware(),
+            "the label is not the seam"
+        );
+
+        let t0 = std::time::Instant::now();
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::Now]);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(90),
+            "the host must actually wait out the slot when the radio will not"
+        );
+    }
+
+    /// A best-effort radio (the Waveshare SX1262 today) keeps the software gate — same lease
+    /// decision, enforced by the host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_best_effort_radio_keeps_the_software_gate() {
+        let r = SchedRadio::new(false, TxDiscipline::BestEffort);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_slot_gate(|_| Some(SlotTiming::After { delay_us: 0 }));
+        face.send_bytes(Bytes::from_static(b"slot")).await.unwrap();
+        assert_eq!(*r.sent.lock().unwrap(), vec![Sent::Now]);
+    }
+
+    /// An absolute device-clock instant on a radio that cannot schedule must ERROR: the host
+    /// holds no mapping into that domain, and transmitting now would silently discard the
+    /// discipline. A knob the hardware cannot do fails loudly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_absolute_slot_on_an_unscheduled_radio_errors_instead_of_transmitting_now() {
+        let r = SchedRadio::new(false, TxDiscipline::BestEffort);
+        let face = LoraPhy::new(FaceId(1), r.clone())
+            .with_knobs(r.clone())
+            .with_slot_gate(|_| {
+                Some(SlotTiming::AtClock {
+                    tick: 42,
+                    domain: ClockDomainId(1),
+                })
+            });
+        assert!(face.send_bytes(Bytes::from_static(b"slot")).await.is_err());
+        assert!(
+            r.sent.lock().unwrap().is_empty(),
+            "nothing may go on air when the requested discipline is unreachable"
+        );
+    }
+
+    /// **Default behaviour is untouched.** No gate installed, or a gate that declines to
+    /// schedule this wire (a control frame, no name-group), is a plain `inject` on call — on a
+    /// scheduling radio too, so installing hardware never changes ungated traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ungated_send_is_a_plain_inject_on_every_radio() {
+        for seam in [false, true] {
+            let r = SchedRadio::new(seam, SCHEDULED);
+            let none = LoraPhy::new(FaceId(1), r.clone()).with_knobs(r.clone());
+            none.send_bytes(Bytes::from_static(b"a")).await.unwrap();
+
+            let declines = LoraPhy::new(FaceId(2), r.clone())
+                .with_knobs(r.clone())
+                .with_slot_gate(|_| None);
+            declines.send_bytes(Bytes::from_static(b"b")).await.unwrap();
+
+            assert_eq!(*r.sent.lock().unwrap(), vec![Sent::Now, Sent::Now]);
+        }
     }
 }
