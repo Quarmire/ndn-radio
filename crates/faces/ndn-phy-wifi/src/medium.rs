@@ -1089,9 +1089,17 @@ impl TxBearer {
         // reconcile-free (the delay is applied on the device's own clock). None ⇒ the software gate, unchanged.
         let mut hw_delay: Option<u64> = None;
         if !robust && let Some(sched) = &self.sched {
+            // ⚠ REQUIRE THE SEAM, NOT THE LABEL. `hw_slot_wait` keys on `TxDiscipline::ScheduledAt`
+            // alone, but a backend can declare that without implementing `inject_after` — and the
+            // HAL default for `inject_after` is *inject now*. Taking the hardware path there would
+            // skip this software gate AND drop the delay: the frame goes out immediately with no
+            // slot discipline at all, strictly worse than never having claimed the discipline.
+            // (Measured live case: the AR9271 declares `ScheduledAt{1 µs}` and implements neither
+            // seam.) `FrameIo::schedules_tx` is overridden only alongside a real `inject_after`,
+            // so requiring it here makes the fallback safe for every present and future backend.
             match sched.hw_slot_wait(&wire) {
-                Some(d) => hw_delay = Some(d),
-                None => sched.gate(&wire).await,
+                Some(d) if self.radio.schedules_tx() => hw_delay = Some(d),
+                _ => sched.gate(&wire).await,
             }
         }
         TXD_GATED.fetch_add(1, Ordering::Relaxed);
