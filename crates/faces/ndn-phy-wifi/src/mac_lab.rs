@@ -565,8 +565,26 @@ async fn prop_p11_skew_times_long_frames_defeats_lanes_and_cv_restores_them() {
     // IN THE LANES SCHEDULE: the lane exists, but not where A thinks it is.
     // A LAGGING (the sign that exposes the lane START, where the owner fires): A's pre-lane open
     // slot ends 2 ms into the lane in wall time, plus an in-flight 1.9 ms frame's tail.
-    let (alarms, hit) = run(slot, air, -2_000, 1_500, lane_period_ms).await;
-    assert!(alarms >= 40, "fixture: enough lane occurrences ({alarms})");
+    // ⚠ FIXTURE vs PROPERTY. This harness measures a timing property in REAL time (deliberately —
+    // the medium's time is what actually overlaps), so a loaded machine gathers fewer lane
+    // occurrences in a fixed window and the run ends data-starved. That is not a property
+    // violation, and conflating the two made this test fail ~50% under parallel load while passing
+    // consistently on a quiet one. Extend the window until there is enough data, bounded; only a
+    // genuine shortfall after the cap is a failure, and it says so.
+    let (mut alarms, mut hit) = run(slot, air, -2_000, 1_500, lane_period_ms).await;
+    for _ in 0..3 {
+        if alarms >= 40 {
+            break;
+        }
+        let (a2, h2) = run(slot, air, -2_000, 3_000, lane_period_ms).await;
+        alarms += a2;
+        hit += h2;
+    }
+    assert!(
+        alarms >= 40,
+        "FIXTURE (not the property): only {alarms} lane occurrences after extending the window — \
+         the machine is too loaded to gather data, rerun on a quiet host"
+    );
     let skewed_rate = hit as f64 / alarms as f64;
     assert!(
         skewed_rate > 0.10,
