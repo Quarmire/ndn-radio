@@ -1,6 +1,6 @@
 [package]
 name = "ndn-phy-lora"
-description = "Connectionless LoRa face for ndn-rs — broadcasts NDN packets over a serial-bridged SX126x LoRa radio, with plan-driven link FEC (named-radio bearer, no association)"
+description = "Connectionless LoRa-family face for ndn-rs — broadcasts NDN packets over any serial-bridged sub-GHz radio (SX126x/SX127x/LR2021), with plan-driven link FEC and a capability-derived MTU (named-radio bearer, no association)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,15 +12,32 @@ classification = "extension"
 ndn-transport       = { workspace = true }
 ndn-radio-hal       = { workspace = true }
 ndn-radio-cognition = { workspace = true }
-ndn-radio-drivers   = { path = "../../../../ndn-radio-drivers", features = ["lora"] }
 ndn-coding          = { path = "../../coding/ndn-coding", default-features = false, features = ["link-fec-bridge"] }
 bytes               = { workspace = true, features = ["std"] }
 tracing             = { workspace = true }
 tokio               = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 
+# NOTE: `ndn-radio-drivers` is deliberately NOT a dependency (G4). A face crate talks to
+# the radio through the HAL traits (`FrameIo` / `RadioKnobs` / `RadioTime` /
+# `RadioProfile` / `OpenRadio`), never through a concrete driver: this PHY mounts the
+# Waveshare SX1262, the nRF54L15+LR2021 FLRC bridge and a Heltec SX1276 through the same
+# seam, and depending on the driver crate would both invert the layering and pull a USB /
+# serial stack into every consumer of this face. It appears below only as a DEV-dependency,
+# for the example that drives a real dongle.
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread", "time"] }
 ndn-frame-io = { workspace = true }
+# `examples/lora_face_node.rs`: a real NDN Interest/Data roundtrip through LoraPhy -> Face ->
+# ForwarderEngine, over the loopback bus (self-test, no hardware) or a real serial dongle.
+ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", features = ["lora"] }
+ndn-app    = { workspace = true }
+ndn-engine = { workspace = true }
+ndn-packet = { workspace = true, features = ["std"] }
+tokio-util = { workspace = true }
+
+[[example]]
+name = "lora_face_node"
 
 [lints]
 workspace = true

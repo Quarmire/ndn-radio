@@ -1858,6 +1858,7 @@ dependencies = [
  "ndn-packet",
  "ndn-phy-wifi",
  "ndn-radio",
+ "ndn-radio-cognition",
  "ndn-radio-drivers",
  "ndn-signals-core",
  "ndn-strategy",
@@ -1875,13 +1876,17 @@ name = "ndn-phy-lora"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ndn-app",
  "ndn-coding",
+ "ndn-engine",
  "ndn-frame-io",
+ "ndn-packet",
  "ndn-radio-cognition",
  "ndn-radio-drivers",
  "ndn-radio-hal",
  "ndn-transport",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
