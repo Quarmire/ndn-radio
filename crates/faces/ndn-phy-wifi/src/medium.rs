@@ -352,7 +352,16 @@ pub(crate) struct AppliedKnobs {
     csd: Option<bool>,
     edcca: Option<bool>,
     power: Option<u8>,
+    /// The dBm value last **requested** — the dedupe key, so a firmware clamp does not re-push a
+    /// write every tick forever.
     power_dbm: Option<i8>,
+    /// ★ The dBm the radio reported it **actually applied**, which a regulatory or firmware clamp
+    /// can put below the request. This, not the request, is what a peer must be told: a neighbour
+    /// computing path loss from a power we never transmitted at gets a wrong answer and no way to
+    /// notice. See `ReceptionReport::tx_power_dbm`.
+    pub(crate) applied_dbm: Option<i8>,
+    rx_gain: Option<ndn_radio_hal::RxGain>,
+    edcca_thresh: Option<(i8, i8)>,
     sf: Option<u8>,  // LoRa spreading factor
     cr: Option<u8>,  // LoRa coding rate
     bw: Option<u32>, // LoRa bandwidth (kHz)
@@ -369,20 +378,42 @@ pub(crate) fn apply_knobs(
     alloc: &RadioAllocation,
 ) -> Result<(), FaceError> {
     let p = &alloc.params;
+
+    // ★ **Every knob degrades on its own.** These used to propagate with `?`, so a single knob a
+    // radio does not implement aborted the tick and silently disarmed every knob AFTER it — the
+    // decided rate, the LoRa dials, everything downstream of the first refusal. The MT7612U
+    // documented the consequence: "one impossible width also skipped `set_tx_csd` and
+    // `set_edcca_ignore`". A knob a radio lacks is normal and must cost only that knob.
+    //
+    // `last` is updated ONLY on success, so a knob that failed is retried next tick rather than
+    // being recorded as applied — the failure must not become invisible on the second pass.
+    fn note(what: &str, r: Result<(), FaceError>) -> bool {
+        match r {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!(knob = what, error = %e, "radio refused a knob; continuing");
+                false
+            }
+        }
+    }
     // Channel + bandwidth retune together (the ~16 ms cost the change-gating exists for).
     if let Some(ch) = alloc.channel {
         let bw_code = p.bw().unwrap_or(0);
-        if last.channel != Some((ch, bw_code)) {
-            knobs.set_channel(ch, Bandwidth::from_code(bw_code))?;
+        if last.channel != Some((ch, bw_code))
+            && note(
+                "set_channel",
+                knobs.set_channel(ch, Bandwidth::from_code(bw_code)),
+            )
+        {
             last.channel = Some((ch, bw_code));
         }
     }
-    if last.csd != Some(p.csd()) {
-        knobs.set_tx_csd(p.csd())?;
+    if last.csd != Some(p.csd()) && note("set_tx_csd", knobs.set_tx_csd(p.csd())) {
         last.csd = Some(p.csd());
     }
-    if last.edcca != Some(p.edcca_ignore) {
-        knobs.set_edcca_ignore(p.edcca_ignore)?;
+    if last.edcca != Some(p.edcca_ignore)
+        && note("set_edcca_ignore", knobs.set_edcca_ignore(p.edcca_ignore))
+    {
         last.edcca = Some(p.edcca_ignore);
     }
     // TX power: prefer the absolute dBm scale when the radio has one, since it is what the policy
@@ -393,8 +424,9 @@ pub(crate) fn apply_knobs(
     // re-push a write on every tick forever.
     let dbm_applied = match p.tx_power_dbm {
         Some(dbm) if last.power_dbm != Some(dbm) => match knobs.set_tx_power_dbm(dbm) {
-            Ok(_applied) => {
+            Ok(applied) => {
                 last.power_dbm = Some(dbm);
+                last.applied_dbm = Some(applied);
                 true
             }
             Err(_) => false, // unsupported on this radio — fall through to the index scale
@@ -405,28 +437,53 @@ pub(crate) fn apply_knobs(
     if !dbm_applied
         && let Some(idx) = p.tx_power
         && last.power != Some(idx)
+        && note("set_tx_power", knobs.set_tx_power(idx as u32))
     {
-        knobs.set_tx_power(idx as u32)?;
+        // ★ Recorded only on success. This previously ran unconditionally after a `?`-propagating
+        // call, so on a radio whose `set_tx_power` default was a silent `Ok(())` — the MT7612U and
+        // MT7921AU have no power actuator at all — `last.power` recorded a back-off that no
+        // silicon ever applied, and the bandit was rewarded for a footprint reduction that did not
+        // happen. See `RadioCapability::power_actuated`.
         last.power = Some(idx);
+    }
+    // ★ The RECEIVE half of spatial reuse, actuated beside the power decision rather than after it,
+    // because they are one decision: quieter without being less deferential just shrinks this
+    // node's reach. The dBm threshold is preferred where a radio has one — same reasoning as
+    // dBm-over-index for power — but the two are complementary, not alternatives, so both are
+    // pushed when both are decided (the a81a has both).
+    if let Some((l2h, h2l)) = p.edcca_threshold_dbm
+        && last.edcca_thresh != Some((l2h, h2l))
+        && note(
+            "set_edcca_threshold_dbm",
+            knobs.set_edcca_threshold_dbm(l2h, h2l),
+        )
+    {
+        last.edcca_thresh = Some((l2h, h2l));
+    }
+    if let Some(g) = p.rx_gain
+        && last.rx_gain != Some(g)
+        && note("set_rx_gain", knobs.set_rx_gain(g))
+    {
+        last.rx_gain = Some(g);
     }
     // LoRa reach/rate dials (no-op on Wi-Fi radios): spreading factor, coding rate, bandwidth. Each
     // is a ~1 s AT retune of the dongle, so gate strictly on a changed value.
     if let Some(sf) = p.spreading_factor()
         && last.sf != Some(sf)
+        && note("set_spreading_factor", knobs.set_spreading_factor(sf))
     {
-        knobs.set_spreading_factor(sf)?;
         last.sf = Some(sf);
     }
     if let Some(cr) = p.coding_rate()
         && last.cr != Some(cr)
+        && note("set_coding_rate", knobs.set_coding_rate(cr))
     {
-        knobs.set_coding_rate(cr)?;
         last.cr = Some(cr);
     }
     if let Some(bw) = p.bandwidth_khz()
         && last.bw != Some(bw)
+        && note("set_bandwidth_khz", knobs.set_bandwidth_khz(bw))
     {
-        knobs.set_bandwidth_khz(bw)?;
         last.bw = Some(bw);
     }
     Ok(())

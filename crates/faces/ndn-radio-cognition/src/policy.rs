@@ -337,7 +337,12 @@ impl RadioPolicy {
         DataPlaneConfig {
             dedup: duty_limited_broadcast,
             cs_serve: duty_limited_broadcast,
-            hop: false, // gated on #41 (common-view time); function present in firmware
+            // Still gated on #41 for the FIRMWARE path (its `hop_channel` needs a common-view
+            // clock the MCU does not carry). The radio-sequencer path — a name-derived
+            // `(carrier, period)` table written with `RadioKnobs::set_hop_plan` — is a separate
+            // actuator that needs no such clock, and is installed per face rather than toggled
+            // here. See `crate::name_hop_plan`.
+            hop: false,
         }
     }
 
@@ -680,6 +685,8 @@ impl RadioPolicy {
             edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
             tx_power: self.decide_power(cap, mcs, rssi),
             tx_power_dbm: self.decide_power_dbm(cap, mcs, rssi),
+            rx_gain: self.decide_rx_gain(mcs, rssi),
+            edcca_threshold_dbm: self.decide_edcca_threshold_dbm(mcs, rssi),
         }
     }
 
@@ -698,13 +705,28 @@ impl RadioPolicy {
     /// max** (returns `None` ⇒ leave the hard-won power alone when there's no margin
     /// to give back).
     fn decide_power(&self, cap: &RadioCapability, mcs: u8, rssi: Option<i8>) -> Option<u8> {
-        let backoff_db = self.power_backoff_db(mcs, rssi)?;
-        let backoff_idx = (backoff_db / DB_PER_POWER_IDX).round() as u8;
-        if backoff_idx == 0 {
-            None // no surplus margin → keep calibrated full power
-        } else {
-            Some(cap.max_tx_power.saturating_sub(backoff_idx))
+        // ★ `None` here means "no opinion", and the actuator reads it as "leave the radio where it
+        // is". So it must mean *only* "no measured peer" — never "no back-off wanted". Conflating
+        // the two made this a RATCHET: a node that trimmed 18 dB against a close neighbour, then
+        // watched that neighbour walk away, computed a zero back-off, returned `None`, and kept
+        // whispering for the rest of the process lifetime. Zero back-off is a real decision, and
+        // the decision is *go back to full power*.
+        rssi?;
+        // No actuator, or no measured scale, means no index opinion. Both used to be papered over
+        // — the first by a `set_tx_power` default that returned `Ok(())` without touching silicon,
+        // the second by a global constant — and between them a back-off could be decided, recorded
+        // and rewarded without any part of it reaching the air.
+        if !cap.power_actuated {
+            return None;
         }
+        let db_per_idx = cap.db_per_power_idx?;
+        let backoff_db = self.power_backoff_db(mcs, rssi).unwrap_or(0.0);
+        let backoff_idx = (backoff_db / db_per_idx).round() as u32;
+        let target = u32::from(cap.max_tx_power).saturating_sub(backoff_idx);
+        // Never below the part's monotone floor: past it, the a81a's commanded power INVERTS and
+        // climbs ~11 dB above calibrated max — the exact opposite of the decision.
+        let floor = u32::from(cap.min_tx_power.unwrap_or(0));
+        Some(target.max(floor).min(u32::from(cap.max_tx_power)) as u8)
     }
 
     /// The same back-off, expressed on the **absolute dBm scale** for a radio that
@@ -720,7 +742,11 @@ impl RadioPolicy {
     /// margin to give back — never a guess.
     fn decide_power_dbm(&self, cap: &RadioCapability, mcs: u8, rssi: Option<i8>) -> Option<i8> {
         let range = cap.tx_power_dbm?;
-        let backoff_db = self.power_backoff_db(mcs, rssi)?;
+        // See [`Self::decide_power`]: only a missing peer is "no opinion". A zero back-off means
+        // restore the ceiling — which is what `decide_lora_power_dbm` has always done, and the
+        // reason this path drifted away from it was the `?` on the next line.
+        rssi?;
+        let backoff_db = self.power_backoff_db(mcs, rssi).unwrap_or(0.0);
         let target = i16::from(range.max) - backoff_db.round() as i16;
         Some(range.clamp(target.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8))
     }
@@ -741,9 +767,53 @@ impl RadioPolicy {
         Some(range.clamp(target.clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8))
     }
 
+    /// **The receive half of spatial reuse**: how sensitive this node should be.
+    ///
+    /// Driven off the same surplus signal as [`decide_power`](Self::decide_power), and deliberately
+    /// so — the two are one decision. Backing off transmit power shrinks who *hears* this node;
+    /// raising the detection floor shrinks who this node *defers to*. A node that does only the
+    /// first has reduced its own reach and bought nothing: it still yields the medium to every
+    /// distant transmitter it can hear, so the concurrency the back-off was for never appears.
+    ///
+    /// * surplus margin (the same condition that licenses a power trim) ⇒ [`RxGain::Reduced`]
+    /// * a marginal link ⇒ [`RxGain::Auto`], handing the front end back to the radio. **Never
+    ///   `Boosted`**: a struggling link is exactly where the extra gain most often makes things
+    ///   worse, and this policy has no measurement saying otherwise on any Wi-Fi part.
+    /// * no measured peer ⇒ `None`, no opinion.
+    fn decide_rx_gain(&self, mcs: u8, rssi: Option<i8>) -> Option<ndn_radio_hal::RxGain> {
+        rssi?;
+        Some(match self.power_backoff_db(mcs, rssi) {
+            Some(_) => ndn_radio_hal::RxGain::Reduced,
+            None => ndn_radio_hal::RxGain::Auto,
+        })
+    }
+
+    /// The same decision in **true dBm**, for a radio whose defer threshold is denominated in real
+    /// units ([`RadioKnobs::set_edcca_threshold_dbm`](ndn_radio_hal::RadioKnobs::set_edcca_threshold_dbm)).
+    ///
+    /// ★ The floor is raised by **the same dB the power was trimmed by**. That symmetry is the
+    /// whole point: trim 10 dB of transmit power and raise the defer floor 10 dB and the node has
+    /// actually claimed reuse — it is quieter *and* less deferential by the same amount, so its
+    /// share of the medium is preserved while its interference footprint shrinks. Trim only the
+    /// power and it has simply made itself smaller.
+    ///
+    /// Anchored at [`EDCCA_L2H_BASE_DBM`], the vendor default, with the conventional 8 dB
+    /// hysteresis between `l2h` and `h2l`. `None` when there is no surplus to claim.
+    fn decide_edcca_threshold_dbm(&self, mcs: u8, rssi: Option<i8>) -> Option<(i8, i8)> {
+        let backoff = self.power_backoff_db(mcs, rssi)?;
+        let l2h = (f32::from(EDCCA_L2H_BASE_DBM) + backoff)
+            .round()
+            .clamp(-128.0, 127.0) as i8;
+        Some((l2h, l2h.saturating_sub(EDCCA_HYSTERESIS_DB)))
+    }
+
     /// dB of power the weakest wanted receiver can spare, after keeping
     /// [`POWER_SAFETY_MARGIN_DB`] in hand and capping at [`MAX_BACKOFF_DB`].
-    /// `None` = no measured peer, or no surplus — leave the power alone.
+    ///
+    /// `None` = no measured peer. ⚠ It ALSO returns `None` for a zero back-off, which is a
+    /// different thing entirely — callers must not propagate that with `?`. Both renderers now
+    /// check `rssi` themselves and treat `None` from here as 0 dB, because a zero back-off is a
+    /// decision to transmit at full power, not an absence of one.
     ///
     /// Shared by both power knobs so the index and dBm paths can never drift into
     /// two different policies.
@@ -880,6 +950,38 @@ impl RadioPolicy {
     }
 }
 
+/// **Decide the BLE advertising PHY** — the bearer's reach lever, chosen the same way the Wi-Fi side
+/// chooses a data rate: capability floor first, preference second.
+///
+/// Two inputs, and the order matters:
+///
+/// 1. **The floor is a capability, not a preference.** Only extended advertising PDUs carry a PHY
+///    selection, so an LE 2M or LE Coded advert is invisible to a legacy-only receiver at any range
+///    and any power — MEASURED: 20/20 on LE 1M and 0/20 on coded, to the same peer. So the choice is
+///    capped at the *least* capable fresh neighbour, and a single legacy-only neighbour pins the whole
+///    group to 1M. That is the doctrine's worst-overheard receiver, applied to a PHY instead of a rate.
+/// 2. **Within the floor, reach or rate.** Coded (S=8) buys roughly 2–4x range through coding gain,
+///    at an eighth of the symbol rate; 2M halves airtime at some cost in range. So `Urgent` (favour
+///    reach) takes Coded when the group allows it, `Bulk` (favour throughput) takes 2M, and `Normal`
+///    stays on 1M — the universal PHY, and the one with no downside for a group whose composition may
+///    change between reports.
+///
+/// `worst_neighbor` is `None` when nobody has reported: that means an unknown neighbourhood, not an
+/// empty one, so it resolves to [`ADV_PHY_1M`](crate::report::ADV_PHY_1M) — the only PHY that is safe
+/// against a receiver we have not met.
+///
+/// Returns one of the `ADV_PHY_*` codes; the BLE bearer maps it to its own PHY type.
+pub fn decide_adv_phy(view: &dyn MediumView, priority: Priority, self_cap: u8, now_ms: u64) -> u8 {
+    use crate::report::{ADV_PHY_1M, ADV_PHY_2M, ADV_PHY_CODED};
+    // The group floor: our own transmit capability AND the least capable listener.
+    let floor = self_cap.min(view.worst_neighbor_adv_phy(now_ms).unwrap_or(ADV_PHY_1M));
+    match priority {
+        Priority::Urgent if floor >= ADV_PHY_CODED => ADV_PHY_CODED,
+        Priority::Bulk if floor >= ADV_PHY_2M => ADV_PHY_2M,
+        _ => ADV_PHY_1M,
+    }
+}
+
 impl RadioStrategy for RadioPolicy {
     fn decide(&self, ctx: &NameContext, medium: &dyn MediumView, now_ms: u64) -> RadioPlan {
         RadioPolicy::decide(self, ctx, medium, now_ms)
@@ -899,10 +1001,24 @@ const BROAD_MARGIN_DB: f32 = 6.0;
 const UNICAST_MARGIN_DB: f32 = 4.0;
 /// Decode-margin (dB) kept above the threshold when backing off TX power.
 const POWER_SAFETY_MARGIN_DB: f32 = 6.0;
+/// The clear-channel (defer) threshold a radio sits at with no reuse claimed, in dBm — the vendor
+/// default the Realtek parts boot with. [`RadioPolicy::decide_edcca_threshold_dbm`] raises above
+/// this by exactly the dB of transmit power it gave back.
+const EDCCA_L2H_BASE_DBM: i8 = -75;
+/// Hysteresis between the busy (`l2h`) and idle (`h2l`) thresholds, in dB — the kernel default.
+const EDCCA_HYSTERESIS_DB: i8 = 8;
 /// Most we'll back TX power off, even with huge surplus margin (dB).
 const MAX_BACKOFF_DB: f32 = 18.0;
-/// Approx dB per chip TXAGC index step (used to convert a dB back-off to indices).
-const DB_PER_POWER_IDX: f32 = 0.5;
+// ☠ `DB_PER_POWER_IDX = 0.5` lived here. It was a single global "approx dB per TXAGC index step"
+// applied to every radio in the fleet, and **no part in the fleet obeyed it**: MEASURED 0.22 dB on
+// the a81a (2x wrong), 0.111-0.155 on the RTL8733BU (4x wrong), and non-linear on the RTL8812AU
+// where no single number can be right. So the policy reasoned correctly in dB and then rendered an
+// 18 dB decision as 1.5-5 dB of actual back-off, differently per part, invisibly.
+//
+// The number now comes from the radio: `RadioCapability::db_per_power_idx`, populated only from a
+// measurement. When a part has not been measured this is `None` and `decide_power` returns `None`
+// — declining to have an index opinion is strictly better than guessing, because a guess here is
+// indistinguishable from a decision and gets rewarded as one.
 
 /// Nominal PHY rate proxy (Mbps) for the objective estimate — monotone in the
 /// rate-affecting params, not a calibrated figure.
@@ -948,7 +1064,11 @@ mod power_dbm_tests {
     #[test]
     fn advertised_range_yields_a_dbm_decision() {
         let p = RadioPolicy::default();
-        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        let cap = RadioCapability {
+            db_per_power_idx: Some(0.5),
+            power_actuated: true,
+            ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
+        };
         // A very strong peer: lots of surplus margin to give back.
         let dbm = p
             .decide_power_dbm(&cap, 0, Some(-30))
@@ -962,7 +1082,11 @@ mod power_dbm_tests {
     #[test]
     fn both_scales_agree_on_when_to_back_off() {
         let p = RadioPolicy::default();
-        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        let cap = RadioCapability {
+            db_per_power_idx: Some(0.5),
+            power_actuated: true,
+            ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
+        };
         for rssi in [-30i8, -50, -70, -90] {
             let idx = p.decide_power(&cap, 0, Some(rssi));
             let dbm = p.decide_power_dbm(&cap, 0, Some(rssi));
@@ -979,7 +1103,14 @@ mod power_dbm_tests {
     #[test]
     fn no_advertised_range_means_no_dbm_decision() {
         let p = RadioPolicy::default();
-        let cap = RadioCapability::wifi_monitor_5ghz(vec![149]); // index-only
+        // Index-only, but with a MEASURED index scale — without one the index path correctly
+        // declines too, which is a different property (see
+        // `a_radio_with_no_actuator_gets_no_power_decision`).
+        let cap = RadioCapability {
+            db_per_power_idx: Some(0.5),
+            power_actuated: true,
+            ..RadioCapability::wifi_monitor_5ghz(vec![149])
+        };
         assert!(cap.tx_power_dbm.is_none());
         assert_eq!(p.decide_power_dbm(&cap, 0, Some(-30)), None);
         // ...but the index path still decides, so such a radio is not left un-actuated.
@@ -990,7 +1121,11 @@ mod power_dbm_tests {
     #[test]
     fn no_rssi_leaves_power_untouched() {
         let p = RadioPolicy::default();
-        let cap = RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27));
+        let cap = RadioCapability {
+            db_per_power_idx: Some(0.5),
+            power_actuated: true,
+            ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
+        };
         assert_eq!(p.decide_power_dbm(&cap, 0, None), None);
     }
 
@@ -1158,6 +1293,7 @@ mod tests {
                 NeighborReport {
                     heard_prefixes: vec![],
                     spectrum: vec![],
+                    max_adv_phy: crate::report::ADV_PHY_1M,
                     max_rx_mcs: max_rx,
                     ts_ms: 1_000,
                 },
@@ -1567,5 +1703,278 @@ mod tests {
         });
         let p = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
         assert_eq!(p.allocations[0].channel, Some(161));
+    }
+}
+
+#[cfg(test)]
+mod adv_phy_tests {
+    use ndn_radio_hal::RxGain;
+
+    /// ★ The power ratchet: a back-off that could never be undone.
+    ///
+    /// `power_backoff_db` returns `None` both for "no measured peer" and for "zero back-off", and
+    /// both renderers used to propagate that with `?`. Since `apply_knobs` reads `None` as "leave
+    /// the radio alone", a node that trimmed power against a close neighbour could never restore it
+    /// when that neighbour left — it whispered for the rest of the process lifetime. This was live
+    /// on HaLow, the one bearer where the dBm axis actually works.
+    #[test]
+    fn power_recovers_when_the_close_neighbour_leaves() {
+        let policy = RadioPolicy::default();
+        let mut cap = RadioCapability::wifi_monitor_2ghz_1ss((1..=13).collect());
+        cap.tx_power_dbm = Some(ndn_radio_hal::DbmRange::new(2, 20));
+        cap.max_tx_power = 63;
+        cap.db_per_power_idx = Some(0.5); // the index half needs a declared scale to have an opinion
+        cap.power_actuated = true;
+
+        // A very strong peer: plenty of surplus, so both renderers must trim.
+        let near_dbm = policy.decide_power_dbm(&cap, 4, Some(-35));
+        let near_idx = policy.decide_power(&cap, 4, Some(-35));
+        assert!(near_dbm.is_some() && near_idx.is_some());
+        assert!(near_dbm.unwrap() < 20, "expected a trim, got {near_dbm:?}");
+        assert!(near_idx.unwrap() < cap.max_tx_power);
+
+        // That peer walks away to the edge of decodability: zero surplus. This is a DECISION to
+        // transmit at full power, not an absence of one.
+        let far_dbm = policy.decide_power_dbm(&cap, 4, Some(-90));
+        let far_idx = policy.decide_power(&cap, 4, Some(-90));
+        assert_eq!(far_dbm, Some(20), "must climb back to the ceiling, not return None");
+        assert_eq!(far_idx, Some(cap.max_tx_power));
+
+        // Genuinely no measurement is still, correctly, no opinion.
+        assert_eq!(policy.decide_power_dbm(&cap, 4, None), None);
+        assert_eq!(policy.decide_power(&cap, 4, None), None);
+    }
+
+    /// ★ The index back-off must be rendered with the RADIO'S measured dB-per-step, not a global
+    /// constant. MEASURED: 0.22 dB/step on the a81a and 0.125 on the RTL8733BU, against the old
+    /// hardcoded 0.5 — so the same decided back-off is 27 index steps on one part and 48 on
+    /// another, and the constant was 2x/4x wrong respectively.
+    #[test]
+    fn index_backoff_uses_the_parts_own_measured_scale() {
+        let policy = RadioPolicy::default();
+        let mcs = 4;
+        // Pick an RSSI that yields a known back-off through the shared helper, so the test states
+        // the CONVERSION property and does not re-encode the threshold table.
+        // -70 dBm gives a modest surplus rather than the 18 dB cap, so neither scale saturates.
+        let rssi = Some(-70i8);
+        let backoff = policy.power_backoff_db(mcs, rssi).expect("a mid peer has surplus");
+
+        let mk = |db_per_idx: f32| {
+            let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
+            // 127, not 63: at 0.125 dB/step an 18 dB back-off is 144 steps, so a 63-index scale
+            // saturates and the two parts would look identical. The saturation is real and correct
+            // on hardware; it just hides the property under test.
+            cap.max_tx_power = 127;
+            cap.db_per_power_idx = Some(db_per_idx);
+            cap.power_actuated = true;
+            cap
+        };
+        let steps = |cap: &RadioCapability| {
+            cap.max_tx_power - policy.decide_power(cap, mcs, rssi).unwrap()
+        };
+        assert!(
+            (backoff / 0.125).round() <= 127.0,
+            "test must not saturate: {backoff} dB / 0.125 exceeds the scale"
+        );
+
+        let a81a = steps(&mk(0.22));
+        let rtl8733b = steps(&mk(0.125));
+        assert_eq!(a81a as f32, (backoff / 0.22).round());
+        assert_eq!(rtl8733b as f32, (backoff / 0.125).round());
+        assert!(
+            rtl8733b > a81a,
+            "a finer scale must take MORE index steps for the same dB: {rtl8733b} vs {a81a}"
+        );
+        // The plan's acceptance numbers, stated concretely: a 6 dB back-off is 27 index steps on
+        // the a81a and 48 on the RTL8733BU. The retired global constant made both 12.
+        if (backoff - 6.0).abs() < f32::EPSILON {
+            assert_eq!((a81a, rtl8733b), (27, 48));
+        }
+    }
+
+    /// ☠ A radio whose power knob reaches no silicon must get no power decision at all.
+    /// MEASURED true of the MT7612U and MT7921AU. Before `power_actuated` existed they accepted
+    /// every back-off, `apply_knobs` recorded it, and the bandit was rewarded for a footprint
+    /// reduction that never physically happened.
+    #[test]
+    fn a_radio_with_no_actuator_gets_no_power_decision() {
+        let policy = RadioPolicy::default();
+        let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        cap.max_tx_power = 63;
+        cap.db_per_power_idx = Some(0.5);
+        cap.power_actuated = false;
+        assert_eq!(policy.decide_power(&cap, 4, Some(-40)), None);
+
+        // ...and neither does one whose scale has never been measured: guessing the units is
+        // indistinguishable from deciding, and gets rewarded as a decision.
+        cap.power_actuated = true;
+        cap.db_per_power_idx = None;
+        assert_eq!(policy.decide_power(&cap, 4, Some(-40)), None);
+    }
+
+    /// ☠ The back-off must never cross the part's monotone floor. MEASURED on the a81a: below
+    /// index 20 the commanded power INVERTS and peaks ~11 dB above calibrated max — a "back-off"
+    /// that shouts into the channel it was protecting.
+    #[test]
+    fn backoff_stops_at_the_inversion_floor() {
+        let policy = RadioPolicy::default();
+        let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        cap.max_tx_power = 63;
+        cap.db_per_power_idx = Some(0.22); // 18 dB max back-off => ~82 steps, well past the floor
+        cap.min_tx_power = Some(20);
+        cap.power_actuated = true;
+        let idx = policy.decide_power(&cap, 0, Some(-20)).expect("huge surplus");
+        assert!(idx >= 20, "walked past the inversion floor to {idx}");
+    }
+
+    /// ★ Spatial reuse is ONE decision with two halves. Whenever the policy trims transmit power
+    /// it must also make this node less deferential by the same amount — otherwise it has only
+    /// made itself smaller: still yielding the medium to every distant transmitter it hears, with
+    /// none of the concurrency the trim was for.
+    #[test]
+    fn the_two_halves_of_spatial_reuse_move_together() {
+        let policy = RadioPolicy::default();
+        let mcs = 4;
+
+        // Surplus margin: trim power AND stop deferring so readily.
+        let strong = Some(-40i8);
+        let trim = policy
+            .power_backoff_db(mcs, strong)
+            .expect("a strong peer has surplus");
+        assert_eq!(policy.decide_rx_gain(mcs, strong), Some(RxGain::Reduced));
+        let (l2h, h2l) = policy
+            .decide_edcca_threshold_dbm(mcs, strong)
+            .expect("surplus licenses a higher floor");
+        assert_eq!(
+            i16::from(l2h) - i16::from(EDCCA_L2H_BASE_DBM),
+            trim.round() as i16,
+            "the defer floor must rise by exactly the dB the power fell"
+        );
+        assert_eq!(h2l, l2h - EDCCA_HYSTERESIS_DB);
+
+        // A marginal link: hand the front end back, claim no reuse.
+        let weak = Some(-90i8);
+        assert_eq!(policy.decide_rx_gain(mcs, weak), Some(RxGain::Auto));
+        assert_eq!(policy.decide_edcca_threshold_dbm(mcs, weak), None);
+
+        // No measured peer: no opinion at all, on either half.
+        assert_eq!(policy.decide_rx_gain(mcs, None), None);
+        assert_eq!(policy.decide_edcca_threshold_dbm(mcs, None), None);
+    }
+
+    /// ⚠ A struggling link must never be answered with `Boosted`. Extra front-end gain on a
+    /// marginal link is as likely to desense as to help, and nothing in this tree has MEASURED the
+    /// delta on any Wi-Fi part — so the policy must not reach for it.
+    #[test]
+    fn a_weak_link_is_never_boosted() {
+        let policy = RadioPolicy::default();
+        for rssi in [-70i8, -80, -85, -90, -95] {
+            assert_ne!(
+                policy.decide_rx_gain(4, Some(rssi)),
+                Some(RxGain::Boosted),
+                "boosted at rssi {rssi}"
+            );
+        }
+    }
+
+    /// A radio with no dBm axis must still get no dBm opinion, however strong the peer — the
+    /// index path is the only one that may speak for it.
+    #[test]
+    fn no_dbm_axis_means_no_dbm_decision() {
+        let policy = RadioPolicy::default();
+        let cap = RadioCapability::wifi_monitor_2ghz_1ss((1..=13).collect());
+        assert_eq!(cap.tx_power_dbm, None);
+        assert_eq!(policy.decide_power_dbm(&cap, 4, Some(-35)), None);
+    }
+    use super::*;
+    use crate::report::{ADV_PHY_1M, ADV_PHY_2M, ADV_PHY_CODED};
+    use crate::sense::{MediumState, NeighborReport};
+
+    fn medium_with(caps: &[u8]) -> MediumState {
+        let mut m = MediumState::default();
+        for (i, c) in caps.iter().enumerate() {
+            m.observe_report(
+                i as u64 + 1,
+                NeighborReport {
+                    heard_prefixes: vec![],
+                    spectrum: vec![],
+                    max_rx_mcs: crate::report::FULL_RX_MCS,
+                    max_adv_phy: *c,
+                    ts_ms: 100,
+                },
+            );
+        }
+        m
+    }
+
+    /// One legacy-only neighbour pins the whole group to 1M, however urgent the traffic and however
+    /// capable everyone else is. This is the property the whole mechanism exists for: a coded advert
+    /// would not reach that neighbour at all.
+    #[test]
+    fn one_legacy_only_neighbour_pins_the_group_to_1m() {
+        let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_CODED, ADV_PHY_1M]);
+        for p in [Priority::Bulk, Priority::Normal, Priority::Urgent] {
+            assert_eq!(decide_adv_phy(&m, p, ADV_PHY_CODED, 100), ADV_PHY_1M);
+        }
+    }
+
+    /// With an all-capable group, urgency buys reach and bulk buys airtime.
+    #[test]
+    fn intent_picks_within_the_group_floor() {
+        let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_CODED]);
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            ADV_PHY_CODED
+        );
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Bulk, ADV_PHY_CODED, 100),
+            ADV_PHY_2M
+        );
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Normal, ADV_PHY_CODED, 100),
+            ADV_PHY_1M
+        );
+    }
+
+    /// Our own transmit capability is a floor too — a radio that cannot emit coded must not be told to.
+    #[test]
+    fn own_capability_bounds_the_choice() {
+        let m = medium_with(&[ADV_PHY_CODED]);
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_1M, 100),
+            ADV_PHY_1M
+        );
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_2M, 100),
+            ADV_PHY_1M
+        );
+    }
+
+    /// No reports = an UNKNOWN neighbourhood, not an empty one. Silence must not be read as
+    /// permission to use a PHY that would exclude whoever is actually out there.
+    #[test]
+    fn unknown_neighbourhood_falls_back_to_the_universal_phy() {
+        let m = MediumState::default();
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            ADV_PHY_1M
+        );
+    }
+
+    /// A neighbour that has gone stale must stop constraining the group — otherwise one departed
+    /// legacy node holds everyone at 1M forever.
+    #[test]
+    fn stale_neighbours_stop_constraining() {
+        let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_1M]);
+        let long_after = 100 + 10_000_000;
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            ADV_PHY_1M
+        );
+        assert_eq!(
+            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, long_after),
+            ADV_PHY_1M,
+            "with every neighbour stale the fold is None, which must still mean the universal PHY"
+        );
     }
 }

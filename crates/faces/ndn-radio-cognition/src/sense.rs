@@ -149,6 +149,10 @@ pub struct NeighborReport {
     /// [`crate::report::LEGACY_ONLY_RX`] (0) if it decodes legacy OFDM only. Drives the
     /// worst-overheard-receiver data-rate cap.
     pub max_rx_mcs: u8,
+    /// The best BLE advertising PHY this neighbour can *receive* ([`crate::report::ADV_PHY_1M`] …
+    /// `ADV_PHY_CODED`). Drives the advertising-PHY floor: unlike the MCS cap, a neighbour that
+    /// cannot receive the chosen PHY is not served at all.
+    pub max_adv_phy: u8,
     pub ts_ms: u64,
 }
 
@@ -187,8 +191,19 @@ impl Default for Demand {
 struct NeighborState {
     /// RSSI EWMA per radio that hears this neighbor (LoRa hears far, Wi-Fi near).
     rssi: HashMap<RadioId, Ewma>,
-    /// Per-radio EWMA SNR (dB), when the backend reports it. Parallel to `rssi`.
+    /// **OUTBOUND** SNR (dB): how cleanly this neighbour reports hearing *us*, folded from its
+    /// reception reports. This is what the worst-receiver rate cap wants, because it describes the
+    /// link our transmission must survive.
     snr: HashMap<RadioId, Ewma>,
+    /// **INBOUND** SNR (dB): how cleanly *we* hear this neighbour, measured locally from received
+    /// frames. This is what we advertise in `heard_snr`.
+    ///
+    /// Kept separate from `snr` because SNR is NOT reciprocal — RSSI roughly is, but noise and
+    /// interference are local to each end, so a contended receiver and a contended transmitter are
+    /// different situations. Folding both directions into one EWMA (which this did) averaged "how
+    /// loud we are there" with "how noisy it is here", and left the report builder advertising
+    /// numbers that originated at the peer it was advertising them to.
+    snr_in: HashMap<RadioId, Ewma>,
     report: Option<NeighborReport>,
     last_seen_ms: u64,
 }
@@ -206,6 +221,8 @@ pub struct MediumState {
     /// before reception reports establish per-neighbour links; deliberately kept out of
     /// `neighbors` so it never affects `receiver_count`/multiplicity.
     ambient_rssi: HashMap<RadioId, Ewma>,
+    /// Ambient inbound SNR per radio — see [`MediumState::observe_radio_snr`].
+    ambient_snr: HashMap<RadioId, Ewma>,
     neighbors: HashMap<u64, NeighborState>,
     demand: HashMap<u64, Demand>,
     /// Per-radio on-air time records `(sent_ms, airtime_ms)` over the duty window, for enforcing
@@ -217,6 +234,12 @@ pub struct MediumState {
     /// outgoing [`snapshot_report`](Self::snapshot_report) so peers can cap the data rate
     /// they reach us at. Defaults to fully-capable.
     self_rx_mcs: u8,
+    /// The best BLE advertising PHY THIS node can receive — advertised so peers know whether a
+    /// coded (long-range) advert would reach us at all. Conservative until declared.
+    self_adv_phy: u8,
+    /// This node's applied TX power in dBm, or `None` when it has no dBm-truthful axis.
+    /// Advertised in outgoing reports so a neighbour can turn its RSSI of us into a path loss.
+    self_tx_power_dbm: Option<i8>,
     /// Per-frame neighbour density `(count, updated_ms)` from the §2 source-nonce map (the doctrine's
     /// CCLF density term) — every neighbour that put a frame on air, including silent ones that never
     /// sent a reception report. Folded into `receiver_count` by `max` so it never under-counts and
@@ -250,6 +273,8 @@ impl MediumState {
             e2e: Ewma::new(0.2),
             stale_ms: 10_000,
             self_rx_mcs: crate::report::FULL_RX_MCS,
+            self_adv_phy: crate::report::ADV_PHY_1M,
+            self_tx_power_dbm: None,
             ..Default::default()
         }
     }
@@ -268,6 +293,32 @@ impl MediumState {
         self.self_rx_mcs = max_rx_mcs;
     }
 
+    /// Declare the best BLE advertising PHY this node can **receive** ([`crate::report::ADV_PHY_1M`],
+    /// `ADV_PHY_2M` or `ADV_PHY_CODED`). Advertised in outgoing reports.
+    ///
+    /// Declare what the scanner is actually armed for, not what the silicon could do: a controller
+    /// with extended advertising whose scan was never given coded parameters still hears nothing on
+    /// the coded PHY, and over-declaring here removes this node from the group silently.
+    pub fn set_self_adv_phy(&mut self, max_adv_phy: u8) {
+        self.self_adv_phy = max_adv_phy;
+    }
+
+    /// Declare the TX power this node is **actually transmitting at**, in dBm, or `None` if it has
+    /// no dBm-truthful axis.
+    ///
+    /// ★ Paired with the RSSI a neighbour reports for us, this is what makes a **measured path
+    /// loss** — `pl_dB = tx_power_dbm − rssi` — instead of the reciprocity guess the power policy
+    /// otherwise rests on, an assumption it invalidates itself the moment either end backs off.
+    ///
+    /// ⚠ Declare the **applied** power (what the radio reported back), not the requested one: a
+    /// firmware or regulatory clamp makes them differ, and a peer computing path loss from a
+    /// number we did not transmit at gets a wrong answer with no way to notice. Leave it `None` on
+    /// an index-scale radio rather than converting — see
+    /// [`ReceptionReport::tx_power_dbm`](crate::report::ReceptionReport::tx_power_dbm).
+    pub fn set_self_tx_power_dbm(&mut self, dbm: Option<i8>) {
+        self.self_tx_power_dbm = dbm;
+    }
+
     /// The worst (lowest) RX capability across fresh neighbours — the ceiling a broadcast
     /// data rate must respect to reach every neighbour (the doctrine's worst-overheard
     /// receiver). `None` when no neighbour has reported one. `Some(LEGACY_ONLY_RX)` means
@@ -277,6 +328,20 @@ impl MediumState {
             .values()
             .filter(|s| self.fresh(s.last_seen_ms, now_ms))
             .filter_map(|s| s.report.as_ref().map(|r| r.max_rx_mcs))
+            .min()
+    }
+
+    /// The worst (least capable) BLE advertising PHY across fresh neighbours — the ceiling an
+    /// advertisement must respect to reach *every* neighbour.
+    ///
+    /// `None` when no neighbour has reported. Note this fold is stricter than its Wi-Fi sibling by
+    /// design: a neighbour that cannot receive the chosen PHY is not merely served slowly, it is not
+    /// served at all, so the minimum here is a hard floor rather than a preference.
+    pub fn worst_neighbor_adv_phy(&self, now_ms: u64) -> Option<u8> {
+        self.neighbors
+            .values()
+            .filter(|s| self.fresh(s.last_seen_ms, now_ms))
+            .filter_map(|s| s.report.as_ref().map(|r| r.max_adv_phy))
             .min()
     }
 
@@ -293,6 +358,7 @@ impl MediumState {
         self.radios.insert(id, cap);
         self.residual.entry(id).or_default();
     }
+
 
     /// Record `airtime_ms` of on-air time for `radio` at `now_ms` — call once per transmission on a
     /// duty-cycled radio ([`lora_airtime_ms`] gives the value). Old records fall out of the window.
@@ -339,6 +405,30 @@ impl MediumState {
         }
     }
 
+    /// Fold a **locally measured** SNR (dB) for frames received *from* `neighbor` — the inbound
+    /// direction, from a backend that reports per-frame PHY quality (`CapturedFrame.phy.snr_db`).
+    ///
+    /// This is the source node the SNR path was missing. Before it, the only writer of any SNR was
+    /// report ingest — which carries a peer's measurement of *our* outbound link — so what a node
+    /// advertised in `heard_snr` was that peer's own number echoed back, and the graph had no
+    /// origin. A rate cap fed from a closed echo caps nothing.
+    pub fn observe_heard_snr(
+        &mut self,
+        radio: RadioId,
+        neighbor: u64,
+        snr_db: Option<f32>,
+        now_ms: u64,
+    ) {
+        if let Some(v) = snr_db {
+            let st = self.neighbors.entry(neighbor).or_default();
+            st.last_seen_ms = now_ms;
+            st.snr_in
+                .entry(radio)
+                .or_insert_with(|| Ewma::new(0.3))
+                .update(v);
+        }
+    }
+
     /// Fold a per-radio ambient inbound RSSI reading (no neighbour identity). Unlike
     /// [`observe_rx`] this creates no neighbour entry — it feeds only the cold-start
     /// `weakest_rssi` fallback, never `receiver_count`.
@@ -349,6 +439,26 @@ impl MediumState {
                 .or_insert_with(|| Ewma::new(0.3))
                 .update(r as f32);
         }
+    }
+
+    /// Ambient inbound **SNR** for a radio — the quality of whatever it is hearing, with no
+    /// neighbour attached. The SNR sibling of [`observe_radio_rssi`](Self::observe_radio_rssi).
+    ///
+    /// Deliberately NOT fed to the worst-receiver rate cap: an SNR with no neighbour behind it
+    /// would cap the rate on nobody's behalf. It is a cold-start and diagnostic signal — the
+    /// honest answer to "is this radio in a noisy place", which nothing could ask before.
+    pub fn observe_radio_snr(&mut self, radio: RadioId, snr_db: Option<i8>, _now_ms: u64) {
+        if let Some(v) = snr_db {
+            self.ambient_snr
+                .entry(radio)
+                .or_insert_with(|| Ewma::new(0.3))
+                .update(v as f32);
+        }
+    }
+
+    /// Ambient inbound SNR (dB) for `radio`, if any frames have carried it.
+    pub fn ambient_snr_db(&self, radio: RadioId) -> Option<f32> {
+        self.ambient_snr.get(&radio).and_then(|e| e.get())
     }
 
     pub fn observe_occupancy(&mut self, occ: ChannelOccupancy) {
@@ -425,7 +535,7 @@ impl MediumState {
         for (&n, st) in &self.neighbors {
             if self.fresh(st.last_seen_ms, now_ms)
                 && let Some(q) = st
-                    .snr
+                    .snr_in
                     .values()
                     .filter_map(|e| e.get())
                     .min_by(|a, b| a.total_cmp(b))
@@ -448,6 +558,8 @@ impl MediumState {
             heard_prefixes,
             spectrum: spec.into_iter().collect(),
             heard_snr,
+            max_adv_phy: self.self_adv_phy,
+            tx_power_dbm: self.self_tx_power_dbm,
         }
     }
 }
@@ -505,6 +617,14 @@ pub trait MediumView {
     fn worst_neighbor_rx_mcs(&self, _now_ms: u64) -> Option<u8> {
         None
     }
+
+    /// The worst (least capable) BLE advertising PHY any fresh neighbour advertised — the ceiling a
+    /// broadcast advertisement must respect so every listener can receive it at all. `None` when no
+    /// neighbour has reported. Default `None` for views that don't track reception reports.
+    fn worst_neighbor_adv_phy(&self, _now_ms: u64) -> Option<u8> {
+        None
+    }
+
 }
 
 impl MediumView for MediumState {
@@ -533,6 +653,9 @@ impl MediumView for MediumState {
     fn worst_neighbor_rx_mcs(&self, now_ms: u64) -> Option<u8> {
         // Delegate to the inherent accessor (the report-derived worst RX ceiling).
         MediumState::worst_neighbor_rx_mcs(self, now_ms)
+    }
+    fn worst_neighbor_adv_phy(&self, now_ms: u64) -> Option<u8> {
+        MediumState::worst_neighbor_adv_phy(self, now_ms)
     }
     fn residual(&self, radio: RadioId) -> Option<LinkResidual> {
         self.residual.get(&radio).copied()
@@ -820,6 +943,7 @@ mod tests {
                 heard_prefixes: vec![0xABCD],
                 spectrum: vec![(149, 40)],
                 max_rx_mcs: crate::report::FULL_RX_MCS,
+                max_adv_phy: crate::report::ADV_PHY_1M,
                 ts_ms: 100,
             },
         );
@@ -888,5 +1012,64 @@ mod tests {
         let d = m.demand(0xAA).unwrap();
         assert!((d.reinterest_rate.get().unwrap() - 0.3).abs() < 1e-6);
         assert!((d.rank_deficit.get().unwrap() - 2.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod snr_direction_tests {
+    use super::*;
+
+    const W: RadioId = RadioId(1);
+
+    /// The bug this separation exists to prevent: what a node ADVERTISES about a neighbour must be
+    /// its own measurement of that neighbour, never a value the neighbour reported about us.
+    /// Previously both wrote one field, so `heard_snr` echoed the peer's own number back at it and
+    /// the whole SNR path had no origin.
+    #[test]
+    fn advertised_snr_is_our_measurement_not_the_peers_echo() {
+        let mut m = MediumState::default();
+        // A peer tells us how cleanly IT hears US (outbound). This must not become what we
+        // advertise about the peer.
+        m.observe_rx_snr(W, 42, Some(30.0), 1_000);
+        let rep = m.snapshot_report(7, 1, 1_000);
+        assert!(
+            rep.heard_snr.is_empty(),
+            "a peer's report of our outbound link must not be re-advertised as our observation of them"
+        );
+
+        // Now WE measure how cleanly we hear that peer (inbound). That is advertisable.
+        m.observe_heard_snr(W, 42, Some(11.0), 1_000);
+        let rep = m.snapshot_report(7, 2, 1_000);
+        assert_eq!(rep.heard_snr, vec![(42, 11)]);
+    }
+
+    /// The two directions must not contaminate each other: the rate cap reads outbound, the report
+    /// advertises inbound, and feeding one must leave the other untouched.
+    #[test]
+    fn the_two_directions_stay_separate() {
+        let mut m = MediumState::default();
+        m.observe_heard_snr(W, 42, Some(5.0), 1_000); // inbound only
+        assert_eq!(
+            m.weakest_snr_db(W, 1_000),
+            None,
+            "an inbound measurement says nothing about how a receiver hears us"
+        );
+        m.observe_rx_snr(W, 42, Some(25.0), 1_000); // outbound only
+        assert_eq!(m.weakest_snr_db(W, 1_000), Some(25.0));
+        assert_eq!(
+            m.snapshot_report(7, 1, 1_000).heard_snr,
+            vec![(42, 5)],
+            "the outbound value must not leak into what we advertise"
+        );
+    }
+
+    /// Ambient SNR is a radio-level observation with no neighbour attached, so it must never reach
+    /// the worst-receiver cap — capping the rate on nobody's behalf is how a lever starts lying.
+    #[test]
+    fn ambient_snr_never_feeds_the_receiver_cap() {
+        let mut m = MediumState::default();
+        m.observe_radio_snr(W, Some(3), 1_000);
+        assert_eq!(m.ambient_snr_db(W), Some(3.0));
+        assert_eq!(m.weakest_snr_db(W, 1_000), None);
     }
 }

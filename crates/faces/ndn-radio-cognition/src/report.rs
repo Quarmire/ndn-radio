@@ -20,8 +20,13 @@
 /// Reception-report content magic (first byte).
 pub const REPORT_MAGIC: u8 = 0xCD;
 /// Report wire version. v2 appends `max_rx_mcs` after `ts_ms` (v1 reports decode with
-/// `max_rx_mcs = FULL_RX_MCS`, i.e. assume a fully-capable receiver).
-pub const REPORT_VERSION: u8 = 2;
+/// `max_rx_mcs = FULL_RX_MCS`, i.e. assume a fully-capable receiver). v3 appends
+/// [`ReceptionReport::tx_power_dbm`] at the tail (absent = a reporter with no dBm axis).
+pub const REPORT_VERSION: u8 = 3;
+
+/// `tx_power_dbm` sentinel meaning "the reporter has no dBm-truthful power axis". Chosen because
+/// no real transmit power is this value, and it survives the `i8` wire encoding unchanged.
+pub const TX_POWER_UNKNOWN: i8 = i8::MIN;
 /// Max entries encoded/accepted per list (bounded state).
 pub const MAX_ENTRIES: usize = 32;
 /// `max_rx_mcs` value meaning "decodes any HT/VHT MCS" — the fully-capable default.
@@ -37,6 +42,18 @@ pub const LEGACY_ONLY_RX: u8 = 0;
 /// 2-stream frame is undecodable by a 1-chain radio regardless of per-stream MCS. This is why
 /// [`FULL_RX_MCS`] here means "2-stream capable", and any `1..=7` means "single stream, ≤ that MCS".
 pub const SINGLE_STREAM_HT_RX_MCS: u8 = 7;
+
+/// `max_adv_phy`: the reporter can receive **LE 1M advertising only** — the universal PHY, and the
+/// only one legacy advertising can use. Assumed for any peer that does not say otherwise.
+pub const ADV_PHY_1M: u8 = 1;
+/// `max_adv_phy`: also receives **LE 2M** extended advertising (faster, shorter range).
+pub const ADV_PHY_2M: u8 = 2;
+/// `max_adv_phy`: also receives **LE Coded** (S=8) extended advertising — the long-range PHY.
+///
+/// Requires both an extended-advertising controller *and* a scanner armed for the coded primary PHY;
+/// a node with the first but not the second still cannot hear a coded advert, so this must reflect
+/// what the receiver is actually listening for, not merely what its silicon could do.
+pub const ADV_PHY_CODED: u8 = 3;
 
 /// A node's snapshot of what it observes, shared with neighbors.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +85,55 @@ pub struct ReceptionReport {
     ///
     /// Empty when the reporter's radio cannot measure SNR, which must cost it nothing.
     pub heard_snr: Vec<(u64, i8)>,
+    /// The most capable BLE advertising PHY the reporter can **receive** — [`ADV_PHY_1M`],
+    /// [`ADV_PHY_2M`] or [`ADV_PHY_CODED`].
+    ///
+    /// The BLE sibling of [`max_rx_mcs`](Self::max_rx_mcs), and it matters more than the Wi-Fi one:
+    /// choosing a rate a neighbour cannot decode costs delivery, but choosing a *PHY* a neighbour
+    /// cannot receive costs it **everything** — only extended advertising PDUs carry a PHY selection,
+    /// so a coded advert is invisible to a legacy-only controller at any range and any power.
+    /// MEASURED: an RTL8720DN peer heard 20/20 LE 1M adverts and 0/20 coded ones.
+    ///
+    /// Defaults to [`ADV_PHY_1M`] — the conservative direction, unlike `max_rx_mcs`, which assumes a
+    /// fully-capable receiver when unstated. The asymmetry is deliberate: guessing too high here
+    /// silently removes a neighbour from the group rather than slowing it down.
+    pub max_adv_phy: u8,
+    /// ★ **The reporter's applied TX power in dBm** when these observations were made, or `None`
+    /// when the reporter has no dBm-truthful axis.
+    ///
+    /// Paired with [`heard_neighbors`](Self::heard_neighbors), each entry becomes a **measured path
+    /// loss**: `pl_dB = tx_power_dbm − rssi`. Without it an RSSI is not a path loss, and the whole
+    /// power policy rests on a reciprocity assumption that it *breaks itself* the instant either
+    /// end backs off — with neither end able to tell. That is the protocol blocker for choosing
+    /// power per neighbour rather than per radio.
+    ///
+    /// ⚠ **`None` must be sent as absent, never faked.** A reporter on an index scale broadcasting
+    /// a number no receiver can interpret is worse than silence: "index 43" folds in one dongle's
+    /// efuse base, one boot's TSSI convergence and one part's nonlinear ladder. Same rule as
+    /// [`RadioCapability::tx_power_dbm`](ndn_radio_hal::RadioCapability::tx_power_dbm) being `None`
+    /// on three Wi-Fi radios that *do* have a measured index knob.
+    pub tx_power_dbm: Option<i8>,
+}
+
+impl ReceptionReport {
+    /// The **measured path loss** in dB from the reporter to `node`, if both halves are present.
+    ///
+    /// `pl_dB = tx_power_dbm − rssi`. This is the quantity the power policy actually wants and has
+    /// never had: today it substitutes a reciprocity assumption ("if I hear you at −45, you hear me
+    /// at −45"), which is exactly what a back-off at either end invalidates — silently, because
+    /// neither end knows the other's power. With both, a node can compute the minimum power that
+    /// still reaches a named demand set instead of assuming one.
+    ///
+    /// `None` when the reporter has no dBm axis or did not hear `node` — never a guess.
+    pub fn path_loss_db(&self, node: u64) -> Option<i16> {
+        let tx = self.tx_power_dbm?;
+        let rssi = self
+            .heard_neighbors
+            .iter()
+            .find(|(id, _)| *id == node)
+            .map(|(_, r)| *r)?;
+        Some(i16::from(tx) - i16::from(rssi))
+    }
 }
 
 impl Default for ReceptionReport {
@@ -81,6 +147,8 @@ impl Default for ReceptionReport {
             heard_prefixes: Vec::new(),
             spectrum: Vec::new(),
             heard_snr: Vec::new(),
+            max_adv_phy: ADV_PHY_1M,
+            tx_power_dbm: None,
         }
     }
 }
@@ -126,6 +194,16 @@ pub fn encode_report(r: &ReceptionReport) -> Vec<u8> {
         b.extend_from_slice(&id.to_le_bytes());
         b.push(*snr as u8);
     }
+    // --- appended: BLE advertising-PHY receive capability ---
+    // Appended for the same reason the SNR section is, and read back the same way: absence means an
+    // un-upgraded peer, which is exactly the peer we must assume is 1M-only anyway.
+    b.push(r.max_adv_phy);
+    // --- appended (v3): the reporter's applied TX power, dBm ---
+    // Appended, like every field before it, so an older peer simply stops reading here. The
+    // sentinel carries "I have no dBm axis" explicitly rather than by omission, because omission
+    // is already taken: a truncated v2 report and a v3 reporter without an axis must decode the
+    // same way, and they do.
+    b.push(r.tx_power_dbm.unwrap_or(TX_POWER_UNKNOWN) as u8);
     b
 }
 
@@ -205,6 +283,18 @@ pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
             heard_snr.push((id, v as i8));
         }
     }
+    // Absent = an un-upgraded peer = assume 1M-only. An out-of-range value is also clamped down
+    // rather than rejected: a peer claiming a PHY that does not exist must not be able to talk us
+    // into transmitting one no one can hear.
+    let max_adv_phy = match r.u8() {
+        Some(v) if (ADV_PHY_1M..=ADV_PHY_CODED).contains(&v) => v,
+        _ => ADV_PHY_1M,
+    };
+    // Absent (a v2 peer) and the explicit sentinel both mean "no dBm axis" — see the encoder.
+    let tx_power_dbm = match r.u8() {
+        Some(v) if v as i8 != TX_POWER_UNKNOWN => Some(v as i8),
+        _ => None,
+    };
     Some(ReceptionReport {
         node_id,
         seq,
@@ -214,11 +304,58 @@ pub fn decode_report(bytes: &[u8]) -> Option<ReceptionReport> {
         heard_prefixes,
         spectrum,
         heard_snr,
+        max_adv_phy,
+        tx_power_dbm,
     })
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// ★ v3 wire compatibility, both directions. The field is APPENDED, so a v2 peer's bytes must
+    /// still decode (as "no dBm axis"), and our v3 bytes must not confuse a reader that stops early.
+    #[test]
+    fn v3_tx_power_round_trips_and_v2_still_decodes() {
+        let mut r = sample();
+        r.tx_power_dbm = Some(14);
+        let back = decode_report(&encode_report(&r)).expect("v3 decodes");
+        assert_eq!(back.tx_power_dbm, Some(14));
+
+        // A v2 reporter: same bytes with the final octet removed.
+        let mut bytes = encode_report(&r);
+        bytes.pop();
+        let old = decode_report(&bytes).expect("a truncated v2 report must still decode");
+        assert_eq!(
+            old.tx_power_dbm, None,
+            "an un-upgraded peer must read as 'no dBm axis', not as a bogus power"
+        );
+        assert_eq!(old.heard_neighbors, r.heard_neighbors, "v2 fields intact");
+    }
+
+    /// ⚠ "No dBm axis" must survive the round trip as absence, not as a number. An index-scale
+    /// reporter broadcasting a value no receiver can interpret is worse than silence.
+    #[test]
+    fn absent_power_is_not_faked() {
+        let mut r = sample();
+        r.tx_power_dbm = None;
+        assert_eq!(decode_report(&encode_report(&r)).unwrap().tx_power_dbm, None);
+        // The sentinel is not mistakable for a real power.
+        assert!(TX_POWER_UNKNOWN < -100);
+    }
+
+    /// The point of carrying the field: an RSSI becomes a path loss.
+    #[test]
+    fn path_loss_needs_both_halves() {
+        let mut r = ReceptionReport {
+            node_id: 7,
+            heard_neighbors: vec![(42, -60)],
+            ..Default::default()
+        };
+        assert_eq!(r.path_loss_db(42), None, "no power => no path loss, not a guess");
+        r.tx_power_dbm = Some(20);
+        assert_eq!(r.path_loss_db(42), Some(80));
+        assert_eq!(r.path_loss_db(43), None, "not heard => none");
+    }
     use super::*;
 
     fn sample() -> ReceptionReport {
@@ -227,6 +364,8 @@ mod tests {
             seq: 7,
             ts_ms: 12345,
             max_rx_mcs: LEGACY_ONLY_RX,
+            max_adv_phy: ADV_PHY_CODED,
+            tx_power_dbm: None,
             heard_neighbors: vec![(1, -55), (2, -80)],
             heard_prefixes: vec![0x11, 0x22, 0x33],
             spectrum: vec![(149, 40), (165, 5)],

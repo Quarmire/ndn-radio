@@ -38,7 +38,6 @@ use ndn_signals_core::SignalView;
 use ndn_transport::link_service::{
     EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame, TickCtx,
 };
-use tracing::Instrument;
 
 use crate::FaceId;
 
@@ -427,6 +426,7 @@ impl RadioControl {
                     heard_prefixes: rep.heard_prefixes.clone(),
                     spectrum: rep.spectrum.clone(),
                     max_rx_mcs: rep.max_rx_mcs,
+                    max_adv_phy: rep.max_adv_phy,
                     ts_ms: now_ms,
                 },
             );
@@ -468,11 +468,43 @@ impl RadioControl {
             .observe_rx_snr(radio, neighbour, snr_db, now_ms);
     }
 
+    /// Fold a **locally measured** per-frame SNR for frames received *from* `neighbour` — the
+    /// inbound direction, which is what this node then advertises to that neighbour in `heard_snr`.
+    ///
+    /// The counterpart of [`observe_rx_snr`](Self::observe_rx_snr), which carries the *outbound*
+    /// direction (a peer telling us how it hears us). Keeping them apart is the point: SNR is not
+    /// reciprocal, and merging them left the whole SNR path with no origin — every value a node
+    /// advertised had been measured by the peer it was advertising to.
+    pub fn observe_heard_snr(
+        &self,
+        radio: RadioId,
+        neighbour: u64,
+        snr_db: Option<f32>,
+        now_ms: u64,
+    ) {
+        self.medium
+            .lock()
+            .unwrap()
+            .observe_heard_snr(radio, neighbour, snr_db, now_ms);
+    }
+
     /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
     /// decodes, or [`ndn_radio_cognition::report::LEGACY_ONLY_RX`]). Stamped into
     /// outgoing reception reports so peers cap the data rate they reach us at.
     pub fn set_self_rx_mcs(&self, max_rx_mcs: u8) {
         self.medium.lock().unwrap().set_self_rx_mcs(max_rx_mcs);
+    }
+
+    /// Declare the TX power this node is **actually transmitting at**, in dBm, or `None` on a
+    /// radio with no dBm-truthful axis. Stamped into outgoing reception reports.
+    ///
+    /// ★ Pass the value the radio reported **applying** (`AppliedKnobs::applied_dbm`), not the
+    /// value requested — a regulatory or firmware clamp makes them differ. Paired with the RSSI a
+    /// neighbour reports for us this becomes a MEASURED path loss, which is the input the power
+    /// policy has never had: today it substitutes reciprocity, an assumption that a back-off at
+    /// either end invalidates with neither end able to tell.
+    pub fn set_self_tx_power_dbm(&self, dbm: Option<i8>) {
+        self.medium.lock().unwrap().set_self_tx_power_dbm(dbm);
     }
 
     /// The worst RX capability across fresh neighbours — `Some(LEGACY_ONLY_RX)` when a
@@ -505,6 +537,26 @@ impl RadioControl {
     /// observable end of the occupancy wire.
     pub fn busy_pct(&self, radio: RadioId, channel: u8) -> Option<u8> {
         self.medium.lock().unwrap().busy_pct(radio, channel)
+    }
+
+    /// Per-radio hardware/health snapshot for the mgmt introspection surface:
+    /// each radio's HAL [`RadioCapability`] plus the weakest recently-heard RSSI.
+    /// Read-only; briefly locks `medium` (like [`busy_pct`](Self::busy_pct)).
+    ///
+    /// This is the *substrate* cognition acts on — the operator dashboard renders
+    /// it beside the decided plan from [`telemetry`](Self::telemetry). Occupancy is
+    /// left to [`busy_pct`](Self::busy_pct) since it is keyed by operating channel.
+    pub fn radio_hardware(&self) -> Vec<(RadioId, RadioCapability, Option<i8>)> {
+        let now = self.now_ms();
+        let medium = self.medium.lock().unwrap();
+        medium
+            .radios()
+            .into_iter()
+            .map(|(id, cap)| {
+                let rssi = medium.weakest_rssi(id, now);
+                (id, cap, rssi)
+            })
+            .collect()
     }
 
     /// Start **frame-free occupancy sensing** on a radio at bring-up: spawn the
@@ -654,6 +706,9 @@ impl RadioControl {
                 for (&face, &radio) in &self.face_radio {
                     if let Some(ls) = sig.link(FaceId(face)) {
                         m.observe_radio_rssi(radio, ls.rssi_dbm, now_ms);
+                        // The same seam already carries SNR and nothing read it, so the ambient
+                        // inbound quality this radio sees never reached cognition at all.
+                        m.observe_radio_snr(radio, ls.snr_db, now_ms);
                     }
                 }
                 // §2 CCLF density term: distinct source nonces heard recently (the per-neighbour map
@@ -698,7 +753,7 @@ impl RadioControl {
         if let Some(bandit) = &self.bandit {
             for (name_ctx, plan) in active.iter().zip(plans.iter_mut()) {
                 if let Some(alloc) = plan.allocations.first_mut() {
-                    let (rssi, busy, recv, max_mcs, max_power) = {
+                    let (rssi, busy, recv, max_mcs, max_power, db_per_idx, power_floor) = {
                         let m = self.medium.lock().unwrap();
                         let cap = m.capability(alloc.radio);
                         (
@@ -710,6 +765,14 @@ impl RadioControl {
                             m.receiver_count(now_ms),
                             cap.as_ref().map(|c| c.max_mcs()).unwrap_or(9),
                             cap.as_ref().map(|c| c.max_tx_power).unwrap_or(63),
+                            // ★ The power arm renders through the radio's OWN measured dB-per-index
+                            // step, and is suppressed entirely when the part has no measured scale
+                            // or no actuator at all. A default here would reintroduce exactly the
+                            // global constant this replaced.
+                            cap.as_ref()
+                                .filter(|c| c.power_actuated)
+                                .and_then(|c| c.db_per_power_idx),
+                            cap.as_ref().and_then(|c| c.min_tx_power).unwrap_or(0),
                         )
                     };
                     let ctx = Context::new(rssi, busy, recv, name_ctx.priority.rank());
@@ -731,7 +794,14 @@ impl RadioControl {
                         recv,
                         "bandit: arm selected"
                     );
-                    apply_arm(&ARMS[arm], &mut alloc.params, max_mcs, max_power);
+                    apply_arm(
+                        &ARMS[arm],
+                        &mut alloc.params,
+                        max_mcs,
+                        max_power,
+                        db_per_idx,
+                        power_floor,
+                    );
                     self.last_arm
                         .lock()
                         .unwrap()
@@ -1027,71 +1097,26 @@ impl RadioActuators for LibUsbActuator {
     }
 }
 
-/// frames/s from two `REG_RXERR_RPT`-style counter samples `dt_s` apart, u16
-/// wrap-aware (the counter is a 16-bit hardware accumulator that rolls over).
-/// The pure core of frame-free occupancy sensing (#30).
-pub fn activity_rate(prev: u16, cur: u16, dt_s: f32) -> f32 {
-    if dt_s <= 0.0 {
-        return 0.0;
-    }
-    cur.wrapping_sub(prev) as f32 / dt_s
-}
+/// **Frame-free occupancy sensing lives in `ndn-radio-cognition` now** (#30).
+///
+/// Both items are bearer-agnostic — they speak only [`RadioKnobs`](crate::RadioKnobs) and
+/// the cognition sense bus, and nothing in them is 802.11 — so keeping them here forced a
+/// LoRa PHY to depend on the *Wi-Fi* crate to sense its own channel. They moved next to
+/// [`ChannelOccupancy`] / [`MediumState`]; this re-export keeps every existing call site
+/// (`ndn_phy_wifi::spawn_occupancy_sampler`, `crate::control::activity_rate`) compiling
+/// unchanged. `RadioControl` is the Wi-Fi end of the sink seam, impl'd just below.
+pub use ndn_radio_cognition::{activity_rate, spawn_occupancy_sampler};
 
-/// Spawn a background **frame-free occupancy sampler**: every `interval`, read the
-/// radio's activity counter ([`RadioKnobs::read_channel_activity`](crate::RadioKnobs::read_channel_activity))
-/// off the inject hot path, difference it into frames/s ([`activity_rate`]), and
-/// feed it to the sense bus ([`RadioControl::observe_activity`]) so the policy
-/// decides on real medium load. A radio that returns `None` (no such counter) is
-/// polled once and the task exits — nothing to sample. `now_ms` supplies the
-/// sense-bus timestamp. The blocking USB read runs on `spawn_blocking`, so the
-/// sampler never stalls the runtime.
-pub fn spawn_occupancy_sampler(
-    control: Arc<RadioControl>,
-    radio: RadioId,
-    channel: u8,
-    knobs: Arc<dyn crate::RadioKnobs>,
-    interval: Duration,
-    now_ms: impl Fn() -> u64 + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        let mut prev: Option<(u16, Instant)> = None;
-        loop {
-            ticker.tick().await;
-            let k = knobs.clone();
-            // Time the frame-free counter read (a USB control transfer, off the hot
-            // path) as its own span under the sampler.
-            let read = tokio::task::spawn_blocking(move || k.read_channel_activity())
-                .instrument(
-                    tracing::debug_span!(target: "named_radio", "occupancy_read", radio = radio.0),
-                )
-                .await;
-            let cur = match read {
-                Ok(Ok(Some(v))) => v,
-                Ok(Ok(None)) => return, // this radio can't sense occupancy — stop
-                _ => continue,          // transient read / join error — retry next tick
-            };
-            let now = Instant::now();
-            if let Some((p, t)) = prev {
-                let dt = now.duration_since(t).as_secs_f32();
-                let fps = activity_rate(p, cur, dt);
-                let ts = now_ms();
-                control.observe_activity(radio, channel, fps, ts);
-                // Frame-free occupancy is a first-class sensed signal — trace it so
-                // the OTLP span pipeline (ndn-observability) can carry "what the
-                // radio saw" alongside the DECIDE that consumes it.
-                tracing::debug!(
-                    target: "named_radio",
-                    radio = radio.0,
-                    channel,
-                    frames_per_s = fps,
-                    busy_pct = control.busy_pct(radio, channel),
-                    "occupancy_sample"
-                );
-            }
-            prev = Some((cur, now));
-        }
-    })
+/// The Wi-Fi face's control plane as an occupancy sink: the sampler feeds
+/// `RadioControl`'s own sense bus, exactly as it did when it lived in this file.
+/// The bodies are the inherent methods above — this only names them for the seam.
+impl ndn_radio_cognition::OccupancySink for RadioControl {
+    fn observe_activity(&self, radio: RadioId, channel: u8, frames_per_s: f32, now_ms: u64) {
+        RadioControl::observe_activity(self, radio, channel, frames_per_s, now_ms);
+    }
+    fn busy_pct(&self, radio: RadioId, channel: u8) -> Option<u8> {
+        RadioControl::busy_pct(self, radio, channel)
+    }
 }
 
 #[cfg(test)]
@@ -1120,6 +1145,20 @@ mod tests {
         assert_eq!(c.busy_pct(W, 11), Some(0));
     }
 
+    /// **E1** — the sampler moved to `ndn-radio-cognition` (so a LoRa PHY can reach it without
+    /// this crate), and `RadioControl` is now its Wi-Fi-side sink. Both must still be reachable
+    /// under their old paths, and the sink must feed the same bus the inherent method does.
+    #[test]
+    fn the_moved_sampler_is_still_reachable_here_and_feeds_this_control_plane() {
+        use ndn_radio_cognition::OccupancySink;
+        let c = RadioControl::new(RadioPolicy::default());
+        // Through the trait seam the sampler actually calls:
+        OccupancySink::observe_activity(&c, W, 6, activity_rate(0, 25, 1.0), 0);
+        assert_eq!(OccupancySink::busy_pct(&c, W, 6), Some(25));
+        // ...landing in the same sense bus the rest of the control plane reads.
+        assert_eq!(c.busy_pct(W, 6), Some(25));
+    }
+
     /// Records the last allocation it was asked to apply.
     struct MockActuator {
         radio: RadioId,
@@ -1135,13 +1174,24 @@ mod tests {
         }
     }
 
+    /// A capability that declares a MEASURED power scale.
+    ///
+    /// ★ The bare `wifi_monitor_5ghz` preset deliberately does NOT: `db_per_power_idx` is `None`
+    /// until somebody measures the part, and both `decide_power` and the bandit's power arm
+    /// correctly decline to act on an axis whose units they do not know. A test that wants to
+    /// exercise the power path must therefore say what the units are — which is the point, since
+    /// the global 0.5 dB/step this replaced was MEASURED wrong on every real radio.
+    fn cap_with_measured_power(channels: Vec<u8>) -> RadioCapability {
+        RadioCapability {
+            db_per_power_idx: Some(0.5),
+            power_actuated: true,
+            ..RadioCapability::wifi_monitor_5ghz(channels)
+        }
+    }
+
     fn control_with_mock() -> (RadioControl, Arc<MockActuator>) {
         let mut c = RadioControl::new(RadioPolicy::default());
-        c.register_radio(
-            W,
-            FaceId(10),
-            RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]),
-        );
+        c.register_radio(W, FaceId(10), cap_with_measured_power(vec![149, 161, 165]));
         let mock = Arc::new(MockActuator {
             radio: W,
             last: RwLock::new(None),
@@ -1591,9 +1641,18 @@ mod tests {
             strong_pwr.unwrap() < 63,
             "backed-off power below calibrated max"
         );
-        assert!(
-            weak_pwr.is_none(),
-            "weak link keeps full calibrated power (None)"
+        // ★ Contract CHANGED, deliberately: a weak link must command **full calibrated power**,
+        // and it must say so — `Some(max)`, not `None`.
+        //
+        // `None` reaches `apply_knobs` as "leave the radio wherever it is", so encoding "no
+        // back-off wanted" as `None` made power a one-way ratchet: a node that trimmed against a
+        // close neighbour, then watched that neighbour walk away, computed a zero back-off,
+        // emitted `None`, and kept whispering for the rest of the process lifetime. `None` now
+        // means only "no measured peer".
+        assert_eq!(
+            weak_pwr,
+            Some(63),
+            "weak link must climb back to calibrated max, not decline to have an opinion"
         );
     }
 
@@ -1608,7 +1667,7 @@ mod tests {
         let c = RadioControl::new_bandit(PolicyConfig::default(), 0.4);
         let (c, mock) = {
             let mut c = c;
-            c.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+            c.register_radio(W, FaceId(10), cap_with_measured_power(vec![149]));
             let mock = Arc::new(MockActuator {
                 radio: W,
                 last: RwLock::new(None),

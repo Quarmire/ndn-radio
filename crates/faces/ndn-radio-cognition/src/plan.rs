@@ -38,6 +38,28 @@ pub struct TxParams {
     /// when its radio has absolute control and falls back to the index otherwise.
     /// `None` = leave the radio's current power untouched.
     pub tx_power_dbm: Option<i8>,
+    /// ★ **The receive half of spatial reuse**: how sensitive this node should be, as a posture.
+    ///
+    /// The counterpart to [`tx_power`](Self::tx_power) and the reason a power back-off alone buys
+    /// so little. Backing off TX shrinks who *hears* this node; raising the detection floor shrinks
+    /// who this node *defers to*. Do only the first and a node in a dense cell still yields to
+    /// every distant transmitter it can hear, so the concurrency the back-off was supposed to buy
+    /// never materialises — it has simply reduced its own reach.
+    ///
+    /// `None` = no opinion, leave the front end where it is (including under the radio's own
+    /// autonomous gain control). Bearer-agnostic: the per-part dB delta is unknowable here, which
+    /// is why this is a posture rather than a number.
+    pub rx_gain: Option<ndn_radio_hal::RxGain>,
+    /// The clear-channel (defer) threshold in **true dBm**, as `(l2h, h2l)` — above `l2h` the
+    /// medium counts as busy, below `h2l` it is idle again.
+    ///
+    /// The dBm-denominated form of the same decision as [`rx_gain`](Self::rx_gain), for the one
+    /// radio in the fleet that expresses it in real units. Preferred where available, exactly as
+    /// [`tx_power_dbm`](Self::tx_power_dbm) is preferred over the index: it means the same thing on
+    /// every bearer and can be reasoned about in link budget.
+    ///
+    /// `None` = no opinion.
+    pub edcca_threshold_dbm: Option<(i8, i8)>,
     /// Bearer-specific PHY rate/robustness knobs.
     pub rate: RateParams,
     /// **The modulation itself** — the `SetPacketType` mode this transmission wants the radio in.

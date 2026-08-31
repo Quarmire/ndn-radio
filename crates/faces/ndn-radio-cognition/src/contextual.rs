@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use crate::plan::TxParams;
 
 /// dB per chip TXAGC index (mirrors the policy's power model).
-const DB_PER_POWER_IDX: f32 = 0.5;
+// See the note where this constant used to live in `policy.rs`: a single global dB-per-index step
+// was wrong on every radio it was applied to. The arm renders through the part's own MEASURED
+// scale, and a part without one gets no power arm at all.
 /// Reward penalty for a delivery miss (≫ any airtime term so misses dominate).
 pub const MISS_PENALTY: f32 = 5.0;
 /// Weight of the spatial-footprint (power) term in the reward — small, so it breaks
@@ -79,17 +81,34 @@ pub const ARMS: [Arm; 5] = [
 ];
 
 /// Apply an arm to a baseline [`TxParams`], clamped to the radio's capability.
-pub fn apply_arm(arm: &Arm, p: &mut TxParams, max_mcs: u8, max_power: u8) {
+///
+/// ★ `db_per_power_idx` is the radio's own MEASURED dB-per-index step
+/// ([`RadioCapability::db_per_power_idx`]) and `power_floor` its monotone floor
+/// ([`RadioCapability::min_tx_power`]). Both must come from the part, not from a constant: a single
+/// global 0.5 dB/step was MEASURED wrong on every radio it was applied to (2x on the a81a, 4x on
+/// the RTL8733BU, non-linear on the RTL8812AU). **A radio with no measured scale gets no power
+/// arm** — the bandit must not be allowed to "explore" an axis whose units it does not know, since
+/// it would then be rewarded for a footprint reduction of unknown, possibly zero, size.
+pub fn apply_arm(
+    arm: &Arm,
+    p: &mut TxParams,
+    max_mcs: u8,
+    max_power: u8,
+    db_per_power_idx: Option<f32>,
+    power_floor: u8,
+) {
     // The bandit's rate arm is a Wi-Fi MCS bump — only touch a Wi-Fi rate.
     if let Some(w) = p.wifi_mut()
         && let Some(m) = w.mcs
     {
         w.mcs = Some((m as i16 + arm.mcs_delta as i16).clamp(0, max_mcs as i16) as u8);
     }
-    if arm.power_backoff_db != 0 {
+    if arm.power_backoff_db != 0
+        && let Some(db_per_idx) = db_per_power_idx
+    {
         let cur = p.tx_power.unwrap_or(max_power) as i16;
-        let d = (arm.power_backoff_db as f32 / DB_PER_POWER_IDX).round() as i16;
-        p.tx_power = Some((cur - d).clamp(0, max_power as i16) as u8);
+        let d = (arm.power_backoff_db as f32 / db_per_idx).round() as i16;
+        p.tx_power = Some((cur - d).clamp(power_floor as i16, max_power as i16) as u8);
     }
     if arm.fec_delta != 0 {
         let cur = p.link_fec_redundancy.unwrap_or(0) as i16;
@@ -290,16 +309,16 @@ mod tests {
     #[test]
     fn apply_arm_adjusts_and_clamps() {
         let mut p = params(7);
-        apply_arm(&ARMS[2], &mut p, 9, 63); // +1 rate
+        apply_arm(&ARMS[2], &mut p, 9, 63, Some(0.5), 0); // +1 rate
         assert_eq!(p.mcs(), Some(8));
         let mut p = params(0);
-        apply_arm(&ARMS[1], &mut p, 9, 63); // -1 rate clamps at 0
+        apply_arm(&ARMS[1], &mut p, 9, 63, Some(0.5), 0); // -1 rate clamps at 0
         assert_eq!(p.mcs(), Some(0));
         let mut p = params(5);
-        apply_arm(&ARMS[3], &mut p, 9, 63); // power -6 dB = -12 idx
+        apply_arm(&ARMS[3], &mut p, 9, 63, Some(0.5), 0); // power -6 dB = -12 idx
         assert_eq!(p.tx_power, Some(51));
         let mut p = params(5);
-        apply_arm(&ARMS[4], &mut p, 9, 63); // -1 rate + fec
+        apply_arm(&ARMS[4], &mut p, 9, 63, Some(0.5), 0); // -1 rate + fec
         assert_eq!(p.mcs(), Some(4));
         assert_eq!(p.link_fec_redundancy, Some(1));
     }
