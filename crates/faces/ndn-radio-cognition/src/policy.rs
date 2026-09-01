@@ -619,9 +619,18 @@ impl RadioPolicy {
         let mcs = self.pick_mcs(Some(eff.round().clamp(-110.0, 0.0) as i8), snr, mcs_ceiling);
 
         // Bandwidth: capability ceiling, narrowed under contention.
+        //
+        // ☠ This was `bw = bw.saturating_sub(1)` on the raw code. `Bandwidth::code()` is a wire
+        // encoding and is NOT ordered by width — `Nb10=3, Nb5=4` sort ABOVE `Bw80=2` — so
+        // subtracting one WIDENS a narrowband channel (5 -> 10 MHz) exactly when the medium is
+        // busiest. Latent only because no backend declares narrowband, and the axis is why: an
+        // honest narrowband declaration would make this pick 5 MHz as the *ceiling* and then
+        // "narrow" toward 80. Order by MHz, never by code.
         let mut bw = cap.max_bw();
-        if busy >= self.cfg.busy_high {
-            bw = bw.saturating_sub(1);
+        if busy >= self.cfg.busy_high
+            && let Some(n) = ndn_radio_hal::Bandwidth::from_code(bw).narrower()
+        {
+            bw = n.code();
         }
 
         let good_snr = rssi.unwrap_or(-90) >= -60;
@@ -669,7 +678,12 @@ impl RadioPolicy {
             rate: RateParams::Wifi(WifiRate {
                 mcs: Some(mcs),
                 // HE and VHT are alternative modes — when the HE reach corner fires, the frame is HE, not VHT.
-                vht: !he && cap.max_bw() >= 2,
+                // ★ Width-based, not code-based: `>= 2` read a 10 MHz channel (code 3) as
+                // VHT-capable. This is still an INFERENCE — "80 MHz implies VHT" — and it is the
+                // wrong shape: the RTL8733BU has no VHT receiver at all, which no width can
+                // express. It belongs in the capability as its own field; until then, at least
+                // infer it from real width.
+                vht: !he && ndn_radio_hal::Bandwidth::from_code(cap.max_bw()).mhz() >= 80,
                 nss: Some(nss),
                 short_gi: good_snr,
                 bw: Some(bw),

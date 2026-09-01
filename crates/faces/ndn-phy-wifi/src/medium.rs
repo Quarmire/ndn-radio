@@ -176,6 +176,21 @@ pub struct RadioBearer {
 impl RadioBearer {
     /// A bearer over **any** [`FrameIo`] radio (LoRa, BLE, …).
     pub fn new(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
+        // ★ **Ask the radio before believing the caller** (2026-08-31).
+        //
+        // `cap` is an ASSERTION made by whoever built this bearer, and the whole reason
+        // [`from_open`](Self::from_open) exists is that the assertion is usually a guess. But
+        // `from_open` requires threading four handles through every call site, so it had **zero**
+        // production callers while this constructor had all of them — the fix for the unactuated
+        // contract was itself unactuated. Concretely: the node opened an RTL8822E and got a
+        // placeholder declaring `max_mcs 9 / max_nss 2 / max_bw 2` over a part that receives ONE
+        // stream at MCS 7, which is the MEASURED cause of a one-way link.
+        //
+        // [`FrameIo::radio_capability`] closes that from the handle every caller already holds, so
+        // the common path is now correct by construction rather than by remembering to use the
+        // other constructor. The caller's `cap` survives only where the radio cannot say — which,
+        // among the shipping backends, is nowhere: all 14 implement `RadioProfile`.
+        let cap = radio.radio_capability().unwrap_or(cap);
         Self {
             id,
             radio,
@@ -236,6 +251,8 @@ impl RadioBearer {
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
     /// callers holding an `Arc<dyn FrameIo>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
+        // Same discovery as [`new`](Self::new): the radio's own answer outranks the caller's.
+        let cap = radio.radio_capability().unwrap_or(cap);
         Self {
             id,
             radio,
@@ -2915,6 +2932,64 @@ mod tests {
     /// field. #78 landed the plumbing; the contract it carried stayed unactuated, so every consumer
     /// saw the asserted `cap` while the radio's own capability sat unused on the struct. Same shape
     /// as `agile` (#98): a capability asserted and never checked against hardware.
+    /// ★ **A bearer built from a bare `dyn FrameIo` must take the RADIO's capability, not the
+    /// caller's guess.**
+    ///
+    /// This is the regression test for the leak that shipped: the production node opened an
+    /// RTL8822E and built its face with `WifiPhy::new`, which had to invent
+    /// `wifi_monitor_5ghz` (`max_mcs 9 / max_nss 2 / max_bw 2`) over a part that receives ONE
+    /// stream at MCS 7. Advertising streams a radio cannot receive is the MEASURED cause of a
+    /// one-way link. The capability-complete constructor existed and had zero production callers.
+    ///
+    /// The invariant is now enforced at the common constructor, so it cannot be bypassed by
+    /// forgetting to use the other one.
+    #[test]
+    fn bearer_takes_the_radios_capability_over_the_callers_guess() {
+        // A radio that knows it is 1x1 / MCS7 — the a81a's real shape.
+        struct Honest;
+        #[async_trait::async_trait]
+        impl FrameIo for Honest {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+            fn radio_capability(&self) -> Option<RadioCapability> {
+                Some(RadioCapability::wifi_monitor_5ghz_1ss(vec![36]))
+            }
+        }
+        // A radio that cannot describe itself: the caller's assertion must survive.
+        struct Mute;
+        #[async_trait::async_trait]
+        impl FrameIo for Mute {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        let guess = RadioCapability::wifi_monitor_5ghz(vec![36]);
+        assert_eq!(guess.max_nss(), 2, "the placeholder really does claim 2 streams");
+
+        let b = RadioBearer::new(RadioId(0), Arc::new(Honest), guess.clone());
+        assert_eq!(
+            b.cap.max_nss(),
+            1,
+            "the radio says 1 stream; a bearer that still advertises 2 is the one-way-link bug"
+        );
+        assert_eq!(b.effective_cap().max_nss(), 1, "and effective_cap must agree");
+
+        let b2 = RadioBearer::new(RadioId(0), Arc::new(Mute), guess.clone());
+        assert_eq!(
+            b2.cap.max_nss(),
+            guess.max_nss(),
+            "a radio that cannot say must not silently downgrade the caller's assertion"
+        );
+    }
+
     #[test]
     fn the_radios_own_capability_outranks_the_callers_assertion() {
         struct Truthful(RadioCapability);
