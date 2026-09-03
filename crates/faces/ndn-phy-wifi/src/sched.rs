@@ -150,7 +150,7 @@ pub struct GroupTable {
     /// The SHARED slot granularity the entries were truncated to (`SchedParams::slot_depth`, D3):
     /// every entry is the first `slot_depth` components of a registered prefix, so the slot key a
     /// name maps to is `H(first slot_depth components)` — identical at every node regardless of how
-    /// deep *this* node registered. Stored so [`with_latency`](Self::with_latency) truncates its
+    /// deep *this* node registered. Stored so the latency builders truncate their
     /// inputs the same way, and so the scheduler can key its no-table fallback at the same depth.
     slot_depth: usize,
 }
@@ -211,10 +211,25 @@ impl GroupTable {
         }
     }
 
-    /// Mark the entries matching `prefixes` as [`LeaseClass::Latency`] (#93): placed among the
-    /// reserved lanes, `L = 1`, never contending with bulk. Everything else stays `Bulk`.
+    /// **Mark entries latency-class, with nothing checking the caller's right to** (#93): the
+    /// entries matching `prefixes` become [`LeaseClass::Latency`] — placed among the reserved lanes,
+    /// `L = 1`, never contending with bulk. Everything else stays `Bulk`.
+    ///
+    /// The name says what it is, because the class is not a small thing to hand yourself: a lane
+    /// bulk cannot enter, an access delay bounded independently of offered load
+    /// ([`SlotSchedule::urgent_access_bound_us`]), immunity from bulk preemption
+    /// ([`SlotSchedule::lease_deadline_us`]) and from opportunistic claims. Classifying locally is a
+    /// *correct* answer for a deployment with no trust anchor — the position
+    /// `ClassCeiling::unauthorised` takes for `Priority` — but it must not be the answer that reads
+    /// like the default. Where an authority exists, use
+    /// [`with_latency_authorised`](Self::with_latency_authorised).
+    ///
+    /// **Neither route enforces anything, and neither is meant to.** What makes the class safe is
+    /// that the resulting assignment is pinned by [`class_digest`](Self::class_digest) into
+    /// [`SchedParams`], so a node classifying differently from its neighbours is *detectable* on the
+    /// beacon instead of silent.
     #[must_use]
-    pub fn with_latency(mut self, prefixes: &[impl AsRef<[u8]>]) -> Self {
+    pub fn with_latency_unauthorised(mut self, prefixes: &[impl AsRef<[u8]>]) -> Self {
         let depth = self.slot_depth;
         for e in &mut self.entries {
             // Truncate the caller's prefixes to the shared slot depth before comparing, so a latency
@@ -228,6 +243,129 @@ impl GroupTable {
             }
         }
         self
+    }
+
+    /// [`with_latency_unauthorised`](Self::with_latency_unauthorised) **gated on a
+    /// `ClassAuthority`**: a prefix is marked [`LeaseClass::Latency`] only if the authority puts its
+    /// ceiling at `Priority::Urgent`. Everything it does not authorise stays `Bulk`, silently — the
+    /// authority is asked, not argued with.
+    ///
+    /// Same shape as `policy.rs`'s `ClassCeiling::authorised`, and the same limits stated plainly:
+    /// this is **not** enforcement. A linked crate can write a permissive `ClassAuthority` in four
+    /// lines. What it buys is that self-assertion stops being a one-liner, and that
+    /// `grep impl ClassAuthority` enumerates everything a deployment has chosen to trust. The
+    /// authority is keyed on the entry's `prefix_hash` — the same #44 keyspace `ceiling_for` takes
+    /// everywhere else — so nothing host-shaped enters L2 to ask the question.
+    ///
+    /// ⚠ **There is no `capped_to` here, and that is not an oversight.** `Priority` is a privilege
+    /// ladder, so giving privilege up is free. `LeaseClass` is not a ladder: `Latency` SELECTS a
+    /// placement in a lane set disjoint from the open slots, so "give up latency" is a *different
+    /// map*, not a smaller grant, and every node has to agree on which map. That asymmetry is
+    /// exactly why the digest (agreement) is the load-bearing half of this fix and the ceiling
+    /// (privilege) is the smaller half.
+    #[must_use]
+    pub fn with_latency_authorised(
+        self,
+        auth: &dyn ndn_radio_cognition::ClassAuthority,
+        prefixes: &[impl AsRef<[u8]>],
+    ) -> Self {
+        let depth = self.slot_depth;
+        let granted: Vec<Vec<u8>> = prefixes
+            .iter()
+            .map(|p| slot_trunc(p.as_ref(), depth))
+            .filter(|(slash, hash)| {
+                !slash.is_empty()
+                    && ndn_radio_cognition::ClassCeiling::authorised(auth, *hash).get()
+                        == ndn_radio_cognition::Priority::Urgent
+            })
+            .map(|(slash, _)| slash)
+            .collect();
+        self.with_latency_unauthorised(&granted)
+    }
+
+    /// **The class commitment** (D2) — an order-independent digest of everything in this table that
+    /// makes its slot map differ from the shared, table-free one, and of nothing else.
+    ///
+    /// [`SchedParams`] pinned the lane *count* (`reserved`) and nothing about the *assignment*, so a
+    /// node that unilaterally promoted its own prefixes to [`LeaseClass::Latency`] emitted a beacon
+    /// digest **identical** to an honest neighbour's and `beacon_indicates_partition` never fired —
+    /// while its frames were placed in, and its co-owner witnesses filed against, different slots
+    /// than everyone else's. The design's whole defence is "every node classifies a prefix
+    /// identically, or the maps diverge"; this is the term that makes a violation *observable*.
+    ///
+    /// **How it reaches a neighbour — retracted and replaced.** It was carried on the time beacon
+    /// only, and the beacon task is spawned behind `sched.is_master()` (`NDN_SCHED_MASTER=1`), so
+    /// what that actually caught was a defecting MASTER plus misconfiguration seen by the master's
+    /// readers; a non-master defector put nothing on the air and stayed exactly as invisible as
+    /// before. It also leaned the check on the one frame the control-plane tenet forbids
+    /// ("overhear / piggyback, never beacon", spec §4). The commitment now ALSO rides `addr3[5]`
+    /// bits 2..7 of every ordinary data frame, three bits at a time, as a comparison rather than a
+    /// value ([`FaceScheduler::class_commitment`]) — so any neighbour that hears enough of a
+    /// defector's traffic catches it, master or not. The beacon keeps the full 64-bit width;
+    /// the piggyback keeps the coverage.
+    ///
+    /// Neither prevents a defection: FNV-1a is unkeyed here on purpose (#44), so this pins AGREEMENT
+    /// and does not authenticate. A node that patches its own digest is outside what this can see.
+    ///
+    /// **Two sets go in, each because it changes the map:**
+    /// * the `Latency` entries' slot keys — but only when `lanes_reserved`, because
+    ///   [`SlotSchedule::owner_slot_in`] ignores the class entirely at `reserved_stride < 2` (the
+    ///   shipping default, `NDN_SCHED_RESERVE` unset). Committing to something the map does not read
+    ///   would be a false partition by construction;
+    /// * any entry whose truncated prefix is SHALLOWER than `slot_depth`. Such an entry overrides
+    ///   the no-table fallback key `H(first slot_depth components)` with a shorter one, so a
+    ///   neighbour without that registration genuinely keys covered names to a different slot —
+    ///   regardless of class. Unreachable at the shipping `slot_depth = 1` (every non-empty prefix
+    ///   has ≥ 1 component) and unreachable from [`new`](Self::new); it is in because
+    ///   [`new_with_depth`](Self::new_with_depth) + `FaceScheduler::with_groups` will happily pin a
+    ///   deeper table, and a latent silent-divergence hole is worth ten lines to make loud.
+    ///
+    /// **What is deliberately OUT, because committing to it would false-partition honest
+    /// neighbours:** `Bulk` entries at or below the slot depth — a depth-exact bulk entry yields the
+    /// same `(key, class)` pair as no entry at all, so two nodes with *disjoint* bulk registrations
+    /// and a shared lane set compute a bit-identical map and must digest alike; the entries' masks
+    /// (RX attribution only, legitimately different per registration set); the entry ORDER
+    /// ([`new_with_depth`](Self::new_with_depth) sorts by prefix *length* only, so equal-length
+    /// prefixes keep the caller's slice order — an in-order fold would partition two nodes over a
+    /// literal's ordering); and the prefix BYTES (the hash is what the map reads, and bytes would
+    /// put the deployment's name vocabulary on the air).
+    ///
+    /// Canonical form: each set sorted ascending as `u64` and length-prefixed, then FNV-1a over the
+    /// little-endian bytes. **Sorted, not XOR-folded**: XOR is linear over GF(2)^64 — it cancels
+    /// equal contributions and admits trivial four-element collisions — and this is the one pinned
+    /// field with an adversary who benefits from a collision against an unkeyed, offline-searchable
+    /// hash. Tolerable for `channels_digest`, where nobody wants their channel set to look like
+    /// someone else's; not tolerable here.
+    ///
+    /// `0` = no commitment (no lanes reserved and no shallow entry), which is also what a scheduler
+    /// with **no** table reports — correctly, because the two compute the same map.
+    pub fn class_digest(&self, lanes_reserved: bool) -> u64 {
+        let mut latency: Vec<u64> = Vec::new();
+        let mut shallow: Vec<u64> = Vec::new();
+        for e in &self.entries {
+            if lanes_reserved && e.class == LeaseClass::Latency {
+                latency.push(e.hash);
+            }
+            // `slot_trunc` writes exactly one `/` per component it kept, so this counts components
+            // without re-splitting. Shorter than the shared depth ⇒ this entry supplies a key the
+            // no-table fallback would not have derived.
+            if e.prefix.iter().filter(|&&b| b == b'/').count() < self.slot_depth {
+                shallow.push(e.hash);
+            }
+        }
+        if latency.is_empty() && shallow.is_empty() {
+            return 0;
+        }
+        latency.sort_unstable();
+        shallow.sort_unstable();
+        let mut bytes = Vec::with_capacity(8 + (latency.len() + shallow.len()) * 8);
+        for set in [&latency, &shallow] {
+            bytes.extend_from_slice(&(set.len() as u32).to_le_bytes());
+            for k in set {
+                bytes.extend_from_slice(&k.to_le_bytes());
+            }
+        }
+        fnv64(&bytes)
     }
 
     /// Slot key + class for a name in `/`-joined form: the shared-depth slot group covering it (the
@@ -312,10 +450,32 @@ pub struct SchedParams {
     pub hop_dwell_us: u32,
     /// FNV-1a digest of the ordered channel-class set (the hop map's channels).
     pub channels_digest: u32,
+    /// **The lease-class commitment** (#93): FNV-1a digest of the canonically-ordered set of
+    /// latency slot-group keys, `0` when nothing in the table moves the map.
+    ///
+    /// `reserved` above pins how many lanes *exist*; this pins **which names get them** — a per-node
+    /// input that nothing else in this set covered, so a node promoting its own prefixes used to
+    /// emit a digest indistinguishable from an honest neighbour's. It reaches neighbours two ways:
+    /// the master's time beacon carries this whole digest (64 bits, one node), and every node's
+    /// ordinary data frames carry a 21-bit fold of it three bits at a time
+    /// ([`FaceScheduler::class_commitment`], the fleet-wide carrier). Populated from the installed
+    /// [`GroupTable`] by `FaceScheduler::with_groups` (never from a table the scheduler is not
+    /// actually using); see [`GroupTable::class_digest`] for exactly what is in it, what is out, and
+    /// why the fold is a canonical sort rather than an XOR.
+    pub class_digest: u64,
 }
 
 /// Current [`SchedParams`] wire version. Bump when the pinned set changes.
-pub const SCHED_PARAMS_VERSION: u16 = 1;
+///
+/// **2** — adds [`class_digest`](SchedParams::class_digest), the #93 lease-class assignment.
+/// `version` is the first thing [`digest`](SchedParams::digest) mixes, so every v1 digest differs
+/// from every v2 digest: a v1 and a v2 node read each other as partitioned even where their maps in
+/// fact agree. That is the correct semantics and must not be softened by a "mix it only when
+/// non-empty" shim — a v1 node has **no field** for the assignment, so its digest cannot distinguish
+/// "classified nothing" from "silently promoted everything", and any construction that lets it equal
+/// an honest v2 digest re-opens exactly the blindness this closes. Mixed v1/v2 is a rollout to
+/// finish, not a configuration to support; v1<->v1 stays blind until the last node is upgraded.
+pub const SCHED_PARAMS_VERSION: u16 = 2;
 
 impl Default for SchedParams {
     fn default() -> Self {
@@ -328,6 +488,7 @@ impl Default for SchedParams {
             reserved: 0,
             hop_dwell_us: 0,
             channels_digest: 0,
+            class_digest: 0,
         }
     }
 }
@@ -362,6 +523,9 @@ impl SchedParams {
             reserved,
             hop_dwell_us,
             channels_digest,
+            // The class assignment lives in the `GroupTable`, which is attached later:
+            // `with_groups` fills this in from the table it is actually installing.
+            class_digest: 0,
         }
     }
 
@@ -388,6 +552,10 @@ impl SchedParams {
             .to_le_bytes()
             .iter()
             .for_each(|b| mix(*b));
+        self.class_digest
+            .to_le_bytes()
+            .iter()
+            .for_each(|b| mix(*b));
         h
     }
 }
@@ -403,11 +571,36 @@ fn fnv32(bytes: &[u8]) -> u32 {
     h
 }
 
+/// FNV-1a/64 over raw bytes — the lease-class commitment for [`SchedParams`].
+///
+/// ☠ **64 bits, not 32, and the reason is measured.** The class commitment is the ONE pinned field
+/// whose input an adversary fully chooses: a defector picks its own latency set, so it can append a
+/// throwaway prefix purely to steer the fold. At 32 bits that is not a theoretical margin — an
+/// offline search found a colliding dummy component in **924,491,966 tries, 10 seconds of wall clock
+/// on 10 threads**, and the forged table passed `beacon_indicates_partition` with all three of its
+/// prefixes in reserved lanes. Every other field in the digest is deployment-shared, so this field's
+/// width IS the mechanism's whole margin. At 64 bits the same search is 2^64.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// A 6-byte §2 source nonce packed LE into a u64 (`0` reserved for "unknown").
 fn nonce_u64(n: &[u8; 6]) -> u64 {
     let mut b = [0u8; 8];
     b[..6].copy_from_slice(n);
     u64::from_le_bytes(b).max(1) // an all-zero on-air nonce still counts as "known"
+}
+
+/// The §2 presence nonce for a Tier-0 frame: the 8-bit ephemeral ID (`addr3[4]`), tagged into a
+/// range no legacy 48-bit `addr2` nonce can reach so the two layouts never alias — and never `0`,
+/// which is reserved for "unknown transmitter" (ID `0` is a perfectly ordinary ID).
+fn id_nonce(id: u8) -> u64 {
+    (1u64 << 63) | id as u64
 }
 
 /// Bound on the learned-group mask cache (P1.5): filters we could not attribute to a registered
@@ -762,7 +955,8 @@ impl FaceScheduler {
     }
 
     /// Build the next time-beacon wire (called by the master's beacon task): advances the master's own
-    /// common-view clock to `now` and returns `MAGIC ‖ ref_us(le64)` for direct injection. Injected
+    /// common-view clock to `now` and returns `MAGIC ‖ ref_us(le64) ‖ map_digest(le64) ‖
+    /// params_version(le16)` (21 bytes, was 19 before the class commitment) for direct injection. Injected
     /// raw (not through the slot gate) so the clock signal never waits on a data slot.
     pub fn build_beacon(&self) -> bytes::Bytes {
         let ref_us = self.base.elapsed().as_micros() as u64;
@@ -772,12 +966,18 @@ impl FaceScheduler {
         if let Ok(mut cv) = self.cv.lock() {
             cv.on_raw(ref_us, host_now);
         }
-        // `MAGIC ‖ ref_us(le64) ‖ map_digest(le64)` — the beacon now also carries the shared schedule
-        // pin (D2), so a receiver detects a partitioned medium without any convergence protocol.
-        let mut out = Vec::with_capacity(TIME_BEACON_MAGIC.len() + 16);
+        // `MAGIC ‖ ref_us(le64) ‖ map_digest(le64) ‖ params_version(le16)` — the beacon carries the
+        // shared schedule pin (D2), so a receiver detects a partitioned medium without any
+        // convergence protocol. The version rides in the CLEAR as well as inside the digest: the
+        // digest alone cannot tell an operator "that neighbour runs an older pinned set" from "that
+        // neighbour classifies names differently", and after the v2 bump those two are the common
+        // case and the interesting case respectively. Both existing parsers are length-tolerant, so
+        // the extra two bytes are invisible to a node that does not look for them.
+        let mut out = Vec::with_capacity(TIME_BEACON_MAGIC.len() + 18);
         out.extend_from_slice(&TIME_BEACON_MAGIC);
         out.extend_from_slice(&ref_us.to_le_bytes());
         out.extend_from_slice(&self.sched_params.digest().to_le_bytes());
+        out.extend_from_slice(&self.sched_params.version.to_le_bytes());
         bytes::Bytes::from(out)
     }
 
@@ -806,6 +1006,19 @@ impl FaceScheduler {
         }
     }
 
+    /// The [`SchedParams`] version a time-beacon carries in the clear, if present. `None` for a
+    /// pre-v2 (<= 19-byte) beacon — which is itself the answer "older than the version field", not a
+    /// missing signal.
+    pub fn parse_beacon_params_version(payload: &[u8]) -> Option<u16> {
+        if payload.len() >= TIME_BEACON_MAGIC.len() + 18 && payload[..3] == TIME_BEACON_MAGIC {
+            let mut b = [0u8; 2];
+            b.copy_from_slice(&payload[19..21]);
+            Some(u16::from_le_bytes(b))
+        } else {
+            None
+        }
+    }
+
     /// This node's schedule-map digest (D2) — what its beacons carry and what it tests foreign beacons
     /// against.
     pub fn map_digest(&self) -> u64 {
@@ -814,10 +1027,60 @@ impl FaceScheduler {
 
     /// `true` ⇒ this beacon's carrier computes a **different** schedule map than we do: the medium is
     /// partitioned, so its presence / busy / ownership evidence lands in different slots than ours.
+    ///
+    /// Since v2 that includes a neighbour who **classifies names differently** — the #93 lease class
+    /// is part of the pin ([`SchedParams::class_digest`]). Use
+    /// [`parse_beacon_params_version`](Self::parse_beacon_params_version) to separate "older pinned
+    /// set" from "different lane policy"; the flag itself does not distinguish them.
     /// Detection only — the design corrects nothing here; it is the honest signal that a deployment
     /// mixed incompatible [`SchedParams`]. An absent digest (legacy beacon) is no signal, not a match.
+    ///
+    /// ⚠ **Scope: the clock MASTER only.** The beacon task is spawned behind
+    /// [`is_master`](Self::is_master), so this catches a defecting master, and misconfiguration on
+    /// any node that reads the master's beacon. It is **not** the fleet check — that is
+    /// [`class_commitment`](Self::class_commitment), piggybacked on every node's ordinary data.
+    /// What the beacon still uniquely buys is **width**: the full 64-bit digest, where the piggyback
+    /// carries a 21-bit fold. Coverage from the piggyback, width from the beacon.
     pub fn beacon_indicates_partition(&self, payload: &[u8]) -> bool {
         Self::parse_beacon_map_digest(payload).is_some_and(|d| d != self.map_digest())
+    }
+
+    /// **The piggybacked schedule commitment** (#93): [`fold_commitment`] of [`map_digest`], the
+    /// 21-bit value whose slices ride `addr3[5]` bits 2..7 on every ordinary data frame this node
+    /// sends (`IdDeconfliction::tx_id`, wire-format-spec §5.4).
+    ///
+    /// This is the carrier the beacon could never be. A beacon is transmitted by one node
+    /// (`NDN_SCHED_MASTER=1`), so a non-master node that classified names differently put nothing on
+    /// the air; every node's data frames carry this. It also honours the control-plane tenet the
+    /// beacon carrier violated — "overhear / piggyback, never beacon" (spec §4).
+    ///
+    /// ⚠ **21 bits, not 64 — this must never be published as catching a deliberate defector.** See
+    /// [`ephemeral_id::fold_commitment`](ndn_radio_cognition::ephemeral_id::fold_commitment): the
+    /// 32 -> 64 widening of [`SchedParams::class_digest`] was bought because a 32-bit collision was
+    /// forged offline in ~10 s, and a 21-bit fold is forgeable instantly. It catches a neighbour
+    /// whose configuration HONESTLY differs, which is the #93 scenario
+    /// ([`with_bloom_latency_unauthorised`](crate::MediumConfig::with_bloom_latency_unauthorised)).
+    ///
+    /// [`fold_commitment`]: ndn_radio_cognition::ephemeral_id::fold_commitment
+    /// [`map_digest`]: Self::map_digest
+    pub fn class_commitment(&self) -> u32 {
+        ndn_radio_cognition::ephemeral_id::fold_commitment(self.map_digest())
+    }
+
+    /// `true` ⇒ the commitment slice on this flags byte disagrees with ours — ONE frame's evidence.
+    ///
+    /// ⚠ **A single mismatching slice is evidence, not a verdict**, and this must not be wired
+    /// straight to a partition report: the caller has no way here to know the byte really is a
+    /// Tier-0 flags byte (`addr3` is overwritten with `addr1` by the A-MSDU and legacy builders).
+    /// The reporting path is
+    /// [`ClassCommitmentWatch`](ndn_radio_cognition::ephemeral_id::ClassCommitmentWatch), which
+    /// debounces and — critically — reports a half-collected round as `Unknown`/`Agreeing`, never as
+    /// a partition. This accessor exists for tests and for a caller that has already established the
+    /// frame shape.
+    pub fn slice_indicates_divergence(&self, flags: u8) -> bool {
+        let ours = self.class_commitment();
+        ndn_radio_cognition::ephemeral_id::decode_commitment_slice(flags)
+            .is_some_and(|(s, theirs)| ((ours >> (3 * s as u32)) & 0x7) as u8 != theirs)
     }
 
     /// Discipline the common-view clock to a received master reference time (called by the RX reader
@@ -1016,7 +1279,23 @@ impl FaceScheduler {
             // it there), addr2 on the legacy broadcast shape. Recorded per slot so the claim can
             // tell "this group's OWNER is audible" from "somebody audibly relayed this group".
             let nonce = match (group, addr3, addr) {
-                (Some(g), Some(a3), _) if *g != ndn_radio_hal::BROADCAST => nonce_u64(a3),
+                // ⚠ The §2 presence nonce is the **8-bit ephemeral ID alone** (`addr3[4]`), not all
+                // six bytes. `addr3[0..4]` are the name-derived Blur filter and `addr3[5]` is the
+                // flags byte — both vary per frame — so folding them in made two sightings of the
+                // SAME transmitter compare unequal, and the relay discount below (which asks "did
+                // this nonce evidence two slots?") could almost never fire. It biased
+                // `owner_in_range` toward `true`, i.e. toward MORE claims: the safe-direction
+                // argument in that comment was quietly inverted. It also had to be fixed before the
+                // class-commitment slice started varying `addr3[5]` every frame, which would have
+                // made it unconditional.
+                //
+                // `addr3 == addr1` is the A-MSDU / legacy frame shape (`build_amsdu` writes
+                // `addr3 = ra`; the base builder falls back to `addr3 = dst`), where these bytes are
+                // filler, not an ID — an exact discriminator, since a real Tier-0 `addr3[0..4]`
+                // equals `addr1[0..4]` only by ~2^-32 coincidence.
+                (Some(g), Some(a3), _) if *g != ndn_radio_hal::BROADCAST && a3 != g => {
+                    id_nonce(a3[4])
+                }
                 (_, _, Some(a2)) => nonce_u64(a2),
                 _ => 0,
             };
@@ -1062,6 +1341,19 @@ impl FaceScheduler {
         // Keep the pin honest: the digest must reflect the slot granularity actually in force, so a
         // deeper table raises `sched_params.slot_depth` to match (D2/D3 coupling).
         self.sched_params.slot_depth = groups.slot_depth as u8;
+        // …and the CLASS ASSIGNMENT the table carries (#93/D2). Gated on this scheduler's OWN slot
+        // schedule rather than on `sched_params.reserved`, because the lanes are what actuate the
+        // class: `SlotSchedule::owner_slot_in` reads `LeaseClass` only when a lane stride is set, so
+        // with no lanes there is nothing to commit to and pinning the assignment would false-partition
+        // every honest neighbour that classified differently, for a divergence that splits no
+        // slot map. ⚠ NOT "the class is inert" when no lanes are reserved: `try_claim` refuses a
+        // `Latency` name unconditionally, with no stride guard, so marking a prefix latency at
+        // `NDN_SCHED_RESERVE=0` still withdraws it from the CCLF claim election. That is local
+        // self-harm rather than a map split — which is why it correctly stays out of the pin — but
+        // it is not nothing, and a reader who pre-marks future-latency prefixes as a documented
+        // no-op loses opportunistic claiming for them.
+        let lanes_reserved = self.slot.is_some_and(|s| s.reserved_slots() > 0);
+        self.sched_params.class_digest = groups.class_digest(lanes_reserved);
         self.groups = Some(groups);
         self
     }
@@ -2446,6 +2738,74 @@ mod tests {
         );
     }
 
+    /// **The §2 presence nonce is the ephemeral ID, not the whole `addr3`** — the prerequisite the
+    /// piggybacked class commitment forced, and a live defect on its own.
+    ///
+    /// `observe_rx` folded all six bytes of `addr3` into the per-slot presence nonce. But under
+    /// Tier-0 only `addr3[4]` identifies the transmitter: `addr3[0..4]` are the NAME-derived Blur
+    /// filter and `addr3[5]` is the flags byte. So the same node relaying two different names wrote
+    /// two DIFFERENT nonces, the relay discount below (`owner_in_range`: "did this nonce evidence a
+    /// second slot?") could essentially never fire, and the bias was toward `true` — toward MORE
+    /// claims, the unsafe direction, which is the opposite of what that code's own comment claims.
+    /// The commitment slice would have made it unconditional by varying `addr3[5]` every frame.
+    #[test]
+    fn the_presence_nonce_is_the_ephemeral_id_not_the_whole_addr3() {
+        let sched = mk_claim_sched();
+        // Tier-0 shape: addr1's octet 0 carries the forced local/group bits the origin gate tests.
+        let g = [0x03u8, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let a2 = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x02];
+        // ONE transmitter (ephemeral ID 0x5a) carrying TWO names: the filter bytes differ (they are
+        // name-derived) and so does the flags byte (it now carries a rotating commitment slice).
+        let a3_alarm = [0x04u8, 0x00, 0x00, 0x00, 0x5a, 0b0000_0100];
+        let a3_bulk = [0x08u8, 0x00, 0x00, 0x00, 0x5a, 0b1010_1000];
+        // Different FIRST components: the slot key is H(first `slot_depth` = 1 components).
+        let w_alarm = data_wire(&[b"alarm", b"x"]);
+        let w_bulk = data_wire(&[b"zulu", b"y"]);
+
+        sched.observe_rx(Some(&g), Some(&a2), Some(&a3_alarm), &w_alarm);
+        sched.observe_rx(Some(&g), Some(&a2), Some(&a3_bulk), &w_bulk);
+
+        let nonces: Vec<u64> = sched
+            .slots
+            .nonce
+            .iter()
+            .map(|c| c.load(super::Ordering::Relaxed))
+            .filter(|v| *v != 0)
+            .collect();
+        // Premise: both frames were attributed and landed in DIFFERENT slots — otherwise the second
+        // write would just overwrite the first and this test would prove nothing.
+        assert_eq!(
+            nonces.len(),
+            2,
+            "premise: two names from one transmitter must occupy two slots (got {nonces:?})"
+        );
+        assert_eq!(
+            nonces[0], nonces[1],
+            "one transmitter must present ONE presence nonce however many names it carries —              otherwise the relay discount cannot see that it served two slots"
+        );
+        assert_eq!(nonces[0], id_nonce(0x5a));
+
+        // And the shapes where `addr3` is NOT `id ‖ flags` must not be read as one: the A-MSDU
+        // builder writes `addr3 = addr1` and the legacy builder writes `addr3 = dst`, so those bytes
+        // are filler. Fall back to addr2, exactly as before Tier-0.
+        let s2 = mk_claim_sched();
+        s2.observe_rx(Some(&g), Some(&a2), Some(&g), &w_alarm);
+        let aggregate: Vec<u64> = s2
+            .slots
+            .nonce
+            .iter()
+            .map(|c| c.load(super::Ordering::Relaxed))
+            .filter(|v| *v != 0)
+            .collect();
+        assert_eq!(aggregate.len(), 1, "premise: the frame was attributed");
+        assert_eq!(
+            aggregate[0],
+            nonce_u64(&a2),
+            "addr3 == addr1 is the aggregate/legacy shape — its bytes are not an ephemeral ID"
+        );
+        assert_ne!(aggregate[0], id_nonce(g[4]), "and must not be read as one");
+    }
+
     /// **Presence evidence must outlive the gap between a slow talker's frames** — suppressor two.
     ///
     /// The window was four superframes: 640 ms at the 8 × 20 ms schedule used on air. The neighbour
@@ -2863,6 +3223,10 @@ mod tests {
                 ..base
             },
             super::SchedParams {
+                class_digest: 0x0bad_c0de,
+                ..base
+            },
+            super::SchedParams {
                 version: base.version + 1,
                 ..base
             },
@@ -2902,6 +3266,355 @@ mod tests {
         assert!(
             !sched.beacon_indicates_partition(&foreign[..11]),
             "a digest-less legacy beacon must not read as a partition"
+        );
+    }
+
+    /// A scheduler with **reserved latency lanes** and a table installed the way the real path
+    /// installs one — through `with_groups`, which is what folds the table's slot depth AND its class
+    /// assignment into the pin. Setting `groups` by hand would leave a pin the node's own map
+    /// contradicts, which is the thing this whole area exists to prevent.
+    fn mk_lane_sched(table: std::sync::Arc<GroupTable>) -> FaceScheduler {
+        let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
+        let mut s = mk_claim_sched();
+        s.slot = Some(slot);
+        s.sched_params = SchedParams::capture(1, ClockSource::Wall, Some(&slot), None);
+        s.with_groups(table)
+    }
+
+    /// The same, with **no reserved lanes** — the shipping default (`NDN_SCHED_RESERVE` unset), and
+    /// therefore the configuration every on-air result to date was measured under.
+    fn mk_open_sched(table: std::sync::Arc<GroupTable>) -> FaceScheduler {
+        let slot = SlotSchedule::new(3000, 8);
+        let mut s = mk_claim_sched();
+        s.slot = Some(slot);
+        s.sched_params = SchedParams::capture(1, ClockSource::Wall, Some(&slot), None);
+        s.with_groups(table)
+    }
+
+    /// **The finding, expressed as code** (#93/D2). `LeaseClass` is a per-node assertion that buys
+    /// real airtime — a lane bulk cannot enter, a load-independent access bound, preemption and claim
+    /// immunity — and the design's entire defence is that every node classifies a prefix identically.
+    /// The digest that exists to catch a violation of exactly that did not cover the assignment: a
+    /// node promoting its own prefixes emitted a digest **identical** to an honest neighbour's, so
+    /// `beacon_indicates_partition` never fired while the two placed the same name in different
+    /// slots. Both halves of this test failed before `SchedParams::class_digest`.
+    ///
+    /// It now checks BOTH carriers from one fixture: the beacon (64 bits, clock master only) and the
+    /// piggybacked slice on ordinary data (21-bit fold, every node). The beacon half alone was what
+    /// let the claim overstate its coverage — see the D2 retraction in `mac-design-roots.md`.
+    #[test]
+    fn class_divergence_moves_the_digest_and_trips_partition_detection() {
+        let key = crate::GroupKey([5u8; 16]);
+        let prefixes = [
+            b"/alarm".as_slice(),
+            b"/bulk".as_slice(),
+            b"/ndn".as_slice(),
+        ];
+        // Two nodes, IDENTICAL registration sets and identical schedule inputs. The only difference
+        // is that one of them promoted `/bulk` — its own traffic — into the reserved lanes.
+        let honest = mk_lane_sched(std::sync::Arc::new(GroupTable::new(&key, &prefixes)));
+        let defector = mk_lane_sched(std::sync::Arc::new(
+            GroupTable::new(&key, &prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]),
+        ));
+
+        // The promotion is not cosmetic: it moves /bulk out of the open slots into a reserved lane,
+        // so the two nodes genuinely compute different maps for the same name.
+        let slot = honest.slot.unwrap();
+        let hb = prefix_hash(&[b"bulk".as_slice()]);
+        assert!(
+            !slot.is_reserved(slot.owner_slot_in(hb, LeaseClass::Bulk)),
+            "premise: bulk placement is an open slot"
+        );
+        assert!(
+            slot.is_reserved(slot.owner_slot_in(hb, LeaseClass::Latency)),
+            "premise: the promotion lands in a reserved lane"
+        );
+        let w = data_wire(&[b"bulk".as_slice(), b"7".as_slice()]);
+        assert_ne!(
+            honest.name_group(&w),
+            defector.name_group(&w),
+            "premise: the two nodes map /bulk differently"
+        );
+
+        // …and that difference is now IN THE PIN, so BOTH carriers see it.
+        assert_ne!(
+            honest.map_digest(),
+            defector.map_digest(),
+            "a unilateral promotion must move the map digest"
+        );
+        // Carrier 1 — the time beacon: full 64-bit width, but transmitted only by a clock master.
+        assert!(
+            honest.beacon_indicates_partition(&defector.build_beacon()),
+            "the honest node must detect the defector's beacon as a partition"
+        );
+        assert!(
+            defector.beacon_indicates_partition(&honest.build_beacon()),
+            "detection is symmetric — neither side is privileged"
+        );
+        // Carrier 2 — the piggybacked slice on ordinary data: 21 bits, but EVERY node sends it.
+        // The fold is lossy (64 -> 21), so "the digests differ" does not by itself mean "the folds
+        // differ": that this concrete divergence survives the fold is worth pinning, not assuming.
+        assert_ne!(
+            honest.class_commitment(),
+            defector.class_commitment(),
+            "the 21-bit fold must not collide for the divergence this test is about"
+        );
+        let mut caught = 0usize;
+        for idx in 1..=ndn_radio_cognition::ephemeral_id::COMMITMENT_SLICES {
+            let flags =
+                ndn_radio_cognition::ephemeral_id::encode_commitment_slice(
+                    defector.class_commitment(),
+                    idx,
+                );
+            if honest.slice_indicates_divergence(flags) {
+                caught += 1;
+            }
+            // The converse must never fire: an honest peer's own slices agree with itself.
+            let own = ndn_radio_cognition::ephemeral_id::encode_commitment_slice(
+                honest.class_commitment(),
+                idx,
+            );
+            assert!(
+                !honest.slice_indicates_divergence(own),
+                "slice {idx} false-partitioned an identically configured peer"
+            );
+        }
+        assert!(
+            caught >= 2,
+            "only {caught} of {} slices differ — the debounce needs at least two",
+            ndn_radio_cognition::ephemeral_id::COMMITMENT_SLICES
+        );
+    }
+
+    /// **The commitment is order-independent.** `new_with_depth` sorts entries by prefix LENGTH only
+    /// and the sort is stable, so equal-length prefixes keep the caller's slice order: two honest
+    /// nodes with the same lane set can hold their entries in different sequence. An in-order fold
+    /// (the shape `channels_digest` uses) would report a partition caused by nothing but a literal's
+    /// ordering — a false positive is how a detector's information content goes to zero.
+    #[test]
+    fn the_class_commitment_is_order_independent() {
+        let key = crate::GroupKey([6u8; 16]);
+        let a = GroupTable::new(
+            &key,
+            &[b"/aa".as_slice(), b"/bb".as_slice(), b"/cc".as_slice()],
+        )
+        .with_latency_unauthorised(&[b"/aa".as_slice(), b"/cc".as_slice()]);
+        let b = GroupTable::new(
+            &key,
+            &[b"/cc".as_slice(), b"/bb".as_slice(), b"/aa".as_slice()],
+        )
+        .with_latency_unauthorised(&[b"/cc".as_slice(), b"/aa".as_slice()]);
+
+        // Premise: the entry sequences really do differ (equal lengths ⇒ insertion order survives).
+        let seq = |t: &GroupTable| -> Vec<Vec<u8>> {
+            t.entries.iter().map(|e| e.prefix.clone()).collect()
+        };
+        assert_ne!(seq(&a), seq(&b), "premise: the entry order differs");
+
+        assert_eq!(
+            a.class_digest(true),
+            b.class_digest(true),
+            "the same lane set declared in a different order must digest identically"
+        );
+        assert_eq!(
+            mk_lane_sched(std::sync::Arc::new(a)).map_digest(),
+            mk_lane_sched(std::sync::Arc::new(b)).map_digest(),
+            "…and must not report a partition end-to-end"
+        );
+    }
+
+    /// **A different registration set is not a partition** — the crux of the scope decision. Nodes
+    /// legitimately register what they each serve, so a commitment over the whole table would fire on
+    /// essentially every honest pair and the flag would be permanently on. Committing to the LATENCY
+    /// assignment alone has zero false positives here: disjoint bulk registrations plus one shared
+    /// lane set produce a bit-identical map for every name, registered or not.
+    #[test]
+    fn a_different_registration_set_with_one_lane_policy_does_not_false_partition() {
+        let key = crate::GroupKey([3u8; 16]);
+        let a = mk_lane_sched(std::sync::Arc::new(
+            GroupTable::new(&key, &[b"/a".as_slice(), b"/alarm".as_slice()])
+                .with_latency_unauthorised(&[b"/alarm".as_slice()]),
+        ));
+        let b = mk_lane_sched(std::sync::Arc::new(
+            GroupTable::new(&key, &[b"/b".as_slice(), b"/alarm".as_slice()])
+                .with_latency_unauthorised(&[b"/alarm".as_slice()]),
+        ));
+
+        // Each other's registrations, the shared lane, and a name NEITHER registered (the fallback).
+        for comps in [
+            [b"a".as_slice(), b"1".as_slice()],
+            [b"b".as_slice(), b"1".as_slice()],
+            [b"alarm".as_slice(), b"1".as_slice()],
+            [b"zz".as_slice(), b"1".as_slice()],
+        ] {
+            let w = data_wire(&comps);
+            assert_eq!(
+                a.name_group(&w),
+                b.name_group(&w),
+                "premise: disjoint registrations must still compute one map"
+            );
+        }
+        assert_eq!(
+            a.map_digest(),
+            b.map_digest(),
+            "two honest nodes with different registrations must NOT read as partitioned"
+        );
+        assert!(
+            !a.beacon_indicates_partition(&b.build_beacon()),
+            "a bulk registration this node has never heard of is not a partition"
+        );
+    }
+
+    /// **With no reserved lanes the class is not committed — and that is correct, not a gap.**
+    /// `owner_slot_in` returns `owner_slot` before it looks at the class when `reserved_stride < 2`
+    /// (the shipping default), so two nodes that disagree about a class there compute the *same* map.
+    /// Pinning the assignment anyway would be a false partition by construction. Stated plainly: in a
+    /// deployment with `NDN_SCHED_RESERVE` unset — which is every on-air result to date — this
+    /// commitment is inert, because so is the class.
+    #[test]
+    fn with_no_reserved_lanes_the_class_is_not_committed() {
+        let key = crate::GroupKey([4u8; 16]);
+        let prefixes = [b"/alarm".as_slice(), b"/bulk".as_slice()];
+        let promoted =
+            GroupTable::new(&key, &prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]);
+        assert_eq!(
+            promoted.class_digest(false),
+            0,
+            "no lanes ⇒ nothing to commit to"
+        );
+
+        let a = mk_open_sched(std::sync::Arc::new(GroupTable::new(&key, &prefixes)));
+        let b = mk_open_sched(std::sync::Arc::new(promoted));
+        let slot = a.slot.unwrap();
+        let h = prefix_hash(&[b"bulk".as_slice()]);
+        assert_eq!(
+            slot.owner_slot_in(h, LeaseClass::Latency),
+            slot.owner_slot_in(h, LeaseClass::Bulk),
+            "premise: with no lanes the class does not move the slot"
+        );
+        assert_eq!(a.map_digest(), b.map_digest(), "…so the digests must match");
+        assert!(
+            !a.beacon_indicates_partition(&b.build_beacon()),
+            "an unactuated class difference is not a partition"
+        );
+    }
+
+    /// **A registration SHALLOWER than the slot depth is committed too** — the one map-affecting
+    /// thing a `Bulk` entry can do, and the precondition the latency-only scope would otherwise miss.
+    ///
+    /// `slot_trunc` takes `min(depth, comps)`, so a prefix with fewer components than `slot_depth`
+    /// yields a short entry and `hash_for_name` returns its shorter key, while a node without that
+    /// registration falls back to the name's full-depth key: a genuine, silent map split with no
+    /// class involved. Unreachable at the shipping `slot_depth = 1`, and `new_with_depth` has no
+    /// non-test caller — but `with_groups` will pin whatever depth a table reports, so the hole is
+    /// latent rather than impossible, and a latent silent divergence is worth making loud.
+    #[test]
+    fn a_shallower_than_depth_registration_is_committed() {
+        let key = crate::GroupKey([8u8; 16]);
+        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(
+            &key,
+            &[b"/ndn".as_slice()],
+            2,
+        ));
+        let exact = std::sync::Arc::new(GroupTable::new_with_depth(
+            &key,
+            &[b"/ndn/x".as_slice()],
+            2,
+        ));
+        let a = mk_lane_sched(shallow);
+        let b = mk_lane_sched(exact);
+
+        // Premise: they really do key the same name to different slot groups.
+        let w = data_wire(&[b"ndn".as_slice(), b"x".as_slice(), b"y".as_slice()]);
+        assert_ne!(
+            a.name_group(&w),
+            b.name_group(&w),
+            "premise: a shallow registration overrides the shared-depth key"
+        );
+        assert_ne!(
+            a.map_digest(),
+            b.map_digest(),
+            "a shallow registration must move the map digest"
+        );
+        assert!(
+            a.beacon_indicates_partition(&b.build_beacon()),
+            "…and must be detected on the beacon"
+        );
+    }
+
+    /// **The authority gates the promotion; the bare path does not — and the pin sees both.**
+    /// `with_latency_authorised` is not enforcement (a permissive `ClassAuthority` is four lines);
+    /// what it removes is self-assertion as a one-liner, exactly as `ClassCeiling` did for
+    /// `Priority`. The load-bearing half is the last assert: whichever route a node took, its choice
+    /// is visible in the digest its neighbours test.
+    #[test]
+    fn the_authority_gates_the_promotion_and_the_bare_path_does_not() {
+        struct OnlyAlarm;
+        impl ndn_radio_cognition::ClassAuthority for OnlyAlarm {
+            fn ceiling_for(&self, prefix_hash: u64) -> ndn_radio_cognition::Priority {
+                if prefix_hash == super::prefix_hash(&[b"alarm".as_slice()]) {
+                    ndn_radio_cognition::Priority::Urgent
+                } else {
+                    ndn_radio_cognition::Priority::Normal
+                }
+            }
+        }
+        let key = crate::GroupKey([9u8; 16]);
+        let prefixes = [b"/alarm".as_slice(), b"/bulk".as_slice()];
+        let both = [b"/alarm".as_slice(), b"/bulk".as_slice()];
+
+        let bare = GroupTable::new(&key, &prefixes).with_latency_unauthorised(&both);
+        assert_eq!(
+            bare.hash_for_name(b"/bulk/1").map(|(_, c)| c),
+            Some(LeaseClass::Latency),
+            "the bare path promotes whatever it is handed — that is the finding"
+        );
+
+        let gated = GroupTable::new(&key, &prefixes).with_latency_authorised(&OnlyAlarm, &both);
+        assert_eq!(
+            gated.hash_for_name(b"/alarm/1").map(|(_, c)| c),
+            Some(LeaseClass::Latency),
+            "what the authority grants is promoted"
+        );
+        assert_eq!(
+            gated.hash_for_name(b"/bulk/1").map(|(_, c)| c),
+            Some(LeaseClass::Bulk),
+            "what it does not grant stays Bulk"
+        );
+        assert_ne!(
+            bare.class_digest(true),
+            gated.class_digest(true),
+            "the two nodes disagree about the map, and the pin says so"
+        );
+    }
+
+    /// **The beacon carries the params version in the clear** (bytes 19..21). `version` is the first
+    /// thing the digest mixes, so every v1↔v2 pair reports "partitioned" — correct, but
+    /// undifferentiated: an operator could not tell "that neighbour runs an older pinned set" from
+    /// "that neighbour classifies names differently". Both existing parsers are length-tolerant, so
+    /// the two extra bytes are additive: a shorter (older) beacon still yields its reference time and
+    /// its digest, and simply reports no version — which is itself the answer.
+    #[test]
+    fn the_beacon_carries_the_params_version_in_the_clear() {
+        let s = mk_claim_sched();
+        let wire = s.build_beacon();
+        assert_eq!(
+            super::FaceScheduler::parse_beacon_params_version(&wire),
+            Some(super::SCHED_PARAMS_VERSION),
+            "own beacon round-trips our pinned-set version"
+        );
+        assert_eq!(
+            super::FaceScheduler::parse_beacon_params_version(&wire[..19]),
+            None,
+            "a pre-v2 beacon reports no version"
+        );
+        assert!(
+            super::FaceScheduler::parse_beacon_map_digest(&wire[..19]).is_some(),
+            "…and its digest is still readable"
+        );
+        assert!(
+            super::FaceScheduler::parse_beacon(&wire[..11]).is_some(),
+            "…and an 11-byte legacy beacon is still a beacon"
         );
     }
 
@@ -3225,28 +3938,37 @@ mod tests {
         assert!(slot_wifi >= 4_900, "8733b slot is actuation-bound: {slot_wifi} us");
         assert!(urgent_wifi.unwrap() >= 9, "stride-2 on this bearer is ~10 ms: {urgent_wifi:?}");
 
-        // A hardware-scheduled bearer (the ESP32-C5 class) at the same MTU: the actuation term
-        // collapses and BOTH numbers drop under 10 ms.
+        // The REAL hardware-scheduled bearers, at their own DECLARED granularities — both measured
+        // and conservatively rounded up in their backends, so these are numbers a deployment can
+        // actually get. (An earlier version of this test used a 10 µs granularity that no bearer
+        // declares, which flattered the result: the C5 at full MTU lands just *under* 10 ms, not
+        // comfortably under it.)
+        //   Esp32SerialBackend  ScheduledAt{200 µs}  — measured <=190 µs, esp_wifi_80211_tx latency
+        //   Bw16SerialBackend   ScheduledAt{ 20 µs}  — measured 10 µs submit error over 15 frames
         let (_, bulk_sched, urgent_sched) =
-            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 2);
-        assert!(bulk_sched < 10, "scheduled bearer gets bulk under 10 ms: {bulk_sched} ms");
-        assert!(urgent_sched.unwrap() <= 2, "and urgent to ~2 ms: {urgent_sched:?} ms");
+            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 2);
+        assert!(bulk_sched < 10, "C5 at full MTU squeaks under 10 ms: {bulk_sched} ms");
+        assert!(urgent_sched.unwrap() <= 3, "and urgent to ~2.4 ms: {urgent_sched:?} ms");
+        // The BW16's tighter 20 µs buys ~1.5 ms of superframe back at the same MTU.
+        let (_, bulk_bw16, _) =
+            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 20_000 }, 8, 2);
+        assert!(bulk_bw16 < bulk_sched, "20 µs beats 200 µs: {bulk_bw16} vs {bulk_sched} ms");
 
         // Shrinking the frame the slot is sized for compounds it — the airtime term is the only
         // other lever once actuation is gone.
         let (_, bulk_small, urgent_small) =
-            geom(300, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 2);
-        assert!(bulk_small <= 3, "small-MTU scheduled: bulk {bulk_small} ms");
+            geom(300, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 2);
+        assert!(bulk_small <= 4, "small-MTU C5: bulk {bulk_small} ms");
 
         // No lanes reserved => no guarantee to report, only a load-dependent period.
         let (_, _, none) =
-            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 }, 8, 0);
+            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 0);
         assert!(none.is_none(), "stride 0 must report no guarantee");
 
         println!(
             "8733b(4ms): slot {slot_wifi}us bulk {bulk_wifi}ms urgent {urgent_wifi:?}ms | \
-             scheduled: bulk {bulk_sched}ms urgent {urgent_sched:?}ms | \
-             scheduled+300B: bulk {bulk_small}ms urgent {urgent_small:?}ms"
+             C5(200us): bulk {bulk_sched}ms urgent {urgent_sched:?}ms | \
+             BW16(20us): bulk {bulk_bw16}ms | C5+300B: bulk {bulk_small}ms urgent {urgent_small:?}ms"
         );
     }
 
