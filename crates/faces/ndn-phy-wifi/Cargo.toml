@@ -16,10 +16,16 @@ libusb-backend = ["dep:ndn-radio-drivers", "dep:rusb", "dep:libusb1-sys"]
 # The serial-bridged 802.11 backend (BW16 / ESP32-C5), re-exported for use under
 # a MonitorWifiFace like any other WiFi backend.
 serial-radio = ["dep:ndn-radio-drivers", "ndn-radio-drivers/serial-radio"]
-# No-op gate for the examples/ directory: ~79 one-off hardware bring-up /
-# campaign probe binaries. They are not part of default builds (CI's
-# `--all-targets` skips them); opt in with `--features dev-examples`.
-dev-examples = []
+# Gate for the examples/ directory: ~79 one-off hardware bring-up / campaign probe binaries. They
+# are not part of default builds (CI's `--all-targets` skips them); opt in with
+# `--features dev-examples`.
+#
+# ★ M8: it also turns on `ndn-radio-drivers/bench`, which is what makes the individual ladder rungs
+# (`power_on`, `download_firmware`, `hw_reset`, `wmi_start`, …) `pub` rather than `pub(crate)`. A
+# bench instrument that pokes exactly one rung is legitimate; this crate's LIBRARY half, and every
+# production consumer of it, deliberately cannot reach one. `?/` so it stays a no-op when
+# `libusb-backend` is off and the driver crate is not in the graph at all.
+dev-examples = ["ndn-radio-drivers?/bench"]
 
 [dependencies]
 ndn-radio = { workspace = true }
@@ -38,15 +44,11 @@ ndn-radio-hal    = { workspace = true }
 # µs-precision epoch source, fed from CapturedFrame.stamp (see src/sched.rs, #41).
 ndn-time         = { workspace = true }
 ndn-signals-core = { workspace = true }
-# #92: the NameTableObserver seam the forwarder feeds Tier-1 through.
-ndn-fwd-core     = { workspace = true }
-ndn-store        = { workspace = true }
-ndn-foundation-types = { workspace = true }
 # The four userspace USB Wi-Fi driver backends, lifted into their own crate.
 # Pulled only by the `libusb-backend` feature; re-exported from `lib.rs`.
 ndn-radio-drivers = { path = "../../../../ndn-radio-drivers", optional = true }
 # The pure cross-layer cognitive control plane this face is the actuator/seam for.
-ndn-radio-cognition = { workspace = true }
+ndn-radio-cognition = { workspace = true, features = ["occupancy-sampler"] }
 # The generic mgmt introspection trait (`ControlSurface`) — the radio control plane
 # exposes its live cognition snapshot through it at `/localhost/nfd/ext/list`.
 ndn-mgmt-wire    = { workspace = true }
@@ -72,8 +74,6 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "rt-multi-thread
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ndn-packet = { workspace = true }
 ndn-tlv = { workspace = true }
-# name_filter_eval: exercise the real OTLP-in-Data span pipeline on the filter ops (#107).
-ndn-observability = { workspace = true }
 # Core FEC codec only (no `endpoint` → no engine/ndn-app pulled in): the
 # `segment_payload` / `CodedAssembler` byte-level API drives K-of-N recovery
 # over the raw Face directly. Declared by path (not inherited) so
@@ -106,10 +106,6 @@ name = "bisect_bringup"
 required-features = ["dev-examples"]
 
 [[example]]
-name = "blur_encoding"
-required-features = ["dev-examples"]
-
-[[example]]
 name = "burst_fork"
 required-features = ["dev-examples"]
 
@@ -130,10 +126,6 @@ name = "cal_probe"
 required-features = ["dev-examples"]
 
 [[example]]
-name = "campaign_e_sweep"
-required-features = ["dev-examples"]
-
-[[example]]
 name = "campaign_p5"
 required-features = ["dev-examples"]
 
@@ -143,10 +135,6 @@ required-features = ["dev-examples"]
 
 [[example]]
 name = "dbm_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "depth_fp"
 required-features = ["dev-examples"]
 
 [[example]]
@@ -178,10 +166,6 @@ name = "freq_agile"
 required-features = ["dev-examples"]
 
 [[example]]
-name = "gcs_fp"
-required-features = ["dev-examples"]
-
-[[example]]
 name = "halow_ndn"
 required-features = ["dev-examples"]
 
@@ -195,10 +179,6 @@ required-features = ["dev-examples"]
 
 [[example]]
 name = "inject8812au"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "level_select"
 required-features = ["dev-examples"]
 
 [[example]]
@@ -251,10 +231,6 @@ required-features = ["dev-examples"]
 
 [[example]]
 name = "mt7612_usbagg"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "name_filter_eval"
 required-features = ["dev-examples"]
 
 [[example]]
@@ -358,10 +334,6 @@ name = "thermal_probe"
 required-features = ["dev-examples"]
 
 [[example]]
-name = "tier0_fec_onair"
-required-features = ["dev-examples"]
-
-[[example]]
 name = "tone_hold"
 required-features = ["dev-examples"]
 
@@ -382,7 +354,15 @@ name = "usb_list"
 required-features = ["dev-examples"]
 
 [[example]]
-name = "usb_probe"
+# ★ M8 split `usb_probe` (1084 lines, ~27 flags, doc comment "List USB devices") in two:
+# `bringup_probe` runs any part's canonical PLAN with `--skip` / `--stop-after` / `--poke`, and
+# `regs` is the register surface. Five refuted flags were deleted outright, each with its
+# refutation written into the plan step it was testing.
+name = "bringup_probe"
+required-features = ["dev-examples"]
+
+[[example]]
+name = "regs"
 required-features = ["dev-examples"]
 
 [[example]]

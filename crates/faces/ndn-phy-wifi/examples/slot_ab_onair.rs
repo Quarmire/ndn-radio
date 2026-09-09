@@ -29,7 +29,7 @@
 //! Root cause, from dmesg on o5p-1: `usb 5-1: USB disconnect, device number 103` followed by `new
 //! high-speed USB device number 104` — **the 881a dropped off the bus mid-run and re-enumerated**,
 //! on a USB 2.0 (high-speed) port. Its TX had already collapsed to 66 frames in 40 s (vs the a81a's
-//! 2952), and afterwards even the known-good `tier0_fec_onair` could not open it
+//! 2952), and afterwards even the known-good FEC on-air harness could not open it
 //! (`no RTL8812AU at index 0`). Same failure family as `a81a-usb-brownout-on-tx`.
 //!
 //! So this A/B needs a second transmitter that can sustain TX *and* RX. The 881a cannot today:
@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("SCHED OFF (NDN_SCHED_SLOT unset) — free-running, the contention baseline");
     }
 
-    let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
+    let open = ndn_radio_drivers::open_radio(pid, &ndn_radio_drivers::DeviceSelect::from_env(), &ndn_radio_drivers::BringUpRequest::from_env(channel))?;
     let cap = RadioCapability::wifi_monitor_5ghz(vec![channel]);
     let medium = Arc::new(
         RadioMediumFace::new(

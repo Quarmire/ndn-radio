@@ -88,7 +88,7 @@ impl<R: FrameIo + Send + Sync + 'static> GenerationSink for FrameIoSink<R> {
                     dst: self.dst,
                     src: self.src,
                     addr3: None,
-                    addr4: None,
+                    extra: None,
                     htc: None,
                 })
                 .await;
@@ -180,6 +180,23 @@ impl<P: Send + 'static> LinkFecBridge<P> {
     /// The parity count currently in force (for diagnostics/tests).
     pub fn redundancy(&self) -> u16 {
         self.feature.redundancy()
+    }
+
+    /// Source frames per generation (K) — the size a plan's parity count is bounded against.
+    ///
+    /// The codec already refuses `K + R > 255`, but that is a *codec* bound, not an *airtime* one:
+    /// at K=8 it still admits R=247, a ~31x airtime multiplier that needs no priority class to
+    /// reach. A face bounds the plan's R against this instead, so a parity count the policy could
+    /// never decide (it clamps at `generation_k`) is one the face will not emit either.
+    pub fn generation_size(&self) -> u16 {
+        self.feature.generation_size() as u16
+    }
+
+    /// Worst-generation **rank deficit** the decoder currently holds (`K - rank`; `0` = decodable).
+    /// The measured item-4 diversity signal — a face feeds this to
+    /// `RadioControl::observe_rank_deficit(prefix_hash, deficit, now_ms)` after `decode`.
+    pub fn rank_deficit(&self) -> f32 {
+        self.feature.rank_deficit()
     }
 }
 

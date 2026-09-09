@@ -29,8 +29,7 @@
 //! Nothing is negotiated on air. Both ends must compute a **bit-identical** list or the link is
 //! gone — so every input to [`name_hop_plan`] is a fact both ends hold identically:
 //!
-//! * the **#44 group key** (already shared: it is the same key the Tier-0 Blur, the Fingerprint
-//!   and the body-prefix GCS are computed under);
+//! * the **#44 group key** (already shared: the same key the group-key rendezvous is computed under);
 //! * the **name**;
 //! * the **carrier set** the group operates on, in Hz, canonicalised here (sorted,
 //!   deduplicated) so two nodes that enumerate the same band plan in different orders still
@@ -51,9 +50,8 @@
 //!
 //! ## Why the #44 keyspace, and not a new one
 //!
-//! The hop draws are SipHash-2-4 under the group key, via
-//! [`tier0::name_hash`](ndn_radio::mac::tier0::name_hash) — the *same* primitive and the *same*
-//! key as the Blur positions, the exact-match Fingerprint and the GCS body filter. Three
+//! The hop draws are SipHash-2-4 under the group key, via [`siphash24`](ndn_frame_io::siphash24) —
+//! the #44 shared keyspace, the *same* keyed primitive the group-key rendezvous already uses. Three
 //! reasons, in order of importance:
 //!
 //! 1. **One key to distribute and rotate.** A group already shares exactly one 16-byte key. A
@@ -62,19 +60,25 @@
 //! 2. **The adversarial property carries over.** SipHash under the full key is a keyed PRF, so
 //!    an outsider watching frames cannot recover the key and therefore cannot predict (or
 //!    deliberately camp on) a private group's hop sequence. That property is the whole reason
-//!    tier0 replaced keyed FNV with SipHash; deriving hops from an unkeyed hash would hand it
+//!    the #44 keyspace uses keyed SipHash rather than FNV; deriving hops from an unkeyed hash would hand it
 //!    straight back. (The firmware's own `hop_channel` uses unkeyed FNV-1a for exactly the
 //!    reason this design supersedes: it had to hash on an MCU with no key. Here the host
 //!    computes the table and writes it, so the keyed hash is free.)
 //! 3. **One hash family.** #44's whole point is that name→bits derivations in this stack share
 //!    a primitive rather than accumulating one per feature.
 //!
-//! Draws are separated from the Blur's by **XOR-ing a domain constant into the key**, which is
-//! tier0's own idiom for an independent evaluation (`KEY2_DOMAIN` there, [`HOP_KEY_DOMAIN`]
-//! here), and separated from each other by an index byte appended to the message. So a name's
-//! hop sequence and its filter bits are independent under the same shared key.
+//! Hop draws are separated from any other name-derivation under the same key by **XOR-ing a domain
+//! constant into the key** ([`HOP_KEY_DOMAIN`]), and separated from each other by an index byte
+//! appended to the message. So a name's hop sequence is independent of every other keyed derivation
+//! under the same shared key.
 
-use ndn_radio::mac::tier0::name_hash;
+use ndn_frame_io::siphash24;
+
+/// The #44 shared-keyspace keyed hash — formerly `mac::tier0::name_hash`. The in-frame filter that
+/// shared this primitive is retired; the hop plan keeps using the same keyed SipHash-2-4.
+fn name_hash(key: &[u8; 16], name: &[u8]) -> u64 {
+    siphash24(key, name)
+}
 
 /// Most carriers a hop table holds — the LR20xx `WriteLrFhssHoppingTable` / `SetLoraHopping`
 /// limit, which `CMD_SET_HOP` pins as the wire bound too, and therefore the cap on any plan this
@@ -82,9 +86,9 @@ use ndn_radio::mac::tier0::name_hash;
 /// gets a prefix — see [`HopPlan::truncated`].
 pub const MAX_HOP_COUPLES: usize = 40;
 
-/// Domain separator XOR-ed into the #44 group key so hop draws are an independent PRF
-/// evaluation from the Tier-0 Blur positions and the Fingerprint. Same construction as tier0's
-/// `KEY2_DOMAIN`; a different constant, so the two derivations cannot correlate.
+/// Domain separator XOR-ed into the #44 group key so hop draws are an independent PRF evaluation
+/// from every other keyed name-derivation under the same key; a distinct constant, so the
+/// derivations cannot correlate.
 pub const HOP_KEY_DOMAIN: [u8; 16] = *b"ndn/hop-plan\0\0\0\0";
 
 /// A name's hop table: an ordered, deterministic list of carriers (Hz) plus the period the radio

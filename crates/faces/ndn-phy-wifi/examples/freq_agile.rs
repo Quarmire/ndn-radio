@@ -40,8 +40,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let window_us = 50_000; // 50 ms CLM window per candidate
 
-    let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor(rendezvous_ch)?);
+    let backend = {
 
+        // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
+
+        // named at the call site — and keep the report instead of discarding it.
+
+        let d = Arc::new(LibUsbRtl88xxBackend::open()?);
+
+        d.bring_up_planned(rendezvous_ch, ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+
+        d
+
+    };
     // 1+2. SENSE + SELECT: one CLM scan → print the map, pick the clearest.
     // (`backend.pick_clear_channel(&candidates, window_us)` does steps 1+2 in one
     // call for real faces; here we scan inline so we can print the whole map.)

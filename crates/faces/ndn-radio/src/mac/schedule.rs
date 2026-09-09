@@ -51,10 +51,10 @@ pub struct SlotSchedule {
 /// lease for free; **#96 measured that stock 802.11 ignores our NAV**, which removes that channel
 /// and with it the free announcement the third class depended on.
 ///
-/// The remaining candidate is Tier-0: `addr1‖addr2` already carries the name's prefix-set filter, so
-/// a reserved class prefix could be tested by any receiver at zero extra frame bits. That is the
-/// path to the third class; it is not implemented, and inventing a class that nothing can observe
-/// would be another decided-but-unactuated field.
+/// The one candidate that could have carried it for free — the retired in-frame name filter in
+/// `addr1‖addr2` — is gone, so an overheard frame's class has no observation channel at all today.
+/// The third class is therefore not implemented; inventing a class that nothing can observe would be
+/// another decided-but-unactuated field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LeaseClass {
     /// Reserved lane, `L = 1`, never preempted and never preempting. Alarms, control, time beacons —

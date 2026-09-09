@@ -98,6 +98,13 @@ impl LinkFecFeature {
         self.tx.lock().unwrap().redundancy()
     }
 
+    /// Worst-generation **rank deficit** the decoder currently holds (`K - rank`; `0` = every
+    /// in-flight generation is decodable). The measured signal a face feeds to
+    /// `RadioControl::observe_rank_deficit` — the item-4 diversity producer.
+    pub fn rank_deficit(&self) -> f32 {
+        self.rx.lock().unwrap().rank_deficit()
+    }
+
     /// Retune R for **subsequent** generations, so a control plane can spend more or
     /// less airtime on parity as the medium and the demand set move.
     ///

@@ -39,7 +39,7 @@
 //! `phy_current` — the radio's own words, and the same struct that a PHY switch replaces
 //! wholesale.
 
-use crate::policy::Priority;
+use crate::policy::{NameContext, Priority};
 use crate::sense::{PhyMode, PhyModeSet};
 use std::sync::Mutex;
 
@@ -318,9 +318,16 @@ impl PhyDial {
     /// * `rssi_dbm` — the MEASURED weakest wanted-receiver RSSI, or `None`. Never a proxy.
     /// * `anchor_dbm` — the operating threshold of the reach PHY's *fastest* rung (today
     ///   `thresholds[SF7]`), which is what "the reach mode has margin to spare" means.
-    /// * `priority` — `Urgent` wants reach and never engages the rate mode; only `Bulk`
-    ///   (favour throughput) asks for it, matching how this crate already gates the 250 kHz
-    ///   bandwidth widening.
+    /// * `ctx` — the transmission's context, for its GRANTED class: `Urgent` wants reach and never
+    ///   engages the rate mode; only `Bulk` (favour throughput) asks for it, matching how this crate
+    ///   already gates the 250 kHz bandwidth widening.
+    ///
+    ///   ⚠ Takes the context rather than a bare [`Priority`] deliberately. This is a public entry
+    ///   point, and an asserted class here picks a **rendezvous parameter** — a modulation mismatch
+    ///   is deafness, not slowness — so a caller able to write `Priority::Urgent` could pin a link
+    ///   to the reach PHY on nothing but its own say-so. The in-tree caller always passed a real
+    ///   ceiling, so the hole was latent; it was still a hole, guarded by convention rather than by
+    ///   the signature. Same reasoning as `decide_adv_phy`.
     /// * `have_peer` — is any fresh receiver being heard right now (`receiver_count > 0`)?
     ///   The peer-silence escape hatch reads this.
     #[allow(clippy::too_many_arguments)]
@@ -330,12 +337,20 @@ impl PhyDial {
         declared: Option<PhyMode>,
         rssi_dbm: Option<i8>,
         anchor_dbm: f32,
-        priority: Priority,
+        ctx: &NameContext,
         have_peer: bool,
         now_ms: u64,
     ) -> (Option<PhyMode>, PhyHold) {
+        // `evaluate_inner` keeps the bare class: it is private, so it is not a surface anything can
+        // assert through. The gate belongs at the boundary, not scattered down the call chain.
         let out = self.evaluate_inner(
-            available, declared, rssi_dbm, anchor_dbm, priority, have_peer, now_ms,
+            available,
+            declared,
+            rssi_dbm,
+            anchor_dbm,
+            ctx.priority(),
+            have_peer,
+            now_ms,
         );
         self.state.lock().unwrap().last_hold = out.1;
         out
@@ -461,6 +476,20 @@ impl PhyDial {
 
 #[cfg(test)]
 mod tests {
+    use crate::policy::{ClassAuthority, ClassCeiling};
+
+    /// The tests reach a class the same way production does — through an authority. `evaluate` no
+    /// longer accepts a bare `Priority`, so there is no shortcut available here either; if one
+    /// appears, the gate has been reopened.
+    struct Granted(Priority);
+    impl ClassAuthority for Granted {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            self.0
+        }
+    }
+    fn granted(p: Priority) -> NameContext {
+        NameContext::new(0).with_ceiling(ClassCeiling::authorised(&Granted(p), 0))
+    }
     use super::*;
 
     /// An LR2021: LoRa + FLRC, booted in LoRa.
@@ -482,7 +511,7 @@ mod tests {
         peer: bool,
         t: u64,
     ) -> (Option<PhyMode>, PhyHold) {
-        d.evaluate(offer(), Some(PhyMode::Lora), rssi, ANCHOR, prio, peer, t)
+        d.evaluate(offer(), Some(PhyMode::Lora), rssi, ANCHOR, &granted(prio), peer, t)
     }
 
     /// Drive `d` onto the rate PHY with a decisive link, returning the instant the switch
@@ -544,7 +573,7 @@ mod tests {
                 Some(PhyMode::Lora),
                 Some(-20),
                 ANCHOR,
-                Priority::Bulk,
+                &granted(Priority::Bulk),
                 true,
                 i * 1000,
             );
@@ -557,7 +586,7 @@ mod tests {
             None,
             Some(-20),
             ANCHOR,
-            Priority::Bulk,
+            &granted(Priority::Bulk),
             true,
             1,
         );
@@ -579,6 +608,39 @@ mod tests {
         let (m, why) = eval(&d, Some(-50), Priority::Bulk, true, 10_000);
         assert_eq!(m, Some(PhyMode::Flrc));
         assert_eq!(why, PhyHold::Switched);
+    }
+
+    /// ★ **The class must be EARNED to change the outcome.**
+    ///
+    /// The test above proves a granted `Bulk` reaches the rate PHY on this evidence. Here the
+    /// evidence is byte-identical and the ONLY difference is that no authority granted anything, so
+    /// the context sits at the `Normal` floor and the dial never leaves the reach PHY.
+    ///
+    /// Before `evaluate` took a `NameContext`, a caller could write `Priority::Bulk` as a literal
+    /// and buy this switch outright — and the parameter it buys is a rendezvous one, where a
+    /// mismatch is deafness rather than slowness.
+    #[test]
+    fn an_unauthorised_context_cannot_buy_the_rate_phy() {
+        let d = dial();
+        let unauthorised = NameContext::new(0xAA);
+        assert_eq!(
+            unauthorised.priority(),
+            Priority::Normal,
+            "no authority ⇒ the floor"
+        );
+        for i in 1..60u64 {
+            let (m, why) = d.evaluate(
+                offer(),
+                Some(PhyMode::Lora),
+                Some(-50),
+                ANCHOR,
+                &unauthorised,
+                true,
+                i * 100,
+            );
+            assert_eq!(m, Some(PhyMode::Lora), "never leaves the reach PHY");
+            assert_ne!(why, PhyHold::Switched, "and never reports a switch");
+        }
     }
 
     /// The deadband: a link parked between the engage and return margins never moves, however

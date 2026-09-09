@@ -85,6 +85,66 @@ pub struct ScannedFrame {
 /// The radio behind a [`BlePhy`]: broadcast a frame, and yield scanned
 /// frames. `next_scanned` has a single consumer (the face's reader task);
 /// `broadcast` may be called concurrently and must synchronise internally.
+/// The BLE advertising PHY — the bearer's **reach** lever.
+///
+/// This is a capability, not a tuning parameter: the choice changes *who can hear us at all*, not just
+/// how far. On BLE 5 only the extended advertising PDUs can select a PHY, so anything other than
+/// [`Le1M`](AdvPhy::Le1M) is invisible to a legacy-only controller no matter how strong the signal —
+/// which makes it the same worst-receiver question the Wi-Fi side answers when it drops to a legacy
+/// rate for a legacy-only neighbour.
+///
+/// MEASURED, one ESP32-C5 advertising to two receivers (an extended+coded-capable C5, and an RTL8720DN
+/// whose controller has no extended advertising at all):
+///
+/// | PHY | C5 | RTL8720DN |
+/// |-----|----|-----------|
+/// | `Le1M` | 11/20 | **20/20** |
+/// | `Le2M` | 15/20 | 0/20 |
+/// | `LeCoded` | **20/20** | 0/20 |
+///
+/// Note the coded gain shows up as *delivery*, not RSSI (−61 vs −63 dBm): S=8 buys decodability
+/// through coding gain, which is exactly the currency a broadcast bearer with no feedback wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AdvPhy {
+    /// 1 Msym/s uncoded. The only PHY every BLE receiver can hear, and the only one legacy
+    /// advertising can use — so it is the safe default and the fallback for a mixed neighbourhood.
+    #[default]
+    Le1M,
+    /// 2 Msym/s uncoded: half the airtime per advert, less range. Extended PDUs only.
+    Le2M,
+    /// Coded, S=8: roughly 2–4x range for the same power, at an eighth of the symbol rate.
+    /// Extended PDUs only. (S=2 is not selectable on the ESP32-C5 — that needs the v2 form of
+    /// `LE Set Extended Advertising Parameters`, which its controller does not implement.)
+    LeCoded,
+}
+
+impl AdvPhy {
+    /// The wire code cognition speaks: 1 = 1M, 2 = 2M, 3 = Coded.
+    ///
+    /// Cognition decides a *code*, not an `AdvPhy`, for the same reason it decides a `max_rx_mcs`
+    /// rather than an `McsDescriptor`: the decision belongs to the medium model and the encoding
+    /// belongs to the bearer, and inverting that would make the cognition crate depend on every
+    /// bearer it can reason about.
+    pub fn code(self) -> u8 {
+        match self {
+            AdvPhy::Le1M => 1,
+            AdvPhy::Le2M => 2,
+            AdvPhy::LeCoded => 3,
+        }
+    }
+
+    /// Map a cognition `ADV_PHY_*` code back to a PHY. Anything unrecognised becomes
+    /// [`AdvPhy::Le1M`] — the universal PHY, which is the only safe reading of a value we do not
+    /// understand, since the alternative silently excludes receivers.
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            2 => AdvPhy::Le2M,
+            3 => AdvPhy::LeCoded,
+            _ => AdvPhy::Le1M,
+        }
+    }
+}
+
 #[async_trait]
 pub trait AdvBackend: Send + Sync + 'static {
     /// Transmit `frame` as a BLE advertisement on the medium. Fire-and-forget,
@@ -94,6 +154,24 @@ pub trait AdvBackend: Send + Sync + 'static {
     /// Await the next advertisement heard on the medium. A node never hears its
     /// own transmissions (radios are half-duplex); the backend filters those.
     async fn next_scanned(&self) -> Result<ScannedFrame, FaceError>;
+
+    /// The advertising PHYs this bearer can transmit on. Default: [`AdvPhy::Le1M`] only — the
+    /// universally receivable one, which is the honest answer for a backend that has not been shown
+    /// to do more.
+    fn adv_phys(&self) -> &'static [AdvPhy] {
+        &[AdvPhy::Le1M]
+    }
+
+    /// Select the advertising PHY.
+    ///
+    /// Errors rather than silently ignoring an unsupported request: a reach lever that quietly does
+    /// nothing is worse than an absent one, because cognition then believes it has traded rate for
+    /// range and has not. Check [`adv_phys`](Self::adv_phys) first.
+    fn set_adv_phy(&self, _phy: AdvPhy) -> Result<(), FaceError> {
+        Err(FaceError::Io(std::io::Error::other(
+            "this BLE bearer exposes no advertising-PHY control",
+        )))
+    }
 }
 
 /// A connectionless BLE advertising face. Build a [`Face`] from it with

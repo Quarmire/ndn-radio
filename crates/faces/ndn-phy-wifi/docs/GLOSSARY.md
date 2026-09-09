@@ -1,3 +1,10 @@
+> # ⚠ PARTIALLY SUPERSEDED — the in-frame name filter is RETIRED.
+> Any mention below of the in-frame **name filter** (Blur / Tier-0 / fingerprint / GCS / NameGate)
+> describes a **removed** mechanism. Relevance is now decided by **parsing the NDN name** the frame
+> already carries. **Design of record: `firmware/NDR_MAC_SPEC.md`.** The non-filter material here
+> (temporal access, spectrum/multi-radio, link adaptation, the ephemeral-id addressing doctrine, the
+> single wireless face) remains current.
+
 # NDR MAC — Canonical Vocabulary
 
 **Status: normative.** This is the single source of truth for terminology in the Named Data Radio (NDR)
@@ -74,8 +81,28 @@ The exact NFD name tree. **Correctness lives here alone**; Tiers 0/1 only ever o
 - **Tier-0 layout:** `addr1[0..6] ‖ addr2[0..6] ‖ addr3[0..4]` = the 16-byte filter; `addr3[4]` = 8-bit
   ephemeral ID; `addr3[5]` = flags. `addr1` I/G+U/L bits forced to `0b11` (a no-ACK group marker).
 - **Legacy layout:** `addr1` = broadcast, `addr2` = 8-bit-ID + random, `addr3` = copy of dst.
+- ⚠ **`addr3` is `id ‖ flags` ONLY when `addr3 != addr1`.** The A-MSDU builder writes `addr3 = addr1`
+  and the base builder falls back to `addr3 = dst`; read raw, those shapes name a phantom ID
+  (`0xff` on a legacy broadcast, which also has `FLAG_ID_COLLISION` set). Guard: `tier0_id_flags`.
+- Flags byte (`addr3[5]`, fully allocated): bit 0 `FLAG_BODY_PREFIX`, bit 1 `FLAG_ID_COLLISION`,
+  bits 2–4 commitment-slice **index** (`0` = absent), bits 5–7 the slice's three bits.
 - Encoded as `InjectFrame { dst, src, addr3 }` / `CapturedFrame { group, addr, addr3 }`; pack at
   `medium.rs`.
+
+### Schedule commitment — **two carriers, different jobs; always say which**
+The `SchedParams::digest()` agreement pin (D2, incl. the #93 lease class). Do not write "the digest"
+unqualified; two things carry it and they do not cover the same nodes.
+- **beacon-carried** — the full **64 bits** on the time beacon, transmitted by the clock MASTER only
+  (`NDN_SCHED_MASTER=1`). Reader: `beacon_indicates_partition`. Covers a defecting master and any
+  reader's own misconfiguration. **Width.**
+- **piggybacked** (`FaceScheduler::class_commitment`) — a **21-bit XOR fold** of the same digest,
+  three bits per ordinary data frame in `addr3[5]` bits 2–7, round-robin over 7 slices. Every node
+  emits it, so a **non-master** defector is detectable by any neighbour that hears a round of its
+  traffic. Reader: `ClassCommitmentWatch`. **Coverage.**
+- Neither authenticates (FNV-1a is unkeyed, #44). The piggyback's 21 bits are forgeable instantly —
+  say "detects an honest misconfiguration", never "catches a defector".
+- A receiver's verdict is `Unknown` / `Agreeing { bits }` / `Divergent`; a half-collected round is
+  **never** a partition.
 
 ### "No host identity" doctrine
 Host *identity* is removed; the receive *filter* is kept but re-keyed host→content. No host MAC, no
@@ -196,8 +223,15 @@ offset_to_ref }` drives a network-time reference election (#75); a beacon carrie
 multi-hop composition (`MeshCv.belief`). Defined in `ndn-time`.
 
 ### "beacon" — **six senses; always qualify**
-1. **time beacon** — the actual on-air timing frame: `TIME_BEACON_MAGIC = [0x7E,'T','B']`, 19 bytes
-   `ref_us ‖ map_digest`, injected raw, bypasses the slot-gate. `sched.rs`. **This is the only "beacon"
+1. **time beacon** — the actual on-air timing frame: `TIME_BEACON_MAGIC = [0x7E,'T','B']`, **21 bytes**
+   `MAGIC(3) ‖ ref_us(le64) ‖ map_digest(le64) ‖ params_version(le16)` (19 before the #93 lease-class
+   commitment; both parsers are length-tolerant, so an older node still reads the reference time and
+   the digest and ignores the tail). Injected raw, bypasses the slot-gate. ⚠ Only the clock MASTER
+   (`NDN_SCHED_MASTER=1`) transmits one, so beacon-based partition detection covers a defecting master
+   and misconfiguration seen by its readers — **not** a non-master defector. That gap is closed
+   elsewhere: the **schedule commitment** rides `addr3[5]` bits 2–7 of every node's ordinary data
+   frames (wire-format-spec §5.4a), three bits per frame. Coverage from the piggyback, width from the
+   beacon (21-bit fold vs the beacon's 64 bits). `sched.rs`. **This is the only "beacon"
    that exists as a live artifact.**
 2. **TimeToken** — a *design* concept (not built): an 8-byte field hardware would overwrite with the TX TSF
    at transmit, making *any* frame a timing reference. Not reachable on current silicon. `timing-rides-named-data.md`.

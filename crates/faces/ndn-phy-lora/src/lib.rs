@@ -46,8 +46,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use ndn_coding::link_fec_bridge::{GenerationSink, LinkFecBridge};
 pub use ndn_radio_cognition::TxParams;
-use ndn_radio_cognition::gcs::{BODY_PREFIX_TLV, GCS_MAX_BYTES, GcsFilter};
-use ndn_radio_cognition::name::{inner_name, ndn_name_to_slash};
 /// The bearer-agnostic frame-free occupancy sampler (#30), re-exported so a wiring site can
 /// attach one to this face without naming the cognition crate. It used to live in
 /// `ndn-phy-wifi`, which made a LoRa node depend on the *Wi-Fi* crate to sense its own
@@ -80,7 +78,7 @@ pub use ndn_radio_cognition::{parse_phy_mode, phy_mode_name};
 /// frame, whatever a radio declares.
 ///
 /// It is a ceiling, not the MTU: the MTU is
-/// `min(LORA_MTU, capability().max_payload) - gcs headroom` (see
+/// `min(LORA_MTU, capability().max_payload)` (see
 /// [`LoraPhy::send_mtu`]). Deliberately conservative — a serial-bridged sub-GHz
 /// radio caps a frame well under 255 B and the driver rejects an oversize `inject`,
 /// while the `RadioCapability::lora` preset optimistically declares 256. Taking the
@@ -88,13 +86,6 @@ pub use ndn_radio_cognition::{parse_phy_mode, phy_mode_name};
 /// firmware that truncates RX) is respected, and one that over-declares cannot push
 /// us past a budget measured on the wire.
 pub const LORA_MTU: usize = 200;
-
-/// Bytes the body-prefix GCS TLV puts *in front of* the packet (`[type][len][gcs]`).
-/// Reserved out of the MTU whenever [`with_gcs`](LoraPhy::with_gcs) is on, so a
-/// full-MTU LP fragment plus its filter still fits one frame — without this the
-/// largest fragments would be built to the un-reserved MTU and then rejected by the
-/// driver as oversize, which is invisible loss rather than an error.
-const GCS_HEADROOM: usize = 2 + GCS_MAX_BYTES;
 
 /// Source frames per FEC generation (K). Deliberately small for sub-GHz: at high
 /// spreading factors one frame is hundreds of ms of airtime, so a large K would
@@ -165,7 +156,7 @@ impl GenerationSink for LoraFecSink {
                     dst: [0xff; 6],
                     src: [0x02, b'l', b'o', b'r', b'a', 0x00],
                     addr3: None,
-                    addr4: None,
+                    extra: None,
                     htc: None,
                 })
                 .await;
@@ -181,24 +172,6 @@ enum Egress {
     /// per generation. The bridge owns the batching/decode; this face reads the
     /// plan and feeds it in.
     Fec(LinkFecBridge<()>),
-}
-
-/// Config for the in-frame **body-prefix GCS** filter — the `FLAG_BODY_PREFIX` tier of the shared
-/// named-radio name-filter cascade (`wire-format-spec.md` §2a). The cascade places the prefix-set
-/// filter wherever a bearer has room: an **address-field** bearer packs a random-access Bloom into
-/// its address bytes; a **body-field** bearer with no address fields (LoRa, FLRC) carries a
-/// sequential-decode GCS in the frame body as a self-signaling TLV (`[BODY_PREFIX_TLV][len][gcs]`)
-/// prepended to the first LP fragment. Same #44 keyspace and zero-false-negative guarantee across
-/// both — only the encoding differs, chosen by what the bearer affords.
-///
-/// `key` is the shared SipHash key; `prefixes` are the `/`-joined names this face serves. The RX
-/// gate drops an incoming frame **only** when its GCS admits *none* of these — a `false` from
-/// [`GcsFilter::may_match`] is exact (zero false negatives), so a wanted frame is never dropped.
-pub struct GcsCfg {
-    /// Shared filter key (same keyspace as the Wi-Fi Blur and the receiver's BF-FIB).
-    pub key: [u8; 16],
-    /// `/`-joined prefixes this face serves; empty ⇒ the gate keeps everything (filter-off).
-    pub prefixes: Vec<Vec<u8>>,
 }
 
 /// What the radio says about its own rate axis — the read that keeps this PHY
@@ -295,7 +268,7 @@ pub struct LoraPhy {
     /// modulation would go on fragmenting to the *old* MTU and hand the driver frames it now
     /// rejects — invisible loss rather than an error.
     cap: RwLock<Option<RadioCapability>>,
-    /// Derived from `cap` + the GCS headroom — see [`LORA_MTU`]. Recomputed whenever `cap` is,
+    /// Derived from `cap` — see [`LORA_MTU`]. Recomputed whenever `cap` is,
     /// so the two can never disagree about the frame size.
     mtu: AtomicUsize,
     egress: Egress,
@@ -305,10 +278,6 @@ pub struct LoraPhy {
     /// `link_fec_redundancy` drives the FEC bridge; the LoRa `rate` block and the power
     /// fields drive [`RadioKnobs`] when one is attached.
     planned: Option<Arc<RwLock<Option<TxParams>>>>,
-    /// In-frame body-prefix GCS (`FLAG_BODY_PREFIX`). `None` ⇒ no filter framing on this bearer.
-    /// Applies to the plain (`Egress::Direct`) path only — a FEC generation's coded frames carry
-    /// no parseable name, so there is nothing to filter on before decode.
-    gcs: Option<GcsCfg>,
     /// Last values pushed through `knobs`, so an unchanged plan costs nothing.
     applied: Mutex<AppliedRate>,
     /// The named airtime lease's reach into this bearer: when may this wire go on air?
@@ -336,7 +305,6 @@ impl LoraPhy {
             egress: Egress::Direct,
             pending: Mutex::new(VecDeque::new()),
             planned: None,
-            gcs: None,
             applied: Mutex::new(AppliedRate::default()),
             slot_gate: None,
         }
@@ -385,8 +353,8 @@ impl LoraPhy {
     }
 
     /// The control seam, for a caller wiring something this face does not do itself — a
-    /// frame-free occupancy sampler (`read_channel_activity`), a channel plan, a Tier-0
-    /// on-device name filter. `None` when the radio has no reachable knobs.
+    /// frame-free occupancy sampler (`read_channel_activity`), or a channel/hop plan. `None` when
+    /// the radio has no reachable knobs.
     pub fn knobs(&self) -> Option<Arc<dyn RadioKnobs>> {
         self.knobs.clone()
     }
@@ -547,11 +515,8 @@ impl LoraPhy {
             .ok()
             .and_then(|c| c.as_ref().map(|c| c.max_payload))
             .unwrap_or(LORA_MTU);
-        let head = if self.gcs.is_some() { GCS_HEADROOM } else { 0 };
-        self.mtu.store(
-            LORA_MTU.min(declared).saturating_sub(head).max(1),
-            Ordering::Relaxed,
-        );
+        self.mtu
+            .store(LORA_MTU.min(declared).max(1), Ordering::Relaxed);
     }
 
     /// **Re-read the radio's self-description and replace what we hold** — the mandatory
@@ -614,20 +579,6 @@ impl LoraPhy {
     /// a plain face should do with a plan it cannot act on.
     pub fn with_planned_params(mut self, cell: Arc<RwLock<Option<TxParams>>>) -> Self {
         self.planned = Some(cell);
-        self
-    }
-
-    /// Enable the in-frame **body-prefix GCS** filter (`FLAG_BODY_PREFIX`). On TX, the first LP
-    /// fragment's name is compiled into a GCS and prepended as a self-signaling TLV; on RX, a frame
-    /// carrying one is dropped iff its filter admits *none* of `prefixes` (exact — zero false
-    /// negatives). `key` is the shared #44 SipHash key. Applies to the plain (`Egress::Direct`)
-    /// path only — see [`GcsCfg`].
-    ///
-    /// Lowers the MTU by the filter's worst-case width so a full fragment plus its TLV
-    /// still fits one frame.
-    pub fn with_gcs(mut self, key: [u8; 16], prefixes: Vec<Vec<u8>>) -> Self {
-        self.gcs = Some(GcsCfg { key, prefixes });
-        self.recompute_mtu();
         self
     }
 
@@ -900,8 +851,12 @@ impl LoraPhy {
             && cur.power_idx != Some(idx)
             && !cur.refused.power_idx
         {
-            match knobs.set_tx_power(idx as u32) {
-                Ok(()) => cur.power_idx = Some(idx),
+            match knobs.set_tx_power(ndn_radio_hal::PowerRequest::index(idx)) {
+                // ⚠ Dedupe on the REQUEST (`idx`), not on what the radio reported applying: on
+                // this bearer the "index" is dBm in disguise and the node clamps it into its
+                // declared range, so the applied value routinely differs and caching it would
+                // re-push a write every tick forever.
+                Ok(_applied) => cur.power_idx = Some(idx),
                 Err(e) => {
                     cur.refused.power_idx = is_unsupported(&e);
                     tracing::warn!(target: "named_radio", face = self.id.0, idx, error = %e, "lora set_tx_power failed")
@@ -910,9 +865,12 @@ impl LoraPhy {
         }
 
         // Listen-before-talk: on this bearer `edcca_ignore` maps to the firmware LBT toggle.
-        if cur.edcca_ignore != Some(tp.edcca_ignore) && !cur.refused.edcca {
-            match knobs.set_edcca_ignore(tp.edcca_ignore) {
-                Ok(()) => cur.edcca_ignore = Some(tp.edcca_ignore),
+        if tp.edcca_ignore() {
+            ndn_radio_cognition::ledger::note_edcca_ignored();
+        }
+        if cur.edcca_ignore != Some(tp.edcca_ignore()) && !cur.refused.edcca {
+            match knobs.set_edcca_ignore(tp.edcca_ignore()) {
+                Ok(()) => cur.edcca_ignore = Some(tp.edcca_ignore()),
                 Err(e) => {
                     cur.refused.edcca = is_unsupported(&e);
                     tracing::warn!(target: "named_radio", face = self.id.0, error = %e, "lora set_edcca_ignore failed")
@@ -1026,56 +984,6 @@ impl LoraPhy {
         }
     }
 
-    /// TX: if a GCS is configured and `wire` is a first fragment carrying a name, prepend the
-    /// self-signaling `[BODY_PREFIX_TLV][len][gcs]` header; otherwise pass the wire through
-    /// untouched (a continuation fragment or nameless frame carries no filter — and must not, or a
-    /// receiver would gate it against a filter it can't recompute).
-    fn body_prefix_prepend(&self, wire: Bytes) -> Bytes {
-        let Some(cfg) = self.gcs.as_ref() else {
-            return wire;
-        };
-        let Some(name_tlv) = inner_name(&wire) else {
-            return wire;
-        };
-        let name = ndn_name_to_slash(name_tlv);
-        let filter = GcsFilter::from_name(&cfg.key, &name);
-        let mut gcs = [0u8; GCS_MAX_BYTES + 1];
-        let n = filter.to_wire(&mut gcs);
-        let mut out = Vec::with_capacity(2 + n + wire.len());
-        out.push(BODY_PREFIX_TLV);
-        out.push(n as u8);
-        out.extend_from_slice(&gcs[..n]);
-        out.extend_from_slice(&wire);
-        Bytes::from(out)
-    }
-
-    /// RX: the body-prefix gate. Returns `Some(inner)` to deliver (TLV stripped if present), `None`
-    /// to drop. Fail-open at every ambiguity — no GCS configured, no TLV on the frame, or a
-    /// malformed TLV header all deliver the frame unchanged; a frame is dropped **only** on a
-    /// well-formed filter that provably admits none of the registered prefixes, so a parse slip can
-    /// never manufacture a false negative (the forbidden failure).
-    fn body_prefix_gate(&self, payload: Bytes) -> Option<Bytes> {
-        let Some(cfg) = self.gcs.as_ref() else {
-            return Some(payload);
-        };
-        if payload.first() != Some(&BODY_PREFIX_TLV) {
-            return Some(payload); // no filter on this frame — keep it
-        }
-        // Parse [type][len][gcs]; on any malformed header, fail OPEN (keep the frame).
-        let parsed = (|| {
-            let len = *payload.get(1)? as usize;
-            let gcs = payload.get(2..2 + len)?;
-            Some((GcsFilter::from_wire(gcs), 2 + len))
-        })();
-        let Some((filter, off)) = parsed else {
-            return Some(payload);
-        };
-        if cfg.prefixes.is_empty() || cfg.prefixes.iter().any(|p| filter.may_match(&cfg.key, p)) {
-            Some(payload.slice(off..))
-        } else {
-            None // provably none of our prefixes — safe to drop
-        }
-    }
 }
 
 impl Transport for LoraPhy {
@@ -1109,17 +1017,17 @@ impl Transport for LoraPhy {
         self.actuate_planned();
         match &self.egress {
             Egress::Direct => {
-                // WHEN before WHAT: the gate reads the *wire* (where the NDN name is), not the
-                // GCS-prefixed payload, so the lease keys on the same name the receiver filters on.
+                // WHEN before WHAT: the slot gate reads the *wire* (where the NDN name is), so the
+                // lease keys on the frame's own name.
                 let timing = self.slot_gate.as_ref().and_then(|g| g(&wire));
                 self.inject_scheduled(
                     InjectFrame {
-                        payload: self.body_prefix_prepend(wire),
+                        payload: wire,
                         tx: TxIntent::CONSERVATIVE,
                         dst: [0xff; 6],
                         src: [0x02, b'l', b'o', b'r', b'a', 0x00],
                         addr3: None,
-                        addr4: None,
+                        extra: None,
                         htc: None,
                     },
                     timing,
@@ -1135,7 +1043,23 @@ impl Transport for LoraPhy {
             // generation boundary. Gating this call would delay the enqueue and leave the
             // actual transmission ungated — a lease that looks enforced and is not. Gating a
             // FEC generation belongs in the sink, and is not claimed here.
-            Egress::Fec(bridge) => bridge.send(wire, (), self.planned_redundancy()),
+            // A parity budget larger than the generation is COUNTED, not clamped — the same
+            // decision, for the same reason, as the Wi-Fi face's `inject_with_intent`: R > K is a
+            // legitimate high-loss configuration, the codec already caps `K + R <= 255`, and the
+            // tighter `R <= K` is the POLICY's own ceiling rather than a physical one. What the
+            // face can honestly do is make a budget cognition could not have produced visible.
+            Egress::Fec(bridge) => {
+                let parity = self.planned_redundancy().inspect(|&want| {
+                    // Counted, not warned: the policy's ceiling is `PolicyConfig::generation_k`,
+                    // this is THIS face's generation, and nothing ties them — a face built with a
+                    // smaller K (K=1 is repetition) makes every legitimate plan trip it. See the
+                    // same site in `ndn-phy-wifi/src/medium.rs` for the full reasoning.
+                    if want > bridge.generation_size() {
+                        ndn_radio_cognition::ledger::note_fec_parity_over_generation();
+                    }
+                });
+                bridge.send(wire, (), parity)
+            }
         }
     }
 
@@ -1145,16 +1069,12 @@ impl Transport for LoraPhy {
 
     async fn recv_bytes_with_addr(&self) -> Result<(Bytes, Option<FaceAddr>), FaceError> {
         match &self.egress {
-            // Read until a frame passes the body-prefix gate. A frame provably not under any
-            // registered prefix is dropped here (before the engine sees it); a frame with no filter
-            // TLV, or one that may match, is delivered with its TLV stripped.
-            Egress::Direct => loop {
+            // Deliver every captured frame; relevance is decided by parsing the NDN name upstream
+            // (the in-frame body-prefix filter is retired — see firmware/NDR_MAC_SPEC.md).
+            Egress::Direct => {
                 let cf = self.radio.recv_frame().await?;
-                let addr = cf.addr;
-                if let Some(inner) = self.body_prefix_gate(cf.payload) {
-                    return Ok((inner, addr.map(FaceAddr::Ether)));
-                }
-            },
+                Ok((cf.payload, cf.addr.map(FaceAddr::Ether)))
+            }
             // Feed each captured frame through the FEC decoder; source frames come
             // back immediately, parity recovers missing ones (0/1/many per frame).
             // Buffer the extras and drain across calls.
@@ -1254,70 +1174,6 @@ mod tests {
             .expect("plain face delivers")
             .unwrap();
         assert_eq!(&b[..], b"hello-lora");
-    }
-
-    /// The body-prefix GCS gate (`FLAG_BODY_PREFIX`): TX prepends the self-signaling TLV; RX keeps a
-    /// frame whose filter admits a registered prefix (zero-FN ⇒ a true prefix always matches),
-    /// drops one that admits none, and strips the TLV on delivery. A frame with no TLV is never
-    /// dropped (fail-open). Proves the filter derives the name through the shared cognition
-    /// primitive and agrees with the address-Blur keyspace (#44) without re-registration.
-    #[test]
-    fn body_prefix_gcs_gates_by_registered_prefix() {
-        // A bare Interest wire `0x05 { 0x07 { 0x08 comp … } }` for name `/a/b/c`; `inner_name` uses a
-        // headerless packet as-is, so no LP framing is needed to exercise the name path.
-        let key = *b"ndn/gcs-test-key";
-        let bus = LoopbackMonitorBus::new();
-        let radio = Arc::new(bus.endpoint(1, -60));
-
-        let wire = interest(&["a", "b", "c"]); // name /a/b/c
-        let sender = LoraPhy::new(FaceId(1), radio.clone()).with_gcs(key, vec![]);
-        let framed = sender.body_prefix_prepend(wire.clone());
-        assert_eq!(
-            framed.first(),
-            Some(&BODY_PREFIX_TLV),
-            "TX prepends the body-prefix TLV"
-        );
-        assert!(
-            framed.len() > wire.len(),
-            "the filter adds bytes ahead of the packet"
-        );
-
-        // A receiver serving /a/b keeps it (true prefix ⇒ match) and gets the packet TLV-stripped.
-        let keep = LoraPhy::new(FaceId(2), radio.clone()).with_gcs(key, vec![b"/a/b".to_vec()]);
-        assert_eq!(
-            keep.body_prefix_gate(framed.clone()),
-            Some(wire.clone()),
-            "a registered true prefix passes the gate; the TLV is stripped back to the packet"
-        );
-
-        // A receiver serving only /z/y drops it (provably not under any registered prefix).
-        let reject = LoraPhy::new(FaceId(3), radio.clone()).with_gcs(key, vec![b"/z/y".to_vec()]);
-        assert!(
-            reject.body_prefix_gate(framed).is_none(),
-            "no registered prefix can be under the carried name — the frame is dropped"
-        );
-
-        // A frame WITHOUT the TLV is always delivered (an un-filtered sender), never dropped.
-        assert_eq!(
-            keep.body_prefix_gate(wire.clone()),
-            Some(wire),
-            "a frame carrying no body-prefix TLV is never dropped (fail-open)"
-        );
-    }
-
-    /// A bare Interest wire for `comps` — no LP framing needed to exercise the name path.
-    fn interest(comps: &[&str]) -> Bytes {
-        let mut name = Vec::new();
-        for c in comps {
-            name.push(0x08u8);
-            name.push(c.len() as u8);
-            name.extend_from_slice(c.as_bytes());
-        }
-        let mut nt = vec![0x07u8, name.len() as u8];
-        nt.extend_from_slice(&name);
-        let mut it = vec![0x05u8, nt.len() as u8];
-        it.extend_from_slice(&nt);
-        Bytes::from(it)
     }
 
     /// A radio that declares itself and records every knob it is handed.
@@ -1485,14 +1341,6 @@ mod tests {
             "an over-declared 256 is capped to the face's measured ceiling, not believed"
         );
 
-        let filtered = LoraPhy::new(FaceId(4), io)
-            .with_profile(SpyRadio::with_cap(lora_cap(256)))
-            .with_gcs([7u8; 16], vec![b"/a".to_vec()]);
-        assert_eq!(
-            filtered.send_mtu(),
-            Some(LORA_MTU - GCS_HEADROOM),
-            "the body-prefix TLV's worst case is reserved out of the MTU"
-        );
     }
 
     /// **A knob the radio refuses is asked once, not once per frame.**
@@ -1936,7 +1784,7 @@ mod tests {
             .with_knobs(spy.clone())
             .with_profile(spy.clone());
 
-        let key = *b"ndn/wl-lora-gcs1";
+        let key = *b"ndn/wl-lora-key1";
         let carriers = carrier_grid(902_000_000, 928_000_000, 1_000_000);
         let plan = face
             .install_name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12)
@@ -2011,7 +1859,7 @@ mod tests {
         let face = LoraPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -60)))
             .with_knobs(spy.clone())
             .with_profile(spy.clone());
-        let key = *b"ndn/wl-lora-gcs1";
+        let key = *b"ndn/wl-lora-key1";
         let carriers = carrier_grid(902_000_000, 928_000_000, 1_000_000);
         let short = face
             .install_name_hop_plan(&key, b"/ndn/wl/svc", &carriers, 12)
@@ -2085,6 +1933,11 @@ mod tests {
                     tick_ns: 1_000,
                     monotonic: true,
                     read_now: true,
+                    // A scheduling fixture, not a radio: these tests exercise `tx_clock_domain`
+                    // and the absolute-TX gate, which key on `read_now`/`monotonic` and never on
+                    // the reference. `unknown()` keeps the fixture from asserting a fact it has no
+                    // business having.
+                    reference: ndn_radio_hal::ClockReference::unknown(),
                 })
                 .collect()
         }

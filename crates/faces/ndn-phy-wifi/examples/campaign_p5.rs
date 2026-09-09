@@ -7,9 +7,26 @@
 //!   (the access-delay metric the lanes bound) and prints max/mean/count.
 //! * `obs`  — receiver; counts heard frames per group (the delivery metric).
 //!
-//! Every node registers the same groups via `with_bloom_latency` — the P1 "one filter, one map"
-//! path, on air for the first time: frames carry Tier-0 filters, the RX gate and the scheduler
-//! both read them, `/alarm` is latency-class in every node's table.
+//! Every node registers the same groups via `with_lease_latency_authorised` — the P1 "one map"
+//! path, on air for the first time: the RX gate and the scheduler both attribute a frame by parsing
+//! its name, and `/alarm` is latency-class in every node's table because every node
+//! runs the SAME named lane policy (`CampaignLanePolicy`) rather than each asserting its own. Any
+//! node that disagrees is caught by the `SchedParams` class commitment, which every node here
+//! **piggybacks on its ordinary data frames** (`addr3[5]` bits 2–7, three bits per frame,
+//! wire-format-spec §5.4a) — so the check is live in this campaign even though it sets no
+//! `NDN_SCHED_MASTER` and therefore transmits no beacon. That was not true before: the commitment
+//! rode the time beacon only, so with no master **nothing was transmitted to catch a divergence**
+//! and the shared `CampaignLanePolicy` was the only thing keeping the arms honest.
+//!
+//! What to expect on air, and what NOT to claim from it:
+//! * a divergent neighbour trips a `schedule-map partition (piggybacked commitment)` warning after
+//!   ~2 of its data frames (mean 2.29), and within one 7-frame round with p = 1 - 2.4e-5;
+//! * silence is weak evidence early — a neighbour is `Unknown` until it has been heard, and
+//!   `Agreeing(n of 21)` until a full round has passed. Neither is "the maps match";
+//! * the fold is 21 bits, so this detects an HONEST misconfiguration. It is not a defence against a
+//!   node that patches its own digest, and must not be reported as one;
+//! * **A-MSDU carries no commitment** (the aggregate builder overwrites `addr3`), so if an arm ever
+//!   enables batching, its coverage drops with the un-aggregated fraction.
 //!
 //! ```sh
 //! # obs (o5p-1 881a)         # lat (o5p-2 8812au)        # bulk (o5p-0 a81a)
@@ -31,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use ndn_phy_wifi::{FaceId, OPEN_GROUP_KEY, RadioBearer, RadioId, RadioMediumFace};
+    use ndn_phy_wifi::{FaceId, RadioBearer, RadioId, RadioMediumFace};
     use ndn_radio_cognition::RadioCapability;
     use ndn_transport::Transport;
 
@@ -120,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(String::from_utf8_lossy(comps.get(2..2 + len)?).to_string())
     }
 
-    let open = ndn_radio_drivers::open_named_radio(pid, channel)?;
+    let open = ndn_radio_drivers::open_radio(pid, &ndn_radio_drivers::DeviceSelect::from_env(), &ndn_radio_drivers::BringUpRequest::from_env(channel))?;
     let cap = ndn_radio_cognition::RadioCapability::wifi_monitor_5ghz(vec![channel]);
     // TX power (claim-C prereg + bench power hygiene): TXAGC index via RadioKnobs — clamped to the
     // B210-verified monotone range by the driver (061274c). Unset = calibrated default.
@@ -128,14 +145,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok());
     if let (Some(idx), Some(knobs)) = (txpwr, open.knobs.as_ref()) {
-        knobs.set_tx_power(idx)?;
+        // ★ Print the APPLIED power beside the campaign's own header. A campaign number recorded
+        // without its power reference is not reproducible: on the RTL8812AU the same index spans
+        // ~18-33 dB depending on which regime the bring-up left the radio in.
+        let applied = knobs.set_tx_power(ndn_radio_hal::PowerRequest::index(idx.min(255) as u8))?;
+        println!("tx power: {}", applied.render());
     }
+    // ★ The bring-up regime this campaign ran in, printed beside its results. `plan_digest` is what
+    // makes two campaign runs comparable — or visibly not.
+    println!("{}", open.report().render());
     // OBS is raw-only: no medium, no second recv_frame consumer (the batch-1 half-split lesson).
     let raw_rx: Option<std::sync::Arc<dyn ndn_radio_hal::FrameIo>> = if role == "obs" {
         Some(open.io.clone())
     } else {
         None
     };
+    /// **The campaign's lane policy, named** (#93). `/alarm` is the one prefix authorised to reach
+    /// the reserved lanes, and every role in this campaign runs this same policy — which is the
+    /// premise the shared slot map rests on and, until the class commitment landed, the premise
+    /// nothing checked. Deliberately a `ClassAuthority` and not a slice literal: a permissive impl
+    /// is still four lines, but they are four lines `grep impl ClassAuthority` finds.
+    struct CampaignLanePolicy;
+    impl ndn_radio_cognition::ClassAuthority for CampaignLanePolicy {
+        fn ceiling_for(&self, prefix_hash: u64) -> ndn_radio_cognition::Priority {
+            // Keyed on the slot-group hash the table's entries already carry (#44 keyspace), so the
+            // authority answers about the MAP's key rather than about a string.
+            if prefix_hash == ndn_radio_cognition::prefix_hash(&[b"alarm".as_slice()]) {
+                ndn_radio_cognition::Priority::Urgent
+            } else {
+                ndn_radio_cognition::Priority::Normal
+            }
+        }
+    }
+
     let medium = if role == "obs" {
         None
     } else {
@@ -144,14 +186,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 FaceId(1),
                 vec![RadioBearer::from_open(RadioId(0), open, cap)],
             )
-            .with_bloom_latency(
-                &OPEN_GROUP_KEY,
+            .with_lease_latency_authorised(
                 &[
                     b"/bulk".as_slice(),
                     b"/alarm".as_slice(),
                     b"/light".as_slice(),
                 ],
                 &[b"/alarm".as_slice()],
+                &CampaignLanePolicy,
             )
             .build(),
         ))
@@ -234,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             dst: ndn_radio_hal::BROADCAST,
                             src,
                             addr3: None,
-                            addr4: None,
+                            extra: None,
                             htc: None,
                         };
                         let _ = io.inject(f).await;

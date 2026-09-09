@@ -13,12 +13,8 @@
 //! | **WHERE** | two radios on different channels use decorrelated schedules |
 //! | **HOW-WELL** | reliability maps monotonically to robustness; HE reach levers are gated on capability |
 
-use ndn_phy_wifi::tier0::{self, PrefixFilter};
 use ndn_radio_cognition::{LeaseClass, SlotSchedule, prefix_hash};
 use ndn_radio_hal::{McsDescriptor, Reliability, TxIntent};
-
-/// Fixed Tier-0 domain key for the suite (mask + filter must be built with the same key).
-const KEY: [u8; 16] = *b"ndn/tier0-suite!";
 
 /// Deterministic splitmix64 — reproducible corpora with no `rand` dependency.
 struct Rng(u64);
@@ -44,99 +40,6 @@ fn random_name(rng: &mut Rng, depth: usize) -> Vec<u8> {
         s.extend_from_slice(rng.below(1000).to_string().as_bytes());
     }
     s
-}
-
-/// The slash-form prefixes of a name, as tier0 enumerates them (root-first, capped at `MAX_DEPTH`).
-fn prefixes_of(name: &[u8]) -> Vec<Vec<u8>> {
-    let mut v = Vec::new();
-    tier0::for_each_prefix(name, |p| v.push(p.to_vec()));
-    v
-}
-
-// ─────────────────────────────────────────── WHO ───────────────────────────────────────────
-
-/// **WHO-1 — the filter NEVER false-negatives.** A receiver registered on any prefix `P` of a frame's name
-/// must admit that frame. This is the one guarantee that must be exact (over-accept is allowed; missing a
-/// frame under a registered prefix is a correctness bug). Checked over a corpus at every depth.
-#[test]
-fn who_filter_never_false_negatives() {
-    let mut rng = Rng(0xA11CE);
-    let mut checked = 0u64;
-    for _ in 0..2000 {
-        let depth = 1 + (rng.below(tier0::MAX_DEPTH as u64 - 1) as usize);
-        let name = random_name(&mut rng, depth);
-        let mut filter = PrefixFilter::new();
-        filter.insert_name(&KEY, &name);
-        for p in prefixes_of(&name) {
-            let mask = PrefixFilter::mask_for(&KEY, &p);
-            assert!(
-                filter.may_match(&mask),
-                "FALSE NEGATIVE: frame {:?} does not match its own registered prefix {:?}",
-                String::from_utf8_lossy(&name),
-                String::from_utf8_lossy(&p),
-            );
-            checked += 1;
-        }
-    }
-    assert!(checked > 5000, "corpus too small ({checked})");
-}
-
-/// **WHO-2 — over-admission is bounded.** A receiver registered on prefix `P` should admit a frame whose
-/// name is NOT under `P` only rarely (Bloom false positive). A broken filter (all-ones, or a match that
-/// ignores the bits) would admit ~100%; this asserts the empirical rate is far below that. The bound is
-/// generous (< 25%) so it is robust to parameter changes but still fails a degenerate filter.
-#[test]
-fn who_filter_over_admission_is_bounded() {
-    let mut rng = Rng(0xB0B);
-    let (mut trials, mut admits) = (0u64, 0u64);
-    for _ in 0..4000 {
-        // A frame under /ndn/<X>… and a receiver prefix under /ndn/<Y>… with X != Y — disjoint subtrees.
-        let (dn, dm) = (2 + rng.below(4) as usize, 2 + rng.below(4) as usize);
-        let name = random_name(&mut rng, dn);
-        let other = random_name(&mut rng, dm);
-        let p = prefixes_of(&other);
-        let recv = &p[2.min(p.len() - 1)]; // a mid-depth prefix of the *other* name
-        if name.starts_with(recv) {
-            continue; // by luck actually under P — not a negative case
-        }
-        let mut filter = PrefixFilter::new();
-        filter.insert_name(&KEY, &name);
-        if filter.may_match(&PrefixFilter::mask_for(&KEY, recv)) {
-            admits += 1;
-        }
-        trials += 1;
-    }
-    let fp = admits as f64 / trials as f64;
-    assert!(
-        fp < 0.25,
-        "over-admission rate {fp:.3} exceeds bound (k={}, m={}): filter is not discriminating",
-        tier0::K,
-        tier0::M_BITS
-    );
-}
-
-/// **WHO-3 — an over-full filter is inert (the §8.2 DoS guard).** A frame that packs more prefixes than the
-/// admission popcount `FILL_CAP` allows must match *nothing* — an attacker cannot force universal wake by
-/// stuffing the filter. Build a maximally-dense filter and assert a random receiver mask is rejected.
-#[test]
-fn who_over_full_filter_is_inert() {
-    // Insert many independent deep names into ONE filter to drive popcount past FILL_CAP.
-    let mut rng = Rng(0xDEAD);
-    let mut filter = PrefixFilter::new();
-    for _ in 0..40 {
-        filter.insert_name(&KEY, &random_name(&mut rng, tier0::MAX_DEPTH - 1));
-    }
-    let mut rejected = 0u64;
-    for _ in 0..200 {
-        let mask = PrefixFilter::mask_for(&KEY, &random_name(&mut rng, 3));
-        if !filter.may_match(&mask) {
-            rejected += 1;
-        }
-    }
-    assert_eq!(
-        rejected, 200,
-        "an over-full filter must reject all masks (popcount > FILL_CAP guard)"
-    );
 }
 
 // ────────────────────────────────────────── WHEN ───────────────────────────────────────────

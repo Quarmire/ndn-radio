@@ -1,3 +1,10 @@
+> # ⚠ PARTIALLY SUPERSEDED — the in-frame name filter is RETIRED.
+> Any mention below of the in-frame **name filter** (Blur / Tier-0 / fingerprint / GCS / NameGate)
+> describes a **removed** mechanism. Relevance is now decided by **parsing the NDN name** the frame
+> already carries. **Design of record: `firmware/NDR_MAC_SPEC.md`.** The non-filter material here
+> (temporal access, spectrum/multi-radio, link adaptation, the ephemeral-id addressing doctrine, the
+> single wireless face) remains current.
+
 # Named-radio MAC-addressing doctrine — the decision
 
 **Status: decided 2026-07-17.** This is the reference for what the named-radio link

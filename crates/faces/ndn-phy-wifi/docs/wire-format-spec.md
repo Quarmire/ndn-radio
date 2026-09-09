@@ -1,3 +1,10 @@
+> # ⚠ PARTIALLY SUPERSEDED — the in-frame name filter is RETIRED.
+> Any mention below of the in-frame **name filter** (Blur / Tier-0 / fingerprint / GCS / NameGate)
+> describes a **removed** mechanism. Relevance is now decided by **parsing the NDN name** the frame
+> already carries. **Design of record: `firmware/NDR_MAC_SPEC.md`.** The non-filter material here
+> (temporal access, spectrum/multi-radio, link adaptation, the ephemeral-id addressing doctrine, the
+> single wireless face) remains current.
+
 # Named-Data Radio MAC — On-Air Wire-Format Specification
 
 **Status: specification, read from the shipping code (2026-08-17).** This is the byte-level contract a
@@ -164,6 +171,11 @@ birthday bound):**
   signal on data it already sends; a node receiving that signal for its ID rotates. No dedicated frame —
   the signal rides existing traffic (the control-plane tenet: overhear / piggyback, never beacon).
 
+The **schedule commitment** (§5.4a) rides the same byte for the same reason. It did not, once: it was
+carried only on the time beacon, which one node per network transmits, so the check both violated this
+tenet and covered only that node. Both signals now ride ordinary data, which is what makes them
+fleet-wide.
+
 **Consumers key on the ID, never on host identity:** per-neighbour RSSI, per-source DoS token bucket, the
 neighbour-density count for the FEC pooling discount, and relay-vs-owner discrimination. All are soft
 state whose worst case under a residual alias is a merged RSSI estimate or an over-counted neighbour —
@@ -240,10 +252,88 @@ A new normative byte carrying per-frame options; `0x00` on a plain frame. Bit as
 |---|---|---|
 | 0 | `FLAG_BODY_PREFIX` | a ≤256-bit body-prefix filter TLV follows the LP header (§2a) |
 | 1 | `FLAG_ID_COLLISION` | piggybacked Detect-And-Rotate signal: "I overheard your ID aliased" (§4) |
-| 2–7 | reserved | MUST be 0; reserved for a wire version field |
+| 2–4 | commitment slice **index** | `0` = this frame carries no schedule commitment; `1..7` selects slice `idx−1` (§5.4a) |
+| 5–7 | commitment slice **payload** | the three bits of the sender's folded schedule commitment that the selected slice carries |
 
-The flags byte is what lets the 256-bit body tier and the DAR deconfliction signal ride existing frames
-without a flag-day — it is the versioning surface the frame layout otherwise lacks (§13).
+The byte is fully allocated. A future in-band frame version does **not** ride here — see §13; one spare
+bit could not say *what* changed in any case.
+
+The flags byte is what lets the 256-bit body tier, the DAR deconfliction signal and the schedule
+commitment ride existing frames without a flag-day.
+
+### 5.4a The piggybacked schedule commitment
+
+`ephemeral_id.rs` (`fold_commitment`, `encode_commitment_slice`, `ClassCommitmentWatch`);
+`sched.rs::FaceScheduler::class_commitment`.
+
+A node's `SchedParams::digest()` (§7/§9) is the 64-bit value two neighbours must agree on or their
+slot maps differ — including, since v2, the #93 lease-class assignment. It travelled **only on the
+time beacon**, which only the clock master transmits (`NDN_SCHED_MASTER=1`), so a non-master node
+that classified names differently put nothing on the air and no neighbour could detect it. That is
+also a violation of the control-plane tenet in §4 ("overhear / piggyback, never beacon"): the check
+leaned on the one dedicated frame the design forbids leaning on.
+
+**A 64-bit value cannot be reassembled from six bits at any split.** With `i` index bits and
+`b = 6 − i` payload bits, a self-indexing rolling slice needs `n = ⌈64/b⌉` slices and `i ≥ ⌈log₂ n⌉`;
+that inequality has no solution (`b=1` needs 6 index bits and has 5; `b=2` needs 5 of 4; … `b=5`
+needs 4 of 1). Every reassembling variant also inherits a mixed-epoch problem.
+
+**So nothing is reassembled — the frame carries a comparison, not a fragment.** A receiver never
+needs the neighbour's digest *value*; it needs the one-bit answer "is yours equal to mine?".
+
+```
+τ    = fold_commitment(SchedParams::digest())
+     = (D ^ (D>>21) ^ (D>>42) ^ (D>>63)) & 0x1F_FFFF        (21 bits; every bit of D reaches τ)
+idx  = addr3[5] bits 2..4                                    (0 = ABSENT; 1..7 select slice idx−1)
+bits = addr3[5] bits 5..7 = τ[3·(idx−1) .. 3·(idx−1)+3)
+```
+
+The sender round-robins `idx` 1→7 across its ordinary data frames. A receiver, per neighbour keyed on
+`addr3[4]`, computes *its own* τ and compares that slice. Each slice is compared on arrival and
+discarded; two slices are never combined, so **no value can be assembled out of two epochs** — there
+is no generation counter and no round boundary. The only cross-frame state is confidence.
+
+**`idx = 0` means "no commitment carried", and that is load-bearing.** Three senders emit it: a node
+on the pre-#93 wire (where this table said bits 2–7 MUST be 0), a DAR **hint** frame (whose
+`addr3[4]` is another node's ID, so a slice there would accuse an innocent node), and the
+`addr3 == addr1` shapes below. Reading `0` as data would report a divergence against the entire
+installed base.
+
+**What a receiver may report** — `Unknown` is not `Divergent`:
+
+| state | condition | reported as |
+|---|---|---|
+| `Unknown` | no slice seen (only `idx = 0`, or unheard) | *unjudged* — never a partition |
+| `Agreeing { bits }` | slices compared, none mismatched | *"agrees on N of 21 bits"* — never *"same map"* |
+| `Divergent` | ≥ 2 mismatching slices | the partition warning |
+
+A half-collected round MUST NOT report a partition: every neighbour begins half-collected, so the
+alternative trades a silent defect for a noisy false one across the whole fleet.
+
+⚠ **Not a defence against a deliberate defector.** τ is 21 bits. `class_digest` was widened 32 → 64
+precisely because an offline search forged a 32-bit collision in ~10 s, and 21 bits is forgeable
+instantly. What this catches is a neighbour whose configuration **honestly differs** — the real #93
+scenario. The master's beacon keeps the full 64-bit width. **Coverage from the piggyback, width from
+the beacon.**
+
+⚠ **`addr3` is not always `filter ‖ id ‖ flags`.** The A-MSDU builder writes `addr3 = addr1`
+(`build_amsdu`) and the base builder falls back to `addr3 = dst`. A receiver MUST ignore `addr3` for
+the ID, the DAR flag **and** the commitment when `addr3 == addr1` — an exact discriminator, since a
+real Tier-0 `addr3[0..4]` equals `addr1[0..4]` only by ~2⁻³² coincidence. It follows that an
+**aggregated frame carries no commitment and no ephemeral ID at all**; a deployment that batches
+everything falls back to beacon-only coverage.
+
+⚠ **Judged only for frames that pass the receiver's name gate.** The check sits with the DAR path,
+behind the §3 RX gate, so a neighbour whose traffic shares no registered prefix with the receiver is
+not judged by it. That is the same population whose slot placement can contend with the receiver's,
+but the claim is "every neighbour we hear *in our naming domain*", not "every neighbour".
+
+⚠ **Not carried on non-802.11 bearers.** LoRa and BLE have no address region and no flags byte;
+those bearers remain uncovered by this check.
+
+⚠ **Link-FEC replicates a slice, it does not advance it.** `addr3` is computed once per outbound
+object and the same pin is emitted on all `k+R` coded frames (`RadioFecSink::emit`), so at `k=4/R=2`
+a seven-slice round costs 42 airframes but still exactly 7 objects.
 
 ## 6. Reception report
 
@@ -283,8 +373,22 @@ collide with an NDN first byte (Interest `0x05`, Data `0x06`, LP `0x64`).
 off 0 : [3] MAGIC       = 7E 54 42
 off 3 : u64 ref_us       (LITTLE-endian, the master's monotonic reference time in µs)
 off 11: u64 map_digest   (LITTLE-endian, SchedParams::digest() — the shared schedule pin, D2)
+off 19: u16 params_ver   (LITTLE-endian, SCHED_PARAMS_VERSION, in the CLEAR — added with the #93
+                          lease-class commitment so a version flag-day is distinguishable from a
+                          real lane-policy split; absent ⇒ "older than the version field")
 ```
-Total 19 bytes (`build_beacon`; `parse_beacon` returns `ref_us`, `parse_beacon_map_digest` the digest).
+Total **21 bytes** (was 19 before the #93 class commitment; `build_beacon`; `parse_beacon` returns
+`ref_us`, `parse_beacon_map_digest` the digest, `parse_beacon_params_version` the version). Both
+parsers are length-tolerant, so a pre-v2 node still reads the reference time and the digest and
+ignores the tail.
+
+⚠ **Only the clock master transmits a beacon** (`NDN_SCHED_MASTER=1`; the task is spawned behind
+`sched.is_master()`). So beacon-carried partition detection covers a defecting MASTER, and
+misconfiguration on any node that reads the master's beacon. It is **not** the fleet check — that is
+the piggybacked commitment of §5.4a, which every node sends on ordinary data. What the beacon still
+uniquely carries is **width**: the full 64-bit digest, where the piggyback carries a 21-bit fold.
+Coverage from the piggyback, width from the beacon. Nothing was removed from this frame: the beacon
+is the only path that establishes a shared timeline, and `ref_us` is what disciplines it.
 The beacon is injected **raw** — it MUST NOT pass through the slot gate, so the clock signal never waits
 on a data slot — and is suppressed on RX as non-NDN. The receiver derives the common-view offset from
 `ref_us` plus the hardware RX timestamp (`ingest_common_view`), and a network-time stratum/reference
@@ -400,6 +504,11 @@ remain **unversioned** and are pinned by the golden vectors (§12); a change to 
 MUST bump the golden vectors in lockstep across all implementations. A future
 in-band frame version would most naturally ride a reserved EtherType or an LP header TLV, neither of which
 is allocated today.
+
+§5.4 used to earmark flags bits 2–7 "for a wire version field". That earmark is **retired**: it
+contradicted this section (which never planned to use them), and one or two spare bits cannot version
+a byte anyway — there is no room to say *what* changed. Those bits now carry the schedule-commitment
+slice (§5.4a) and the byte is fully allocated; the escape hatch is the EtherType / LP TLV above.
 
 ## 14. Not specified here
 

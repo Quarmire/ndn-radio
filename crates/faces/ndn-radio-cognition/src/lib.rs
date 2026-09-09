@@ -45,8 +45,15 @@
 //! — feeding the bus from PIT/CS/CCLF and driving the face actuators — lives in the
 //! `LinkServiceFeature` seam, **not** here, so the logic stays unit-testable and
 //! face-agnostic.
+//!
+//! One documented carve-out: [`spawn_occupancy_sampler`] polls a radio's frame-free
+//! activity counter on a background task, so it needs a runtime. It is here rather than in
+//! a PHY crate because it is **bearer-agnostic** — it speaks only `RadioKnobs` and the sense
+//! bus, and putting it in `ndn-phy-wifi` forced a LoRa PHY to depend on the Wi-Fi crate to
+//! sense its own channel. It is gated behind the default `occupancy-sampler` feature; take
+//! `default-features = false` for the pure, runtime-free core.
 
-pub use ndn_radio::mac::{coop, dos, ephemeral_id, gcs, name, prefix_hash, schedule};
+pub use ndn_radio::mac::{coop, dos, ephemeral_id, name, prefix_hash, schedule};
 mod calibrate;
 mod contextual;
 mod demand;
@@ -68,25 +75,34 @@ pub use contextual::{
     reward,
 };
 pub use demand::DemandTracker;
+/// The name-keyed hop plan (#40) — a `(channel, dwell)` table derived from a name under the
+/// shared #44 keyspace, for a radio whose modem walks a hop table itself. See `src/hop.rs`.
 pub use hop::{HOP_KEY_DOMAIN, HopPlan, MAX_HOP_COUPLES, carrier_grid, name_hop_plan};
 #[cfg(feature = "occupancy-sampler")]
 pub use occupancy::spawn_occupancy_sampler;
+/// Frame-free occupancy sensing (#30) — bearer-agnostic, so a LoRa/BLE PHY reaches it
+/// without depending on the Wi-Fi crate. `spawn_occupancy_sampler` needs the
+/// `occupancy-sampler` feature (default on); the pure parts never do.
 pub use occupancy::{OccupancySink, activity_rate};
+/// The modulation axis — `SetPacketType` as a knob cognition decides, with the hysteresis that
+/// makes a PHY switch a rare, deliberate, reversible move. See `src/phy.rs`.
 pub use phy::{
     PhyDial, PhyDialConfig, PhyHold, PhyRole, fastest_phy, parse_phy_mode, phy_mode_name,
     phy_peak_bps, phy_role, ranked_phys, rendezvous_phy,
 };
 pub use plan::{
-    AllocRole, DataPlaneConfig, LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan,
-    RateParams, TxParams, WifiRate, mcs_base_rate_mbps,
+    AllocRole, Contention, DEFER_HYSTERESIS_MAX_DB, DEFER_THRESHOLD_DBM_BAND, DataPlaneConfig,
+    LoraRate, RadioActuators, RadioAllocation, RadioError, RadioPlan, RateParams, TxParams,
+    WifiRate, clamp_defer_threshold, ledger, mcs_base_rate_mbps,
 };
 pub use policy::{
+    ClassAuthority, ClassCeiling, DemandRank,
     DecisionRationale, NameContext, PolicyConfig, Priority, RadioPolicy, RadioRationale,
-    SuppressReason,
+    SuppressReason, decide_adv_phy,
 };
 pub use report::{
-    FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC, ReceptionReport,
-    SINGLE_STREAM_HT_RX_MCS, decode_report, encode_report,
+    ADV_PHY_1M, ADV_PHY_2M, ADV_PHY_CODED, FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC,
+    ReceptionReport, SINGLE_STREAM_HT_RX_MCS, decode_report, encode_report,
 };
 pub use schedule::{HopSchedule, LeaseClass, SlotSchedule, wifi_airtime_us};
 pub use sense::{
@@ -99,4 +115,3 @@ pub use strategy::RadioStrategy;
 /// Re-exported so the `LinkServiceFeature` can translate the face's decoded
 /// `LinkSignals` into [`MediumState::observe_rx`] inputs.
 pub use ndn_signals_core::LinkSignals;
-

@@ -1,3 +1,10 @@
+> # ⛔ RETIRED — the in-frame name filter is dropped from the design.
+> This document designs the in-frame **name filter** (Blur / Tier-0 / fingerprint / GCS). That
+> mechanism has been **removed**. Relevance is now decided by **parsing the NDN name** the frame
+> already carries (off-host where the radio keeps up, host-fallback where it doesn't).
+> **Design of record: `firmware/NDR_MAC_SPEC.md`.** This file is kept only as the historical record
+> that led to retiring the filter — see `reports/ndr-mac-report/REPORT.md` for the measured evidence.
+
 # Name filtering and the NDR MAC — redesign
 
 *Design note, 2026-08-05. Sits under [mac-addressing-doctrine](./mac-addressing-doctrine.md) and
@@ -352,7 +359,7 @@ H3 at first, then `siphash24` per the amended hash decision in §3.1.
 > distribution — FNV-1a `prefix_hash`. (c) The **PIT key** is process-local and never leaves the node
 > — `DefaultHasher` is fine and forcing it into a shared family buys nothing. What actually must be
 > SHARED is not the hash function: it is the **name normalization** — the `/`-joined rendering,
-> `ndn_name_to_slash`; three renderings existed and are now pinned by a test in `tier1.rs` — and the
+> `ndn_name_to_slash`; three renderings existed and are now pinned by a test in `name_tables.rs` — and the
 > **granularity source**. Collapsing them onto one hash was solving the wrong invariant. The §3.1
 > `siphash24` decision is unchanged; its scope is the wire filter and `EphemeralSource`, not "every
 > consumer".

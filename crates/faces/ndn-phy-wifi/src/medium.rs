@@ -35,11 +35,10 @@
 //! subset the `RadioPlan` selects, honouring per-radio channel) remains a follow-up; the
 //! abstraction (one face, N capabilities, union RX, fan-out TX) is complete here.
 //!
-//! The feature gap versus [`WifiPhy`] that this note used to describe is closed (#82):
-//! name-group addressing and link-FEC arrived earlier, the shared [`NameGate`](crate::NameGate)
-//! landed in part 1, and A-MSDU — the last genuinely one-sided feature — landed in part 2. What
-//! remains of #82 is the structural half: `WifiPhy` becoming a one-bearer construction of
-//! this face rather than a parallel implementation of it.
+//! The feature gap versus [`WifiPhy`] that this note used to describe is closed (#82): the named
+//! airtime lease and link-FEC arrived earlier, and A-MSDU — the last genuinely one-sided feature —
+//! landed in part 2. What remains of #82 is the structural half: `WifiPhy` becoming a one-bearer
+//! construction of this face rather than a parallel implementation of it.
 
 use portable_atomic::AtomicU64;
 use std::collections::HashMap;
@@ -53,7 +52,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::RadioControl;
-use ndn_radio_cognition::ephemeral_id::IdDeconfliction;
+use ndn_radio_cognition::ephemeral_id::{ClassCommitmentWatch, IdDeconfliction};
 use ndn_radio_cognition::{NameContext, RadioActuators, RadioAllocation, RadioError};
 use ndn_signals_core::{LinkSignals, NodeSignals, SignalStore, SignalView};
 use ndn_transport::link_service::{LinkServiceFeature, LpLinkService};
@@ -157,7 +156,7 @@ pub struct RadioBearer {
     ///
     /// Per-bearer, not per-face, because that is the shape the MAC needs: a multi-radio node has one
     /// clock per radio, and a slot gate that consults a face-level clock is deciding for the wrong
-    /// medium (#89). Absent until now only because [`open_named_radio`] could not return it.
+    /// medium (#89). Absent until now only because the pre-M8 opener could not return it.
     pub time: Option<Arc<dyn RadioTime>>,
     /// The bearer's self-description — declared capability and calibration (#78).
     ///
@@ -204,7 +203,7 @@ impl RadioBearer {
 
     /// **A bearer from the standardized opener** (#78) — the capability-complete path.
     ///
-    /// `open_named_radio` returns everything the backend implements; this carries all of it onto the
+    /// `open_radio` returns everything the backend implements; this carries all of it onto the
     /// bearer in one call. Before this existed, a caller wanting knobs or timing had to bypass the
     /// standardized opener and name a concrete backend, which is precisely the leak the opener was
     /// created to close — it had fixed the on-air FORMAT leak and left the CAPABILITY leak open.
@@ -363,7 +362,10 @@ impl SignalStore<FaceId> for LinkSignalStore {
 /// BOTH actuator paths ([`MediumActuator`] and `LibUsbActuator`) via [`apply_knobs`],
 /// so a knob wired into one is never forgotten in the other — the divergence that once
 /// dropped absolute-dBm power on the libusb backend and forced two copies of every dial.
-#[derive(Default, Clone, Copy, PartialEq)]
+// ⚠ No longer `Copy`: `applied_power` owns an `AppliedPower`, which carries the list of registers
+// the driver actually wrote. That list is the thing that distinguishes a fused-base write from a
+// raw one, so it is worth the clone.
+#[derive(Default, Clone, PartialEq)]
 pub(crate) struct AppliedKnobs {
     channel: Option<(u8, u8)>, // (channel, bw_code)
     csd: Option<bool>,
@@ -377,6 +379,11 @@ pub(crate) struct AppliedKnobs {
     /// computing path loss from a power we never transmitted at gets a wrong answer and no way to
     /// notice. See `ReceptionReport::tx_power_dbm`.
     pub(crate) applied_dbm: Option<i8>,
+    /// ★ What the radio said it APPLIED for `power`, including the resolved `PowerReference`.
+    /// Not a dedupe key (that is `power`, the request) — this is the record that tells an operator
+    /// which power regime the node is actually in, and it is the field whose absence made the
+    /// 2026-09-03 bug invisible from above the driver.
+    applied_power: Option<ndn_radio_hal::AppliedPower>,
     rx_gain: Option<ndn_radio_hal::RxGain>,
     edcca_thresh: Option<(i8, i8)>,
     sf: Option<u8>,  // LoRa spreading factor
@@ -393,8 +400,44 @@ pub(crate) fn apply_knobs(
     last: &mut AppliedKnobs,
     knobs: &dyn RadioKnobs,
     alloc: &RadioAllocation,
+    cap: Option<&RadioCapability>,
 ) -> Result<(), FaceError> {
     let p = &alloc.params;
+
+    // ★ **Bound TX power to the radio's declared range before it reaches a knob.** Both forms are
+    // escalations — "pin the part at maximum" is the loudest thing on the chip — and `RadioPolicy`
+    // clamps both to this same capability, so anything outside it did not come from cognition.
+    // Counted, not merely clamped: `ledger::tx_power_clamped` is what an operator compares the
+    // `radio.N.tx_power` reading against. `cap = None` ⇒ no declared band ⇒ no bound and no count,
+    // stated rather than faked.
+    let mut p = p.clone();
+    if let Some(c) = cap {
+        if let (Some(dbm), Some(range)) = (p.tx_power_dbm, c.tx_power_dbm) {
+            let bounded = range.clamp(dbm);
+            if bounded != dbm {
+                ndn_radio_cognition::ledger::note_tx_power_clamped();
+                tracing::warn!(
+                    target: "named_radio",
+                    requested = dbm, applied = bounded,
+                    "tx power outside the radio's declared dBm range; clamped"
+                );
+                p.tx_power_dbm = Some(bounded);
+            }
+        }
+        if let (Some(idx), Some(lo)) = (p.tx_power, c.min_tx_power) {
+            let bounded = idx.clamp(lo, c.max_tx_power);
+            if bounded != idx {
+                ndn_radio_cognition::ledger::note_tx_power_clamped();
+                tracing::warn!(
+                    target: "named_radio",
+                    requested = idx, applied = bounded,
+                    "tx power index outside the radio's declared range; clamped"
+                );
+                p.tx_power = Some(bounded);
+            }
+        }
+    }
+    let p = &p;
 
     // ★ **Every knob degrades on its own.** These used to propagate with `?`, so a single knob a
     // radio does not implement aborted the tick and silently disarmed every knob AFTER it — the
@@ -428,10 +471,21 @@ pub(crate) fn apply_knobs(
     if last.csd != Some(p.csd()) && note("set_tx_csd", knobs.set_tx_csd(p.csd())) {
         last.csd = Some(p.csd());
     }
-    if last.edcca != Some(p.edcca_ignore)
-        && note("set_edcca_ignore", knobs.set_edcca_ignore(p.edcca_ignore))
+    // ★ **Energy-detect carrier sense off at the chip.** The highest-value purchase in the tree:
+    // transmit into a busy channel instead of deferring. The value can no longer be asserted by a
+    // struct literal — `TxParams::contention` is a sealed `Contention` and only an `Urgent`
+    // `NameContext` produces `true` — but this is the line where it becomes register writes, so it
+    // is also where the claim is COUNTED. `ledger::edcca_ignored` rising while every plan in the
+    // same `/localhost/nfd/ext/list` snapshot reads `edcca_ignore=false` is a claim that did not
+    // come from this node's policy. Counted on every arrival, not only on a change, so the count
+    // tracks *ticks that claimed the medium* rather than register traffic.
+    if p.edcca_ignore() {
+        ndn_radio_cognition::ledger::note_edcca_ignored();
+    }
+    if last.edcca != Some(p.edcca_ignore())
+        && note("set_edcca_ignore", knobs.set_edcca_ignore(p.edcca_ignore()))
     {
-        last.edcca = Some(p.edcca_ignore);
+        last.edcca = Some(p.edcca_ignore());
     }
     // TX power: prefer the absolute dBm scale when the radio has one, since it is what the policy
     // actually decided (the index is a lossy rendering of the same back-off). A radio without dBm
@@ -451,31 +505,84 @@ pub(crate) fn apply_knobs(
         Some(_) => true, // already applied
         None => false,
     };
+    // ⚠⚠ **RE-BASELINE ANY ON-AIR A/B THAT SPANS THIS CHANGE.** As of the bring-up contract's M1
+    // this branch records what the radio said it APPLIED, not what cognition requested. Before, a
+    // request that the driver clamped, rendered onto a different power reference, or refused after
+    // partially writing was indistinguishable from one that landed exactly — which on the RTL8812AU
+    // spanned ~18-33 dB. Numbers taken either side of this commit are not comparable.
     if !dbm_applied
         && let Some(idx) = p.tx_power
         && last.power != Some(idx)
-        && note("set_tx_power", knobs.set_tx_power(idx as u32))
     {
-        // ★ Recorded only on success. This previously ran unconditionally after a `?`-propagating
-        // call, so on a radio whose `set_tx_power` default was a silent `Ok(())` — the MT7612U and
-        // MT7921AU have no power actuator at all — `last.power` recorded a back-off that no
-        // silicon ever applied, and the bandit was rewarded for a footprint reduction that did not
-        // happen. See `RadioCapability::power_actuated`.
-        last.power = Some(idx);
+        match knobs.set_tx_power(ndn_radio_hal::PowerRequest::index(idx)) {
+            Ok(applied) => {
+                // ★ Recorded only on success. This previously ran unconditionally after a
+                // `?`-propagating call, so on a radio whose `set_tx_power` default was a silent
+                // `Ok(())` — the MT7612U and MT7921AU have no power actuator at all — `last.power`
+                // recorded a back-off that no silicon ever applied, and the bandit was rewarded for
+                // a footprint reduction that did not happen. See `RadioCapability::power_actuated`.
+                //
+                // Dedupe still keys on the REQUEST: a driver clamp (the a81a's 20..=63 floor) makes
+                // the applied index differ from the requested one, and keying on the applied value
+                // would re-push the same write every tick forever.
+                // ★ **Detection by contrast, at the knob.** If the power REFERENCE changes between
+                // two ticks of the same radio, the same index now means a different physical power
+                // — which is the 2026-09-03 defect seen from above the driver, and the one thing
+                // this layer can notice on its own. It should never happen on a healthy part.
+                if let Some(prev) = &last.applied_power
+                    && prev.reference != applied.reference
+                {
+                    tracing::warn!(
+                        target: "named_radio",
+                        was = prev.reference.tag(),
+                        now = applied.reference.tag(),
+                        idx,
+                        "TX POWER REFERENCE CHANGED under a live radio — the same index now means \
+                         a different physical power. Any measurement spanning this tick is invalid."
+                    );
+                }
+                last.power = Some(idx);
+                last.applied_power = Some(applied);
+            }
+            Err(e) => {
+                tracing::debug!(knob = "set_tx_power", error = %e, "radio refused a knob; continuing");
+            }
+        }
     }
     // ★ The RECEIVE half of spatial reuse, actuated beside the power decision rather than after it,
     // because they are one decision: quieter without being less deferential just shrinks this
     // node's reach. The dBm threshold is preferred where a radio has one — same reasoning as
     // dBm-over-index for power — but the two are complementary, not alternatives, so both are
     // pushed when both are decided (the a81a has both).
-    if let Some((l2h, h2l)) = p.edcca_threshold_dbm
-        && last.edcca_thresh != Some((l2h, h2l))
-        && note(
-            "set_edcca_threshold_dbm",
-            knobs.set_edcca_threshold_dbm(l2h, h2l),
-        )
-    {
-        last.edcca_thresh = Some((l2h, h2l));
+    // ☠ **BOUND HERE, because this is the same silicon decision as `edcca_ignore` with no flag on
+    // it.** `set_edcca_threshold` on the Realtek backend range-checks nothing — it encodes
+    // `((dbm + 110 + 0x80) & 0xff)` into `0x84c`, so an arriving `(17, 9)` writes `0xff`: the
+    // channel is never busy. Sealing the `Contention` flag while leaving this unbounded would have
+    // closed the door everyone was watching and left the window open. The band is the range the
+    // policy can actually decide (`DEFER_THRESHOLD_DBM_BAND`, exported from cognition so the bound
+    // and the decision cannot drift), and an out-of-band arrival is clamped and counted rather than
+    // refused — a threshold outside it cannot have come from `decide_edcca_threshold_dbm` at all,
+    // which makes `ledger::defer_threshold_clamped` the sharpest bypass signal we have.
+    if let Some((want_l2h, want_h2l)) = p.edcca_threshold_dbm {
+        let ((l2h, h2l), moved) =
+            ndn_radio_cognition::clamp_defer_threshold(want_l2h, want_h2l);
+        if moved {
+            ndn_radio_cognition::ledger::note_defer_threshold_clamped();
+            tracing::warn!(
+                target: "named_radio",
+                requested = ?(want_l2h, want_h2l),
+                applied = ?(l2h, h2l),
+                "defer threshold outside the decidable band; clamped"
+            );
+        }
+        if last.edcca_thresh != Some((l2h, h2l))
+            && note(
+                "set_edcca_threshold_dbm",
+                knobs.set_edcca_threshold_dbm(l2h, h2l),
+            )
+        {
+            last.edcca_thresh = Some((l2h, h2l));
+        }
     }
     if let Some(g) = p.rx_gain
         && last.rx_gain != Some(g)
@@ -527,6 +634,10 @@ pub struct MediumActuator {
     /// least this. Lets an operator pin a minimum redundancy on a known-lossy
     /// broadcast link where the face-level loss signal can't see single-frame loss.
     fec_floor: u16,
+    /// What the radio DECLARED about itself, when the caller supplied it — the band this actuator
+    /// clamps TX power into. `None` ⇒ no band, so no bound and no `tx_power_clamped` count: an
+    /// actuator that was never told the radio's range cannot honestly say a request is out of it.
+    cap: Option<RadioCapability>,
 }
 
 impl MediumActuator {
@@ -540,7 +651,22 @@ impl MediumActuator {
             last: Mutex::new(AppliedKnobs::default()),
             fec_redundancy: None,
             fec_floor: 0,
+            cap: None,
         }
+    }
+
+    /// Bound TX power to what `cap` says the radio can do.
+    ///
+    /// ★ `RadioPolicy` already clamps BOTH power forms to this same capability (the index to
+    /// `[min_tx_power, max_tx_power]`, the dBm to the declared `DbmRange`), so a value outside it
+    /// **cannot have come from cognition** — exactly the reasoning that makes a clamp here a bypass
+    /// signal rather than a second opinion. Without it, the loudest escalation the chip offers —
+    /// pin the part at maximum power — reverted the spatial-reuse back-off silently, and the
+    /// operator surface showed the requested value with no counter able to disagree with it.
+    /// The LoRa face already did this bound; the Wi-Fi face was the inconsistent one.
+    pub fn with_capability(mut self, cap: RadioCapability) -> Self {
+        self.cap = Some(cap);
+        self
     }
 
     /// Also actuate **link-FEC redundancy**: on each tick, write the decided
@@ -584,7 +710,7 @@ impl RadioActuators for MediumActuator {
             return Ok(());
         };
         let mut last = self.last.lock().unwrap();
-        apply_knobs(&mut last, knobs.as_ref(), alloc).map_err(to_err)?;
+        apply_knobs(&mut last, knobs.as_ref(), alloc, self.cap.as_ref()).map_err(to_err)?;
         Ok(())
     }
 }
@@ -648,24 +774,8 @@ pub struct RadioMediumFace {
     /// path injects at the basic legacy rate ([`TxIntent::ROBUST`]) so it reaches that
     /// neighbour — the worst-overheard-receiver rate cap. `None`/false = decided rate.
     legacy_gate: Option<Arc<AtomicBool>>,
-    /// **TX** Tier-0 addressing (#91c): when set, outbound frames carry each object's prefix-set
-    /// filter in `addr1 ‖ addr2`, with the ephemeral nonce displaced to `addr3`. `None` ⇒ broadcast
-    /// `addr1` and the nonce in `addr2`.
-    tx_bloom: Option<crate::GroupKey>,
-    /// When true, TX emits the **wide** profile (4-address QoS+HTC: extra Blur in `addr4`, fingerprint
-    /// in HT Control) instead of the base 3-address frame. Set by [`with_wide_bloom`](Self::with_wide_bloom)
-    /// so a wide face's transmit and receive halves match; the base region stays identical either way.
-    tx_wide: bool,
-    /// **RX** name filtering: the shared [`NameGate`](crate::NameGate)'s two halves — the Tier-0
-    /// filter (or the NDN-NIC baseline) and an optional Tier-1.
-    ///
-    /// TX and RX are separate because they are separate capabilities: a relay filters on a family of
-    /// prefixes it forwards while addressing by whatever object it is carrying, and a passive
-    /// monitor filters without transmitting at all. `with_bloom` sets both at once for the common
-    /// case; `with_tx_bloom` / `with_rx_gate` set one.
-    rx_gate: Option<Arc<crate::NameGate>>,
-    /// Registered-prefix table for the scheduler (P1), built by [`with_bloom`](Self::with_bloom)
-    /// from the same key + prefixes as the RX gate.
+    /// Registered-prefix table for the scheduler's named airtime lease (P1), built by
+    /// [`with_group_table`](Self::with_group_table) from the registered prefix set.
     group_table: Option<Arc<crate::GroupTable>>,
     /// **Per-frame rate selection** (#82), when enabled: the cognition-decided [`TxParams`], else an
     /// adaptive/fixed [`McsPolicy`]. `None` ⇒ rate stays pure bearer state set out-of-band, the
@@ -830,85 +940,58 @@ impl RadioMediumFace {
             signal_sink: None,
             fec: None,
             legacy_gate: None,
-            tx_bloom: None,
-            tx_wide: false,
-            rx_gate: None,
             group_table: None,
             amsdu: None,
             rate: None,
         }
     }
 
-    /// Enable **Tier-0 name addressing** (#91c) on this medium: outbound frames are addressed by
-    /// each object's prefix-set Bloom filter (`addr1 ‖ addr2`) under `key`, with the ephemeral
-    /// source nonce moved to `addr3`; inbound frames are dropped before the engine unless their
-    /// filter could be under one of `registered_prefixes` (given as `/`-strings). A relay passes
-    /// several prefixes (its forwarding family); a leaf, one. Broadcast frames always pass.
-    pub fn with_bloom(
-        mut self,
-        key: &crate::GroupKey,
-        registered_prefixes: &[impl AsRef<[u8]>],
-    ) -> Self {
-        let masks = crate::bloom_masks_for(key, registered_prefixes);
-        // P1 ("one filter, one map"): the same (key, prefixes) that gate RX also key the slot map,
-        // built HERE so the gate and the scheduler cannot disagree about what is registered.
-        self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
-        self.with_tx_bloom(*key)
-            .with_rx_gate(Arc::new(crate::NameGate::new(
-                crate::RxFilter::Bloom(masks),
-                None,
-            )))
+    /// Install the **registered-prefix table** for the scheduler's named airtime lease (P1). The
+    /// slot key a name maps to is a pure function of the registered set, so every node computes the
+    /// same map. Relevance on RX is decided by parsing the name, not by an in-frame filter.
+    /// `registered_prefixes` are `/`-strings; a relay passes several (its forwarding family), a leaf
+    /// one.
+    pub fn with_group_table(mut self, registered_prefixes: &[impl AsRef<[u8]>]) -> Self {
+        self.group_table = Some(Arc::new(crate::GroupTable::new(registered_prefixes)));
+        self
     }
 
-    /// [`with_bloom`](Self::with_bloom), with some registered prefixes marked **latency-class**
-    /// (#93): those names are placed among the reserved lanes (`NDN_SCHED_RESERVE`), `L = 1`,
-    /// never contending with bulk. Class rides the registration set because it is part of the
-    /// SHARED slot map — every node must classify a prefix identically or their maps diverge.
-    pub fn with_bloom_latency(
+    /// [`with_group_table`](Self::with_group_table), with some registered prefixes marked
+    /// **latency-class** (#93): those names are placed among the reserved lanes (`NDN_SCHED_RESERVE`),
+    /// `L = 1`, never contending with bulk.
+    ///
+    /// ⚠ **`latency_prefixes` is this node's own assertion — nothing checks it**, which is why the
+    /// name says so. The assignment is pinned into `SchedParams::class_digest`, and that pin is
+    /// piggybacked on every ordinary data frame (`addr3[5]` bits 2..7 carry one 3-bit slice of
+    /// `FaceScheduler::class_commitment()` per frame), so a neighbour that classifies differently is
+    /// detected by anyone who hears a round of its traffic. Where a deployment has a trust anchor, use
+    /// [`with_lease_latency_authorised`](Self::with_lease_latency_authorised) so the promotion passes
+    /// a `ClassAuthority` rather than a slice literal.
+    pub fn with_lease_latency_unauthorised(
         mut self,
-        key: &crate::GroupKey,
         registered_prefixes: &[impl AsRef<[u8]>],
         latency_prefixes: &[impl AsRef<[u8]>],
     ) -> Self {
-        self = self.with_bloom(key, registered_prefixes);
         self.group_table = Some(Arc::new(
-            crate::GroupTable::new(key, registered_prefixes).with_latency(latency_prefixes),
+            crate::GroupTable::new(registered_prefixes).with_latency_unauthorised(latency_prefixes),
         ));
         self
     }
 
-    /// **Tier-0 WIDE-profile receive** (#39): like [`with_bloom`](Self::with_bloom), but the RX gate
-    /// tests the layered 126-bit base + 48-bit extra Blur ([`RxFilter::WideBloom`]). A wide frame
-    /// (carrying `addr4`) is filtered on both regions — strictly lower false-positive rate — while a
-    /// base (commodity) sender's 3-address frame is still admitted on the base region alone (zero
-    /// false negatives). TX stays the base profile (see the note at the inject site): this tightens
-    /// what the node *accepts*, the half that costs wasted wakeups/parses, without a wire change that
-    /// a base neighbour could not read.
-    pub fn with_wide_bloom(
+    /// [`with_lease_latency_unauthorised`](Self::with_lease_latency_unauthorised) with the promotion
+    /// gated on a `ClassAuthority`: a prefix reaches the reserved lanes only if the authority puts
+    /// its ceiling at `Priority::Urgent`. Not enforcement (a permissive impl is four lines) — it
+    /// removes self-assertion as a one-liner and makes `grep impl ClassAuthority` the audit.
+    pub fn with_lease_latency_authorised(
         mut self,
-        key: &crate::GroupKey,
         registered_prefixes: &[impl AsRef<[u8]>],
+        latency_prefixes: &[impl AsRef<[u8]>],
+        auth: &dyn ndn_radio_cognition::ClassAuthority,
     ) -> Self {
-        let masks = crate::wide_bloom_masks_for(key, registered_prefixes);
-        self.group_table = Some(Arc::new(crate::GroupTable::new(key, registered_prefixes)));
-        self.tx_wide = true; // TX emits the wide profile too, so this face's halves match
-        self.with_tx_bloom(*key)
-            .with_rx_gate(Arc::new(crate::NameGate::new(
-                crate::RxFilter::WideBloom(masks),
-                None,
-            )))
-    }
-
-    /// Address outbound frames by name (Tier-0) without changing what this face accepts.
-    pub fn with_tx_bloom(mut self, key: crate::GroupKey) -> Self {
-        self.tx_bloom = Some(key);
-        self
-    }
-
-    /// Set the inbound name gate — Tier-0 (or the #101 NDN-NIC baseline) plus an optional Tier-1 —
-    /// without changing how this face addresses what it sends.
-    pub fn with_rx_gate(mut self, gate: Arc<crate::NameGate>) -> Self {
-        self.rx_gate = Some(gate);
+        self.group_table = Some(Arc::new(
+            crate::GroupTable::new(registered_prefixes)
+                .with_latency_authorised(auth, latency_prefixes),
+        ));
         self
     }
 
@@ -1060,8 +1143,43 @@ const TIME_BEACON_MS: u64 = 100;
 // engine is forwarding ⇒ nothing upstream is calling the face. Gated behind
 // target `face.radio.tx` so it's off unless asked for.
 static TXD_ENTER: AtomicU64 = AtomicU64::new(0);
+/// Frames that reached the addressing stage — the wedge diagnostic's "past the gate" mark.
+static TXD_PAST_GATE: AtomicU64 = AtomicU64::new(0);
+/// Frames that ACTUALLY went through `FaceScheduler::gate` (or its hardware equivalent).
 static TXD_GATED: AtomicU64 = AtomicU64::new(0);
+/// ★ Frames that SKIPPED the slot MAC as control traffic (`RunningMedium::send_robust`).
+///
+/// There was no counter anywhere that said this. `TXD_GATED` sat *after* the `if !robust` block and
+/// incremented unconditionally, so the number the egress logger printed as `gated` counted frames
+/// that were never gated, and `stuck_in_gate` could never fire for them. A bypass nothing counts is
+/// a bypass nobody can see abused: this is the number an operator watches when the schedule is
+/// starving and every plan looks correct.
+static TXD_BYPASS: AtomicU64 = AtomicU64::new(0);
 static TXD_FEC: AtomicU64 = AtomicU64::new(0);
+
+/// **Per-face egress gate accounting** — the same two numbers as `TXD_GATED`/`TXD_BYPASS`, but
+/// attributable to one face rather than to the process.
+///
+/// The process-global statics feed the 5-second wedge log, which has no face handle. This is what a
+/// test or an operator asks a specific face, and it is the only form of the number that is
+/// deterministic when several faces (or several tests) run in one process.
+#[derive(Default, Debug)]
+pub struct GateCounts {
+    gated: AtomicU64,
+    bypassed: AtomicU64,
+}
+
+impl GateCounts {
+    /// Frames that went through the slot MAC.
+    pub fn gated(&self) -> u64 {
+        self.gated.load(Ordering::Relaxed)
+    }
+    /// Frames that SKIPPED the slot MAC as control traffic — see
+    /// [`RunningMedium::send_robust`] for what the bypass is for and what bounds it.
+    pub fn bypassed(&self) -> u64 {
+        self.bypassed.load(Ordering::Relaxed)
+    }
+}
 static TXD_DONE_OK: AtomicU64 = AtomicU64::new(0);
 static TXD_DONE_ERR: AtomicU64 = AtomicU64::new(0);
 static TXD_LOGGER: std::sync::Once = std::sync::Once::new();
@@ -1073,14 +1191,17 @@ fn txd_start_logger() {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let (e, g, d) = (
                     TXD_ENTER.load(Ordering::Relaxed),
-                    TXD_GATED.load(Ordering::Relaxed),
+                    TXD_PAST_GATE.load(Ordering::Relaxed),
                     TXD_DONE_OK.load(Ordering::Relaxed) + TXD_DONE_ERR.load(Ordering::Relaxed),
                 );
                 let stuck_gate = e > prev.0 && g == prev.1;
                 let stuck_inject = g > prev.1 && d == prev.2;
                 tracing::info!(
                     target: "face.radio.tx",
-                    enter = e, gated = g, fec = TXD_FEC.load(Ordering::Relaxed),
+                    enter = e, past_gate = g,
+                    gated = TXD_GATED.load(Ordering::Relaxed),
+                    bypassed = TXD_BYPASS.load(Ordering::Relaxed),
+                    fec = TXD_FEC.load(Ordering::Relaxed),
                     done_ok = TXD_DONE_OK.load(Ordering::Relaxed),
                     done_err = TXD_DONE_ERR.load(Ordering::Relaxed),
                     stuck_in_gate = stuck_gate, stuck_in_inject = stuck_inject,
@@ -1112,16 +1233,33 @@ struct TxBearer {
     /// (`NDN_SCHED_*`). `None` ⇒ no gating, the historical send path. Per-bearer so a hop retunes its
     /// own radio; the slot timing is identical on every bearer (one common-view clock per node).
     sched: Option<Arc<crate::FaceScheduler>>,
-    /// Tier-0 addressing (#91c): when set, the frame's `addr1 ‖ addr2` carry the object's
-    /// prefix-set filter and the nonce moves to `addr3`. `None` ⇒ broadcast `addr1`, nonce in
-    /// `addr2`. Shared (`Arc`) across this face's bearers so one object's fragments resolve to the
-    /// same filter whichever bearer each goes out on — the cache is per *object*, not per radio.
-    tier0: Option<Arc<crate::Tier0Addresser>>,
     /// Per-frame rate selection (#82). `None` ⇒ the driver's current rate stands.
     rate: Option<Arc<crate::RatePolicy>>,
     /// A-MSDU coalescer for this bearer's data path (#82 part 2). `None` ⇒ inject each frame
     /// directly. Never used for robust control frames, and never combined with FEC.
     batcher: Option<MediumBatcher>,
+    /// Shared across this face's bearers — see [`GateCounts`].
+    gate_counts: Arc<GateCounts>,
+}
+
+/// `Some(addr3)` only when `addr3` really is the id-carrying `addr3[0..4] ‖ id ‖ flags` shape.
+///
+/// ⚠ **`addr3` is not always that**, and everything keyed on `addr3[4]`/`addr3[5]` — the ephemeral
+/// ID, the DAR collision flag, and now the piggybacked class-commitment slice — inherits the
+/// confusion. `build_amsdu` writes `addr3 = addr1`, and the base builder falls back to
+/// `addr3 = dst` (`ff × 6` for a legacy broadcast frame). Fed in unconditionally, as they were,
+/// every legacy-shaped frame read as a **DAR hint naming ID `0xff`** (`0xff & FLAG_ID_COLLISION`
+/// is set), which rotated the ID of any node that happened to hold `0xff`; and every aggregate fed
+/// two pseudorandom filter bytes in as an ID and flags.
+///
+/// `addr3 == addr1` is an EXACT discriminator, not a heuristic: a genuine id-carrying `addr3[0..4]`
+/// is nonce-seeded and equals `addr1[0..4]` only by ~2^-32 coincidence, while the two shapes that
+/// must be excluded set them equal by construction.
+fn ephemeral_id_flags(group: Option<&[u8; 6]>, addr3: Option<&[u8; 6]>) -> Option<[u8; 6]> {
+    match (group, addr3) {
+        (Some(g), Some(a3)) if g == a3 => None,
+        (_, a3) => a3.copied(),
+    }
 }
 
 impl TxBearer {
@@ -1139,14 +1277,35 @@ impl TxBearer {
         } else {
             TxIntent::CONSERVATIVE
         };
-        self.inject_with_intent(wire, intent).await
+        // `control = false`: this is DATA. See `inject_with_intent` — the legacy gate picks
+        // `TxIntent::ROBUST` for its *rate* and must not thereby take the data plane out of the
+        // airtime lease.
+        self.inject_with_intent(wire, intent, false).await
     }
 
     /// Send one wire at an explicit [`TxIntent`]. A `MostRobust` frame (cooperative
     /// report / discovery / control) **bypasses FEC** — it is a standalone control frame,
     /// not part of a data generation — and the driver maps `MostRobust` to the basic
     /// legacy rate every neighbour can decode (the worst-overheard-receiver reach).
-    async fn inject_with_intent(&self, wire: Bytes, intent: TxIntent) -> Result<(), FaceError> {
+    ///
+    /// ☠ **`intent` and `control` are two axes, and conflating them handed the whole data plane a
+    /// gate bypass.** `robust` below is derived from the intent and correctly suppresses the
+    /// throughput-chosen MCS, the FEC generation and A-MSDU batching — a control frame wants none
+    /// of those trades. But `TxIntent::ROBUST.reliability == MostRobust`, and
+    /// [`TxBearer::inject`] selects `ROBUST` for ordinary data whenever the shared legacy-rate gate
+    /// is up (a neighbour advertised legacy-only RX). Testing the intent for the gate decision
+    /// therefore meant that ONE such neighbour took this node out of the airtime lease entirely,
+    /// at the slowest rate it transmits — the worst possible combination for the shared schedule,
+    /// and invisible to the suite because the legacy-gate test binds no scheduler.
+    ///
+    /// `control` is the second axis: set ONLY by [`RunningMedium::send_robust`], and the only thing
+    /// that skips the slot MAC.
+    async fn inject_with_intent(
+        &self,
+        wire: Bytes,
+        intent: TxIntent,
+        control: bool,
+    ) -> Result<(), FaceError> {
         txd_start_logger();
         TXD_ENTER.fetch_add(1, Ordering::Relaxed);
         let robust = intent.reliability == Reliability::MostRobust;
@@ -1155,14 +1314,18 @@ impl TxBearer {
             .as_ref()
             .is_some_and(|g| g.load(Ordering::Relaxed));
         // Data-centric time-slice/FHSS gate (#61/#40): wait for this name-group's owned slot and/or
-        // retune to its hop channel, from the name + the common-view clock. Robust control frames
-        // (reports / discovery) bypass — they must reach the worst receiver now, not wait on a data
-        // slot (they already ride the basic legacy rate). Off unless `NDN_SCHED_*` is set.
+        // retune to its hop channel, from the name + the common-view clock. CONTROL frames
+        // (reports / discovery, via `send_robust`) bypass — they must reach the worst receiver now,
+        // not wait on a data slot. Keyed on `control`, NOT on the intent: see the doc above. Off
+        // unless `NDN_SCHED_*` is set.
         // A ScheduledAt bearer (the C5) with NDN_SCHED_HW_TX=1 places the frame in *hardware* at its owned
         // slot (a delay handed to inject_after below) rather than the host sleeping in the software gate —
         // reconcile-free (the delay is applied on the device's own clock). None ⇒ the software gate, unchanged.
         let mut hw_delay: Option<u64> = None;
-        if !robust && let Some(sched) = &self.sched {
+        if control {
+            TXD_BYPASS.fetch_add(1, Ordering::Relaxed);
+            self.gate_counts.bypassed.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(sched) = &self.sched {
             // ⚠ REQUIRE THE SEAM, NOT THE LABEL. `hw_slot_wait` keys on `TxDiscipline::ScheduledAt`
             // alone, but a backend can declare that without implementing `inject_after` — and the
             // HAL default for `inject_after` is *inject now*. Taking the hardware path there would
@@ -1175,62 +1338,42 @@ impl TxBearer {
                 Some(d) if self.radio.schedules_tx() => hw_delay = Some(d),
                 _ => sched.gate(&wire).await,
             }
+            TXD_GATED.fetch_add(1, Ordering::Relaxed);
+            self.gate_counts.gated.fetch_add(1, Ordering::Relaxed);
         }
-        TXD_GATED.fetch_add(1, Ordering::Relaxed);
+        TXD_PAST_GATE.fetch_add(1, Ordering::Relaxed);
         // ── Address the frame FIRST, then decide how it goes out ─────────────────────────────
         //
-        // Tier-0 (#91c): address by the object's prefix-set filter in addr1‖addr2, nonce → addr3.
-        // A non-first fragment (no inner name) has no filter of its own, so it falls back to
-        // broadcast — which every receiver's Bloom filter admits (safe over-accept; the object's
-        // first fragment already carried the discriminating filter).
+        // Relevance is decided by PARSING the NDN name, not by an in-frame filter, so every frame is
+        // broadcast-addressed: addr1 = BROADCAST, and the source field carries this node's ephemeral
+        // rotating nonce (doctrine §2 — inert to real networks, no routing meaning, per-frame RSSI
+        // key). The 8-bit ephemeral ID + flags + the piggybacked schedule commitment still ride
+        // `addr3[4]`/`addr3[5]` (the cooperative ID-deconfliction wire encoding, unchanged).
         //
-        // This block used to sit *after* the FEC branch, so a coded frame never reached it: the FEC
-        // path returned early and the sink supplied a fixed broadcast address and a nonce
-        // snapshotted once at spawn. Enabling link-FEC therefore switched Tier-0 addressing and §2
-        // nonce rotation off, silently. Computing the address before the branch is what makes the
-        // two paths incapable of disagreeing (#82).
+        // Computing the address before the FEC branch is what keeps the direct, coded and A-MSDU
+        // paths incapable of disagreeing (#82) — the FEC path used to return early with a fixed
+        // address and a stale nonce.
         let nonce = self.source.current(super::now_ms() as u64);
-        let (dst, src, addr3, addr4, htc) = match self.tier0.as_ref().and_then(|t| t.wire_for(&wire)) {
-            // The 126-bit Blur spans addr1‖addr2‖addr3[0..4] (wire-format-spec §5.3). addr3's last two
-            // bytes carry the **8-bit ephemeral ID** and the **flags byte** — the ID displaced out of
-            // addr2 by the widened filter. `nonce[1]` is a full-entropy byte of the rotating ephemeral
-            // source (nonce[0] has forced local/individual bits); flags = 0 today. NOTE: the PFS/DAR
-            // deconfliction (`ephemeral_id.rs`) is not yet fed from RX — that integration is the
-            // remaining follow-up; the wire format is complete.
-            Some(tw) => {
-                let bf = tw.base;
-                // The 8-bit ephemeral ID (+ flags) from the PFS/DAR allocator: normally our own ID with
-                // clear flags; when a conflict hint is pending it rides this frame (conflicted ID +
-                // FLAG_ID_COLLISION) so the aliasing senders rotate (`ephemeral_id.rs`).
-                let (id, flags) = self.dedup.lock().unwrap().tx_id();
-                let a3 = [bf[12], bf[13], bf[14], bf[15], id, flags];
-                // Wide profile: the extra Blur rides addr4 and the fingerprint (+ marker) rides HT
-                // Control. `build_dot11` promotes the frame to 4-address QoS+HTC when both are set; a
-                // base receiver still reads the byte-identical base Blur from addr1‖addr2‖addr3[0:4].
-                let (a4, htc) = match tw.extra {
-                    Some(extra) => (
-                        Some(extra),
-                        Some([
-                            tw.fp as u8,
-                            (tw.fp >> 8) as u8,
-                            (tw.fp >> 16) as u8,
-                            crate::tier0::WIDE_PROFILE_MARKER,
-                        ]),
-                    ),
-                    None => (None, None),
-                };
-                (
-                    bf[..6].try_into().unwrap(),
-                    bf[6..12].try_into().unwrap(),
-                    Some(a3),
-                    a4,
-                    htc,
-                )
-            }
-            // Doctrine §2: the source field carries this node's ephemeral rotating nonce, not a
-            // fixed host tag — inert to real networks, no routing meaning, per-frame RSSI key.
-            None => (BROADCAST, nonce, None, None, None),
-        };
+        // The 8-bit ephemeral ID (+ flags) from the PFS/DAR allocator: normally our own ID with clear
+        // flags; when a conflict hint is pending it rides this frame (conflicted ID +
+        // FLAG_ID_COLLISION) so the aliasing senders rotate (`ephemeral_id.rs`).
+        //
+        // **The schedule commitment rides here too** (#93): flags bits 2..7 carry one 3-bit slice of
+        // `class_commitment()`, round-robin — the fleet-wide partition detector, read fresh per frame
+        // so a map that moves cannot leave a stale commitment on the air.
+        let commitment = self.sched.as_ref().map(|s| s.class_commitment());
+        let (id, flags) = self.dedup.lock().unwrap().tx_id(commitment);
+        // `addr3[0..4]` carry no name meaning; they are seeded from the nonce so the
+        // frame's addr3 can never equal its broadcast addr1 (the exact `addr3 == addr1` discriminator
+        // `ephemeral_id_flags` uses to tell an id-carrying frame from a legacy filler-addr3 one).
+        let a3 = [nonce[0], nonce[1], nonce[2], nonce[3], id, flags];
+        let (dst, src, addr3, extra, htc): (
+            [u8; 6],
+            [u8; 6],
+            Option<[u8; 6]>,
+            Option<[u8; 8]>,
+            Option<[u8; 4]>,
+        ) = (BROADCAST, nonce, Some(a3), None, None);
 
         // The rate this frame should ride, if any is decided. Computed BEFORE the FEC branch so a
         // coded generation can pin it: see the comment at the pin below.
@@ -1250,15 +1393,43 @@ impl TxBearer {
             // atomic meant a `RadioPlan` could decide `link_fec_redundancy` and have nothing
             // apply it unless a separate actuator happened to be running — the defect this
             // crate is named for in `decided-but-unactuated`.
-            let parity = self
+            let want = self
                 .rate
                 .as_ref()
                 .and_then(|rp| rp.planned_redundancy())
                 .unwrap_or_else(|| r.load(Ordering::Relaxed));
+            // ★ **`link_fec_redundancy` is an airtime escalation that needs no priority class — and
+            // the face is the WRONG place to bound it. Counted, not clamped, and here is why.**
+            //
+            // Two corrections to the premise. First, it is not unbounded: `LinkFecFeature::set_redundancy`
+            // clamps to `min(254, 255 - K)`, with its own test, so `Some(65535)` becomes R=247 at K=8 —
+            // a ~31x airtime multiplier, serious, but a bounded one. Second, the obvious tighter bound
+            // (R <= K, which is what `RadioPolicy` clamps ITSELF to) is a POLICY choice, not a physical
+            // one: R > K is exactly how a broadcast link survives >50% loss, it is reachable through this
+            // cell by design, and `planned_redundancy_changes_frames_on_air` asserts a K=2/R=5 generation
+            // reaches the air. Enforcing the policy's ceiling here would delete that capability to close
+            // an escalation the codec already caps.
+            //
+            // So this does the thing that is actually the face's business: it makes a parity budget the
+            // policy could never have produced VISIBLE. A count moving here is either a cognition bug or a
+            // plan that did not come from cognition, and either one is worth a look.
+            let parity = want; // counted, never clamped — see above
+            // ⚠ **Counted, NOT warned, and the claim it used to make was false.** The old text said
+            // "the policy clamps its own R to the generation, so this plan did not come from it".
+            // The policy clamps to `PolicyConfig::generation_k` (default 8); this compares against
+            // THIS FACE's `generation_size()`, and nothing ties the two. The shipped node binary
+            // builds the face with K=1 on purpose (`with_link_fec(1, ..)` — K=1 is repetition), so
+            // every legitimate R >= 2 tripped a per-frame `warn!` in production. The two Ks are
+            // different quantities, so this comparison cannot distinguish "a plan bypassed
+            // cognition" from "this face runs a smaller generation than the policy assumes" — and a
+            // detector that cannot tell those apart must not assert the first.
+            if want > bridge.generation_size() {
+                ndn_radio_cognition::ledger::note_fec_parity_over_generation();
+            }
             let eligible = self.eligible.as_ref().is_none_or(|pred| pred(&wire));
             if parity > 0 && eligible {
                 // The generation takes the opening frame's address, intent AND rate, so coded
-                // traffic keeps Tier-0 addressing, the legacy-rate cap, and the decided MCS.
+                // traffic keeps the ephemeral-id addressing, the legacy-rate cap, and the decided MCS.
                 //
                 // `mcs` was `None` here until an on-air run caught it. The reasoning was "this
                 // face holds rate as bearer state" — true before `with_rate_policy` existed,
@@ -1281,8 +1452,6 @@ impl TxBearer {
                         dst,
                         src,
                         addr3,
-                        addr4,
-                        htc,
                         intent,
                         mcs: decided,
                     },
@@ -1303,11 +1472,9 @@ impl TxBearer {
             dst,
             src,
             addr3,
-            // Wide profile (when this face was built with `with_wide_bloom`): the addresser produced
-            // the extra Blur + fingerprint above, fragment-consistently, and the FEC path carries the
-            // same via the pin — so a wide face's every frame (direct, coded, or A-MSDU-eligible) is
-            // wide. A base face leaves these `None` and emits the 3-address frame. No TX/RX split.
-            addr4,
+            // No in-frame filter: frames are broadcast-addressed and relevance is decided by parsing
+            // the name, so the extended-address / HT-Control slots carry nothing.
+            extra,
             htc,
         };
         // A-MSDU bundling (#82 part 2): a non-robust data frame is coalesced instead of injected
@@ -1367,6 +1534,7 @@ pub struct RunningMedium {
     tx: Vec<TxBearer>,
     rx: AsyncMutex<mpsc::UnboundedReceiver<(Bytes, Option<FaceAddr>, u16)>>,
     tasks: Vec<JoinHandle<()>>,
+    gate_counts: Arc<GateCounts>,
 }
 
 impl RunningMedium {
@@ -1387,6 +1555,15 @@ impl RunningMedium {
         self.tx.first().and_then(|b| b.sched.clone())
     }
 
+    /// How many frames this face put through the slot MAC, and how many skipped it.
+    ///
+    /// The bypass is deliberate and stays (see [`send_robust`](Self::send_robust)); this is the
+    /// number that makes it visible. A `bypassed` count climbing with the schedule starving is the
+    /// signature of a caller using the control path for data.
+    pub fn gate_counts(&self) -> &GateCounts {
+        &self.gate_counts
+    }
+
     /// This node's **current §2 source nonce** (rotates every `NONCE_ROTATION_MS`, fresh per
     /// process). Exposed for the claim-C topology instrument: a run prints it at start AND end so
     /// a rotation boundary inside the window self-invalidates, and a peer's `NDN_SCHED_DEAF_SRC`
@@ -1404,11 +1581,55 @@ impl RunningMedium {
     /// decode, FEC bypassed. Distinct from [`Transport::send_bytes`], which sends data at
     /// the cognition-decided rate: a report must reach the *worst* receiver (e.g. a
     /// legacy-only-RX 8812au), so it never rides the throughput-optimised data rate.
+    ///
+    /// # ★ This is the one call that SKIPS the named airtime lease, and it is kept that way
+    ///
+    /// `control = true` below is the only thing in the face that bypasses
+    /// [`FaceScheduler::gate`](crate::FaceScheduler::gate): no owned-slot wait, no CCLF jitter.
+    /// **What it is for:** a reception report is a Data on `/localhop/radio/report/<node>` — a
+    /// *named* object, so the gate would genuinely make it wait for that group's turn — and the
+    /// whole point of a report is to tell a sender NOW that it is unreachable at the rate it is
+    /// using. Deferring the signal that a link is failing until the failing link's schedule comes
+    /// round is the wrong trade. (The time beacon does not use this path at all: it calls
+    /// `radio.inject()` directly from the master task, already rate-limited by `TIME_BEACON_MS`.)
+    ///
+    /// **What bounds it, honestly:**
+    /// * *Not a class.* Requiring a `NameContext` here would be theatre — the class does not meter
+    ///   the only real cost (airtime), and the medium is not a security boundary anyway: an
+    ///   in-process crate holding the `Arc<dyn FrameIo>` bypasses the medium wholesale. Everything
+    ///   here is defence against accident and drift, not against a hostile linked crate.
+    /// * *Not the Latency lane.* Routing reports through the gate as
+    ///   [`LeaseClass::Latency`](ndn_radio_cognition::LeaseClass) looks like the designed answer and
+    ///   is currently STRICTLY WORSE: `NDN_SCHED_RESERVE` defaults to 0, and with no reserved lanes
+    ///   a Latency frame waits for its owned slot *and* declines to opportunistically claim idle
+    ///   ones. It becomes right only once reserved lanes are on by default — a separate decision
+    ///   with its own on-air evidence requirement.
+    /// * *Not a token bucket — yet.* A leaky airtime budget that falls through to `sched.gate()` on
+    ///   exhaustion is the right shape (deferring costs one slot; dropping would break the thing the
+    ///   bypass exists for), but its size is the whole design and we have no measurement to set it
+    ///   from. An unmeasured budget here would be one more decided-but-unvalidated knob.
+    /// * *Counted instead.* Every bypass increments `TXD_BYPASS`, logged as `bypassed` beside
+    ///   `gated` under target `face.radio.tx`. Cost per call, from the in-tree airtime model (a
+    ///   bound, not a measurement): a 1500 B frame at basic 6 Mbps is ~2060 µs, ~8.4x an MCS7 frame
+    ///   and ~69% of the `NDN_SCHED_SLOT=8:3000` example slot — and this fans out over EVERY bearer,
+    ///   so an N-radio face pays N x per call.
+    ///
+    /// ⚠ **NOT MEASURED, and it may buy less than it looks like.** `gate()` holds `REG_TXPAUSE`
+    /// (`TxHoldGuard`) while another frame waits for its slot, and TXPAUSE holds *all* transmissions
+    /// at the MAC — it holds, it does not drop. So on a part with a TX-hold actuator a bypassing
+    /// frame is plausibly stalled inside the chip anyway and released in a burst at the start of a
+    /// slot it does not own, turning "reaches the worst receiver now" into "reaches it at an
+    /// unpredictable later instant". This is read from the code and the HAL's documented semantics;
+    /// no on-air run has been made. Cheap to test: two concurrent senders on one bearer with
+    /// `NDN_SCHED_SLOT` set and a `set_tx_hold`-capable backend, timestamping report egress.
     pub async fn send_robust(&self, wire: Bytes) -> Result<(), FaceError> {
         let mut sent = false;
         let mut last_err = None;
         for b in &self.tx {
-            match b.inject_with_intent(wire.clone(), TxIntent::ROBUST).await {
+            match b
+                .inject_with_intent(wire.clone(), TxIntent::ROBUST, true)
+                .await
+            {
                 Ok(()) => sent = true,
                 Err(e) => last_err = Some(e),
             }
@@ -1431,15 +1652,15 @@ impl RunningMedium {
             signal_sink,
             fec,
             legacy_gate,
-            tx_bloom,
-            tx_wide,
-            rx_gate,
             amsdu,
             rate,
         } = cfg;
 
         let (tx_chan, rx_chan) = mpsc::unbounded_channel();
         let mut tx = Vec::with_capacity(bearers.len());
+        // One per FACE, shared by its bearers: `send_robust` fans out over every bearer, so a
+        // per-bearer count would report N per call and hide the fan-out cost rather than show it.
+        let gate_counts = Arc::new(GateCounts::default());
         let mut tasks = Vec::with_capacity(bearers.len());
 
         // This node's ephemeral source identity (mac-addressing-doctrine §2): one per-boot random
@@ -1462,16 +1683,10 @@ impl RunningMedium {
             NONCE_ROTATION_MS,
             2_000,
         )));
-
-        // One Tier-0 addresser for the whole face (not per bearer): its cache is keyed by LP base
-        // sequence, i.e. by *object*, and an object's fragments may fan out across bearers.
-        let tier0 = tx_bloom.map(|k| {
-            Arc::new(if tx_wide {
-                crate::Tier0Addresser::new_wide(k)
-            } else {
-                crate::Tier0Addresser::new(k)
-            })
-        });
+        // Per-neighbour accumulation of the piggybacked schedule commitment (#93), shared per node
+        // like the ID allocator. Staleness = the ID rotation period: past it the ID no longer names
+        // the same transmitter, so its accumulated agreement is not about anyone.
+        let commit_watch = Arc::new(Mutex::new(ClassCommitmentWatch::new(NONCE_ROTATION_MS)));
 
         for b in bearers {
             // #83: the radio's self-description outranks the caller's assertion, and a mismatch is
@@ -1495,8 +1710,8 @@ impl RunningMedium {
             //
             // The sink is `crate::RadioFecSink`, shared with `WifiPhy` (#82). It replaced
             // `ndn-coding`'s generic `FrameIoSink`, which took a fixed broadcast dst and **one nonce
-            // snapshotted for the bridge's whole lifetime** — so turning link-FEC on turned Tier-0
-            // addressing and §2 nonce rotation off. Address, nonce and intent now ride the
+            // snapshotted for the bridge's whole lifetime** — so turning link-FEC on turned the
+            // ephemeral-id addressing and §2 nonce rotation off. Address, nonce and intent now ride the
             // per-generation pin, resolved by the same code the direct send path uses.
             let bridge = fec.as_ref().map(|fc| {
                 Arc::new(LinkFecBridge::spawn(
@@ -1527,7 +1742,7 @@ impl RunningMedium {
                         // no longer keys on the FHSS sentinel and two of them on different channels get
                         // distinct schedules.
                         let s = s.with_operating_channel(b.channel);
-                        // P1: slot key = longest registered prefix; RX attribution by mask AND.
+                        // P1: slot key = longest registered prefix; RX attribution by parsing the name.
                         match &group_table {
                             Some(t) => s.with_groups(t.clone()),
                             None => s,
@@ -1581,8 +1796,8 @@ impl RunningMedium {
                 source: source.clone(),
                 dedup: dedup.clone(),
                 sched: sched.clone(),
-                tier0: tier0.clone(),
                 rate: rate.clone(),
+                gate_counts: gate_counts.clone(),
             });
 
             // One reader per radio → the RX union. A frame heard on any capability is
@@ -1610,8 +1825,8 @@ impl RunningMedium {
                 tracing::warn!(target: "monitor-wifi", "TOPOLOGY INSTRUMENT: deaf to src {:02x?}", d);
             }
             let rate_rx = rate.clone();
-            let rx_gate = rx_gate.clone();
             let dedup = dedup.clone();
+            let commit_watch = commit_watch.clone();
             tasks.push(tokio::spawn(async move {
                 let mut last_mesh_cv = 0u64; // last mesh common-view observation count ingested (#74)
                 loop {
@@ -1682,30 +1897,27 @@ impl RunningMedium {
                                 // its evidence lands in different slots. Detected and reported, not
                                 // corrected (there is no convergence protocol, by design).
                                 if sched.beacon_indicates_partition(&f.payload) {
+                                    // The version rides in the clear so this line can say WHICH kind
+                                    // of split it is: a neighbour on an older pinned set (every
+                                    // v1<->v2 pair reports partitioned by construction — the version
+                                    // is the first thing the digest mixes) versus one on our version
+                                    // that classifies names differently (#93 class_digest). `None`
+                                    // means a pre-v2 beacon, which is itself the first answer.
                                     tracing::warn!(
                                         ours = sched.map_digest(),
                                         theirs = crate::FaceScheduler::parse_beacon_map_digest(&f.payload),
+                                        our_params_version = crate::sched::SCHED_PARAMS_VERSION,
+                                        their_params_version = crate::FaceScheduler::parse_beacon_params_version(&f.payload),
                                         "schedule-map partition: a neighbour computes a different slot map (mismatched SchedParams)"
                                     );
                                 }
                                 sched.ingest_time_ref(ref_us);
                                 continue;
                             }
-                            // Tier-0 name filter (#91c): drop frames not under any registered prefix
-                            // before they reach signals or the engine. The frame's filter is
-                            // addr1‖addr2 (f.group‖f.addr); broadcast (no group) always passes.
-                            // #82: the SAME gate `WifiPhy` uses, from the same code. This
-                            // was an open-coded Tier-0-only copy — no Tier-1, no NDN-NIC baseline, no
-                            // drop accounting — and every filtering feature added recently landed
-                            // only on the other face. Sharing it is what stops the two diverging.
-                            if let Some(gate) = rx_gate.as_ref()
-                                && !gate.admits_wide(
-                                    f.group, f.addr, f.addr3, f.addr4, f.htc, &f.payload,
-                                )
-                            {
-                                continue;
-                            }
-                            // The sender's ephemeral nonce is in addr3 under the Tier-0 layout, else
+                            // Relevance is decided by the engine parsing the NDN name — there is no
+                            // in-frame filter to drop on here. Every captured frame is passed up; the
+                            // ephemeral-ID / DAR / commitment machinery below reads `addr3[4]/[5]`.
+                            // The sender's ephemeral nonce is in addr3 under the id-carrying layout, else
                             // in addr2 (legacy). This one accessor keys per-neighbour signals and the
                             // reassembly stream correctly for both layouts.
                             // Feedback for `McsPolicy::Adaptive` (#82): the RX path is what makes
@@ -1713,23 +1925,75 @@ impl RunningMedium {
                             if let (Some(rate), Some(rssi)) = (rate_rx.as_ref(), f.rssi_dbm) {
                                 rate.observe_rssi(rssi);
                             }
+                            // ⚠ **`addr3` is only `id ‖ flags` under the id-carrying layout.** The A-MSDU
+                            // builder writes `addr3 = addr1` (`build_amsdu`) and the base builder
+                            // falls back to `addr3 = dst` for a legacy broadcast frame — and both
+                            // were fed here unconditionally, so EVERY legacy-shaped frame was read as
+                            // a DAR hint naming ID 0xff (`0xff & FLAG_ID_COLLISION != 0`) and every
+                            // aggregate fed two pseudorandom filter bytes in as an ID and flags. The
+                            // class-commitment slice inherits that byte, so the guard is a
+                            // prerequisite, not a tidy-up. `addr3 == addr1` is an exact
+                            // discriminator: a real id-carrying `addr3[0..4]` equals `addr1[0..4]` only by
+                            // ~2^-32 coincidence.
+                            let eph_a3 = ephemeral_id_flags(f.group.as_ref(), f.addr3.as_ref());
                             // Cooperative ID deconfliction (PFS/DAR): feed the received ID + flags +
                             // RSSI. Returns true if this was a DAR *hint* frame — whose addr3[4] is the
                             // conflicted ID, not the sender's, so it keys no neighbour.
-                            let is_hint = match f.addr3 {
+                            let is_hint = match eph_a3 {
                                 Some(a3) => {
                                     dedup.lock().unwrap().rx(a3[4], a3[5], f.rssi_dbm, super::now_ms() as u64)
                                 }
                                 None => false,
                             };
-                            // Source key = the 8-bit ephemeral ID (addr3[4] under Tier-0; the full
-                            // legacy nonce in addr2 otherwise). NOT the whole addr3 — its first four
-                            // bytes are the name-derived Blur filter, so keying on them would fabricate
-                            // a fresh neighbour per name (wire-format-spec §5.3).
+                            // **The piggybacked schedule commitment** (#93, wire-format-spec §5.4):
+                            // compare the 3-bit slice this frame carries against our own fold. This
+                            // is the carrier that made partition detection FLEET-wide — the time
+                            // beacon is transmitted only by `is_master()`, so a non-master defector
+                            // was previously undetectable by anyone.
+                            //
+                            // Skipped on a hint frame (its `addr3[4]` is another node's ID, so a
+                            // slice would be filed against an innocent neighbour — which is also why
+                            // `tx_id` emits no slice on one). The watch reports a half-collected
+                            // round as `Unknown`/`Agreeing`, NEVER as a partition, and warns once per
+                            // divergence rather than once per frame.
+                            //
+                            // ⚠ **Scope: this sits BEHIND the RX name gate** (like the DAR path it
+                            // rides with, and for the same reason — both key on the ephemeral ID,
+                            // and the gate is what says the frame is in our naming domain). So a
+                            // neighbour whose traffic shares no registered prefix with us is not
+                            // judged by us. That is the same population whose slot placement can
+                            // contend with ours, but it is a narrower claim than "every neighbour"
+                            // and should be read as such.
+                            if let (Some(sched), Some(a3), false) = (sched_rx.as_ref(), eph_a3, is_hint) {
+                                let v = commit_watch.lock().unwrap().observe(
+                                    a3[4],
+                                    a3[5],
+                                    sched.class_commitment(),
+                                    super::now_ms() as u64,
+                                );
+                                if v.newly_divergent {
+                                    tracing::warn!(
+                                        target: "monitor-wifi",
+                                        neighbour_id = a3[4],
+                                        ours = sched.class_commitment(),
+                                        our_params_version = crate::sched::SCHED_PARAMS_VERSION,
+                                        "schedule-map partition (piggybacked commitment): a \
+                                         neighbour computes a different slot map. This is a 21-bit \
+                                         fold — it says the maps DIFFER, not why: an older \
+                                         SchedParams version and a different lane policy are \
+                                         indistinguishable here. The master's beacon carries the \
+                                         version in the clear if one is running."
+                                    );
+                                }
+                            }
+                            // Source key = the 8-bit ephemeral ID (addr3[4] under the id-carrying
+                            // layout; the full legacy nonce in addr2 otherwise). NOT the whole addr3 —
+                            // its first four bytes are pseudo-random, so keying on them would fabricate
+                            // a fresh neighbour per frame.
                             let nonce: Option<[u8; 6]> = if is_hint {
                                 None
                             } else {
-                                match f.addr3 {
+                                match eph_a3 {
                                     Some(a3) => Some([a3[4], 0, 0, 0, 0, 0]),
                                     None => f.addr,
                                 }
@@ -1748,7 +2012,7 @@ impl RunningMedium {
                                 }
                                 sink.set_link(id, ls);
                                 // Doctrine §2: also attribute this RSSI to the *neighbour* by its
-                                // ephemeral source nonce (addr3 under Tier-0, addr2 legacy), so the
+                                // ephemeral source nonce (addr3 under the id-carrying layout, addr2 legacy), so the
                                 // store is a per-neighbour map, not an ambient per-face scalar.
                                 if let Some(src) = nonce {
                                     sink.set_source_link(src, ls);
@@ -1799,7 +2063,7 @@ impl RunningMedium {
                 loop {
                     tick.tick().await;
                     // Time beacons are broadcast control, not name-addressed: they must reach every
-                    // node regardless of its Tier-0 filter, so addr1 stays broadcast (which always
+                    // node regardless of any name relevance, so addr1 stays broadcast (which always
                     // passes) and the nonce rides addr2 as in the legacy layout.
                     let frame = InjectFrame {
                         payload: sched.build_beacon(),
@@ -1807,7 +2071,7 @@ impl RunningMedium {
                         dst: BROADCAST,
                         src: src.current(super::now_ms() as u64),
                         addr3: None,
-                        addr4: None,
+                        extra: None,
                         htc: None,
                     };
                     let _ = radio.inject(frame).await; // transient errors: keep the clock alive
@@ -1821,6 +2085,7 @@ impl RunningMedium {
             tx,
             rx: AsyncMutex::new(rx_chan),
             tasks,
+            gate_counts,
         }
     }
 }
@@ -1918,6 +2183,10 @@ mod power_actuation_tests {
         dbm_calls: StdMutex<Vec<i8>>,
         idx_calls: StdMutex<Vec<u32>>,
         bw_calls: StdMutex<Vec<u32>>,
+        /// The `(l2h, h2l)` defer thresholds that actually reached the chip.
+        edcca_thresh_calls: StdMutex<Vec<(i8, i8)>>,
+        /// Carrier-sense overrides that actually reached the chip.
+        edcca_calls: StdMutex<Vec<bool>>,
         /// Simulate a radio with no absolute control.
         dbm_unsupported: bool,
     }
@@ -1926,9 +2195,29 @@ mod power_actuation_tests {
         fn set_channel(&self, _c: u8, _bw: Bandwidth) -> Result<(), FaceError> {
             Ok(())
         }
-        fn set_tx_power(&self, idx: u32) -> Result<(), FaceError> {
-            self.idx_calls.lock().unwrap().push(idx);
-            Ok(())
+        fn set_tx_power(
+            &self,
+            req: ndn_radio_hal::PowerRequest,
+        ) -> Result<ndn_radio_hal::AppliedPower, FaceError> {
+            let idx = req.requested_index().unwrap_or(63);
+            self.idx_calls.lock().unwrap().push(idx as u32);
+            // A spy on an index-scale part: report a driver reference with no measured slope,
+            // which is what every Wi-Fi part in this fleet honestly has.
+            Ok(ndn_radio_hal::AppliedPower::from_writes(
+                req,
+                ndn_radio_hal::PowerReference::DriverReference {
+                    source: "spy",
+                    slope_db_per_idx: None,
+                },
+                idx,
+                false,
+                vec![ndn_radio_hal::PowerWrite {
+                    reg: 0,
+                    value: idx,
+                    group: "spy",
+                    path: 0,
+                }],
+            ))
         }
         fn set_tx_power_dbm(&self, dbm: i8) -> Result<i8, FaceError> {
             if self.dbm_unsupported {
@@ -1944,6 +2233,56 @@ mod power_actuation_tests {
             self.bw_calls.lock().unwrap().push(khz);
             Ok(())
         }
+        fn set_edcca_threshold_dbm(&self, l2h: i8, h2l: i8) -> Result<(), FaceError> {
+            self.edcca_thresh_calls.lock().unwrap().push((l2h, h2l));
+            Ok(())
+        }
+        fn set_edcca_ignore(&self, on: bool) -> Result<(), FaceError> {
+            self.edcca_calls.lock().unwrap().push(on);
+            Ok(())
+        }
+    }
+
+    /// ☠ **The loudest escalation on the chip, bounded where it actuates.**
+    ///
+    /// Sealing `edcca_ignore` and bounding the defer threshold closed the two doors an audit was
+    /// watching — and left "pin the part at maximum TX power" wide open, silently reverting the
+    /// spatial-reuse back-off with nothing able to disagree: `radio.N.tx_power` shows the operator
+    /// the REQUESTED value, so without a counter beside it there is no contradiction to notice.
+    ///
+    /// `RadioPolicy` clamps both power forms to this same declared capability, so a value outside
+    /// it did not come from cognition — the identical reasoning that justifies the threshold clamp.
+    ///
+    /// Falsified by deleting the clamp block in `apply_knobs`: the spy then records 255 / 127 and
+    /// both assertions fire.
+    #[test]
+    fn tx_power_outside_the_radios_declared_range_is_bounded_and_counted() {
+        let before = ndn_radio_cognition::ledger::counts().tx_power_clamped;
+        let knobs = Arc::new(SpyKnobs::default());
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -55));
+        let cap = RadioCapability::wifi_monitor_5ghz(vec![149])
+            .with_tx_power_dbm(crate::DbmRange::new(10, 22));
+        let act = MediumActuator::new(RadioId(0), io, Some(knobs.clone())).with_capability(cap);
+        let plan = RadioPlan::single(
+            RadioId(0),
+            None,
+            TxParams {
+                tx_power_dbm: Some(127),
+                ..Default::default()
+            },
+        );
+        act.apply(plan.allocation_for(RadioId(0)).unwrap()).unwrap();
+        let applied = knobs.dbm_calls.lock().unwrap().clone();
+        assert!(
+            applied.iter().all(|&d| d <= 22),
+            "a request above the declared range must not reach the knob: {applied:?}"
+        );
+        assert!(
+            ndn_radio_cognition::ledger::counts().tx_power_clamped > before,
+            "and the clamp must be COUNTED — it is the only thing an operator can compare \
+             `radio.N.tx_power` against"
+        );
     }
 
     fn actuate(knobs: Arc<SpyKnobs>, params: TxParams) -> Arc<SpyKnobs> {
@@ -1953,6 +2292,122 @@ mod power_actuation_tests {
         let plan = RadioPlan::single(RadioId(0), None, params);
         act.apply(plan.allocation_for(RadioId(0)).unwrap()).unwrap();
         knobs
+    }
+
+    /// ★ **The claim reaches silicon only with an authority behind it, and it is COUNTED there.**
+    ///
+    /// Two halves of surface A in one test. The seal (an unauthorised name cannot produce
+    /// `edcca_ignore`) is proved in `ndn-radio-cognition`'s own suite; this is the other end — that
+    /// an authorised claim really does reach `set_edcca_ignore`, and that `apply_knobs` tallies it
+    /// on the bearer-agnostic ledger the control surface publishes. The ledger is the house rule
+    /// applied: a bypass nothing counts is a bypass nobody can see abused. Nothing here PREVENTS a
+    /// claim — `ledger` is diagnostics, and the direct-driver-knob path it cannot see is named in
+    /// `Contention`'s docs.
+    ///
+    /// Counted on arrival rather than on a register write, so a claim re-asserted every tick keeps
+    /// counting even though the knob is change-gated and pushed once.
+    ///
+    /// Falsified by moving `note_edcca_ignored()` inside the `last.edcca != ...` change gate (the
+    /// second tick then adds nothing), or by deleting it.
+    #[test]
+    fn an_authorised_medium_claim_reaches_the_chip_and_is_counted() {
+        use ndn_radio_cognition::{ClassAuthority, ClassCeiling, Contention, NameContext, Priority};
+        struct Urgent;
+        impl ClassAuthority for Urgent {
+            fn ceiling_for(&self, _h: u64) -> Priority {
+                Priority::Urgent
+            }
+        }
+        let ctx = NameContext::new(7).with_ceiling(ClassCeiling::authorised(&Urgent, 7));
+        let params = TxParams {
+            contention: Contention::deferring().ignoring_edcca(&ctx),
+            ..Default::default()
+        };
+        assert!(params.edcca_ignore(), "the authority granted the claim");
+
+        let before = ndn_radio_cognition::ledger::counts().edcca_ignored;
+        let knobs = Arc::new(SpyKnobs::default());
+        let bus = LoopbackMonitorBus::new();
+        let io: Arc<dyn FrameIo> = Arc::new(bus.endpoint(1, -55));
+        let act = MediumActuator::new(RadioId(0), io, Some(knobs.clone()));
+        let plan = RadioPlan::single(RadioId(0), None, params);
+        let alloc = plan.allocation_for(RadioId(0)).unwrap();
+        act.apply(alloc).unwrap();
+        act.apply(alloc).unwrap(); // unchanged ⇒ one register write, but two claims
+
+        assert_eq!(
+            *knobs.edcca_calls.lock().unwrap(),
+            vec![true],
+            "the knob is change-gated: one write"
+        );
+        assert_eq!(
+            ndn_radio_cognition::ledger::counts().edcca_ignored - before,
+            2,
+            "the LEDGER counts claims, not register traffic — otherwise a sustained claim looks \
+             like a single event"
+        );
+    }
+
+    /// ☠ **The equivalent bypass, bounded where it actuates.**
+    ///
+    /// `edcca_ignore` is now a sealed `Contention` that only an authorised `Urgent` name can set —
+    /// but `edcca_threshold_dbm` is the GRADED FORM OF THE SAME DECISION ON THE SAME CHIP, it has
+    /// no flag on it, and the Realtek backend range-checks nothing: it encodes
+    /// `((dbm + 110 + 0x80) & 0xff)` straight into `0x84c`, so an arriving `(17, 9)` writes `0xff`
+    /// — the channel is never busy. Sealing the flag while leaving this open would have closed the
+    /// door everyone was watching and left the window beside it.
+    ///
+    /// The field stays public (any class may have an opinion about its own defer threshold once it
+    /// has measured the margin); what is bounded is how far the opinion may reach — to the top of
+    /// the range `decide_edcca_threshold_dbm` can actually produce.
+    ///
+    /// Falsified by deleting the `clamp_defer_threshold` call in `apply_knobs`: the spy then
+    /// records `(17, 9)` and the assertion fires.
+    ///
+    /// ⚠ NOT MEASURED: the `0xff` claim is derived from the driver's encoder arithmetic, not from a
+    /// register read-back on hardware. What this test proves is the clamp, not the silicon effect.
+    #[test]
+    fn a_defer_threshold_the_policy_could_never_decide_is_bounded_at_the_actuator() {
+        let before = ndn_radio_cognition::ledger::counts().defer_threshold_clamped;
+        let k = actuate(
+            Arc::new(SpyKnobs::default()),
+            TxParams {
+                edcca_threshold_dbm: Some((17, 9)), // "never busy"
+                ..Default::default()
+            },
+        );
+        let (hi_lo, hi_hi) = ndn_radio_cognition::DEFER_THRESHOLD_DBM_BAND;
+        let got = k.edcca_thresh_calls.lock().unwrap().clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "the threshold must still be pushed, just bounded"
+        );
+        assert_eq!(
+            got[0].0, hi_hi,
+            "an out-of-band claim lands at the top of the decidable band, not at 0xff"
+        );
+        assert!(got[0].1 <= got[0].0 && got[0].0 >= hi_lo);
+        assert!(
+            ndn_radio_cognition::ledger::counts().defer_threshold_clamped > before,
+            "and it is COUNTED — a threshold outside the band cannot have come from the policy"
+        );
+    }
+
+    /// The mirror of the above: a threshold the policy really can decide must pass through
+    /// untouched. A bound that perturbs legitimate decisions is worse than no bound.
+    #[test]
+    fn a_policy_reachable_defer_threshold_passes_through_unchanged() {
+        let (lo, _) = ndn_radio_cognition::DEFER_THRESHOLD_DBM_BAND;
+        let want = (lo + 10, lo + 10 - ndn_radio_cognition::DEFER_HYSTERESIS_MAX_DB);
+        let k = actuate(
+            Arc::new(SpyKnobs::default()),
+            TxParams {
+                edcca_threshold_dbm: Some(want),
+                ..Default::default()
+            },
+        );
+        assert_eq!(*k.edcca_thresh_calls.lock().unwrap(), vec![want]);
     }
 
     /// A radio with dBm control is driven in dBm — and the index knob is left
@@ -2073,6 +2528,41 @@ mod tests {
         RadioCapability::wifi_monitor_5ghz(vec![149])
     }
 
+    /// **The `addr3 == addr1` guard** — the prerequisite for reading the ephemeral ID / DAR flags /
+    /// commitment slice out of `addr3[4]/[5]`.
+    ///
+    /// Two builders overwrite `addr3` with an address that is not an ephemeral ID: `build_amsdu`
+    /// writes `addr3 = addr1` and the base builder falls back to `addr3 = dst` (`ff × 6` broadcast
+    /// on a legacy frame). Both were fed straight into the DAR path, so every legacy-shaped frame
+    /// was read as a collision hint naming ID `0xff` — a live defect, and one the commitment slice
+    /// would have inherited. An id-carrying frame seeds `addr3[0..4]` from its nonce, so its `addr3`
+    /// never equals its broadcast `addr1`.
+    #[test]
+    fn addr3_is_read_as_an_ephemeral_id_only_in_the_id_carrying_shape() {
+        use ndn_radio_cognition::ephemeral_id::FLAG_ID_COLLISION;
+
+        // Legacy broadcast: addr1 = addr3 = ff×6. Read raw, addr3[5] = 0xff sets FLAG_ID_COLLISION.
+        let bcast = ndn_radio_hal::BROADCAST;
+        assert_eq!(bcast[5] & FLAG_ID_COLLISION, FLAG_ID_COLLISION, "premise");
+        assert_eq!(
+            ephemeral_id_flags(Some(&bcast), Some(&bcast)),
+            None,
+            "a legacy broadcast frame is not a DAR hint naming ID 0xff"
+        );
+
+        // A-MSDU: addr3 = addr1 — filler, not an ID.
+        let ra = [0x03u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(ephemeral_id_flags(Some(&ra), Some(&ra)), None);
+
+        // The id-carrying shape: addr3[0..4] is nonce-seeded, so it differs from addr1.
+        let a3 = [0xde, 0xad, 0xbe, 0xef, 0x5a, 0b0110_0100];
+        assert_eq!(ephemeral_id_flags(Some(&ra), Some(&a3)), Some(a3));
+
+        // A capture path that surfaced no addr1 still yields whatever addr3 it did surface.
+        assert_eq!(ephemeral_id_flags(None, Some(&a3)), Some(a3));
+        assert_eq!(ephemeral_id_flags(Some(&ra), None), None);
+    }
+
     fn name_tlv(comps: &[&[u8]]) -> Vec<u8> {
         let mut inner = Vec::new();
         for c in comps {
@@ -2090,17 +2580,34 @@ mod tests {
         Bytes::from(d)
     }
 
-    /// The multi-radio medium carries Tier-0 addressing end to end (#91c). A producer
-    /// `with_bloom` addresses each object by its name's prefix-set filter (`addr1‖addr2`) with
-    /// the ephemeral nonce in `addr3`; a relay registered on the coarse `/x` receives the whole
-    /// family, an unrelated `/w` node receives none, and — the nonce check — two objects with
-    /// *different* names arrive under the *same* neighbour address (the per-transmitter nonce
-    /// from addr3), not the name-derived filter half that sits in addr2.
-    #[tokio::test]
-    async fn medium_bloom_filters_and_keys_nonce_from_addr3() {
-        let key = crate::OPEN_GROUP_KEY;
+    /// **The medium's latency seam takes an authority** (#93). `with_lease_latency_unauthorised` is
+    /// the name the bare path deserves — it promotes whatever slice literal it is handed, and
+    /// `with_lease_latency_unauthorised(mine, mine)` promotes everything this node sends — while
+    /// `with_lease_latency_authorised` asks a `ClassAuthority` first. Neither *enforces* anything
+    /// (a permissive impl is four lines); what the pair buys is that self-assertion is no longer the
+    /// shorter spelling, and that `grep impl ClassAuthority` enumerates what a deployment trusts.
+    #[test]
+    fn the_medium_latency_seam_takes_an_authority() {
+        struct OnlyAlarm;
+        impl ndn_radio_cognition::ClassAuthority for OnlyAlarm {
+            fn ceiling_for(&self, prefix_hash: u64) -> ndn_radio_cognition::Priority {
+                if prefix_hash == ndn_radio_cognition::prefix_hash(&[b"alarm".as_slice()]) {
+                    ndn_radio_cognition::Priority::Urgent
+                } else {
+                    ndn_radio_cognition::Priority::Normal
+                }
+            }
+        }
         let bus = LoopbackMonitorBus::new();
-        let producer = RadioMediumFace::new(
+        let regs = [
+            b"/bulk".as_slice(),
+            b"/alarm".as_slice(),
+            b"/light".as_slice(),
+        ];
+        // Both prefixes ASKED for the lanes; only one of them is the campaign's lane policy.
+        let asked = [b"/alarm".as_slice(), b"/bulk".as_slice()];
+
+        let bare = RadioMediumFace::new(
             FaceId(1),
             vec![RadioBearer::new(
                 RadioId(1),
@@ -2108,9 +2615,8 @@ mod tests {
                 cap(),
             )],
         )
-        .with_bloom(&key, &["/x"])
-        .build();
-        let relay = RadioMediumFace::new(
+        .with_lease_latency_unauthorised(&regs, &asked);
+        let gated = RadioMediumFace::new(
             FaceId(2),
             vec![RadioBearer::new(
                 RadioId(2),
@@ -2118,52 +2624,15 @@ mod tests {
                 cap(),
             )],
         )
-        .with_bloom(&key, &["/x"])
-        .build();
-        let other = RadioMediumFace::new(
-            FaceId(3),
-            vec![RadioBearer::new(
-                RadioId(3),
-                Arc::new(bus.endpoint(3, -50)),
-                cap(),
-            )],
-        )
-        .with_bloom(&key, &["/w"])
-        .build();
+        .with_lease_latency_authorised(&regs, &asked, &OnlyAlarm);
 
-        producer
-            .send_bytes(data_pkt(&name_tlv(&[b"x", b"y"])))
-            .await
-            .unwrap();
-        producer
-            .send_bytes(data_pkt(&name_tlv(&[b"x", b"z"])))
-            .await
-            .unwrap();
-
-        // The /x relay hears both names; capture their neighbour addresses (the ether bytes).
-        let mut addrs = Vec::new();
-        for _ in 0..2 {
-            let (_, a) = tokio::time::timeout(Duration::from_secs(2), relay.recv_bytes_with_addr())
-                .await
-                .expect("relay hears the /x family")
-                .unwrap();
-            let Some(ndn_transport::FaceAddr::Ether(bytes)) = a else {
-                panic!("expected an ether neighbour address, got {a:?}");
-            };
-            addrs.push(bytes);
-        }
-        assert_eq!(
-            addrs[0], addrs[1],
-            "two different-name objects from one producer share ONE neighbour address — the addr3 \
-             nonce, not the name-derived addr2 filter half"
-        );
-
-        // The /w node hears neither (Tier-0 filter drops before the engine).
-        let none =
-            tokio::time::timeout(Duration::from_millis(200), other.recv_bytes_with_addr()).await;
-        assert!(
-            none.is_err(),
-            "an unrelated prefix must not pass the medium's Bloom filter"
+        let table = |f: &RadioMediumFace| f.group_table.clone().expect("a lease face has a table");
+        assert_ne!(
+            table(&bare).class_digest(true),
+            table(&gated).class_digest(true),
+            "the authority refused /bulk, and the class commitment records the difference — which is \
+             what a neighbour reads off the slices these two nodes piggyback on their data frames \
+             (and, if either is the clock master, off its beacon)"
         );
     }
 
@@ -2195,7 +2664,7 @@ mod tests {
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
                 addr3: None,
-                addr4: None,
+                extra: None,
                 htc: None,
             };
             radio.inject_at(frame, McsDescriptor::ht(0)).await.unwrap();
@@ -2277,7 +2746,7 @@ mod tests {
                 dst: BROADCAST,
                 src: DEFAULT_SRC,
                 addr3: None,
-                addr4: None,
+                extra: None,
                 htc: None,
             })
             .await
@@ -2456,178 +2925,6 @@ mod tests {
             "the frame that bypassed must be the robust one"
         );
     }
-    /// **The medium's coded frames must carry Tier-0 addressing and a fresh §2 nonce too.**
-    ///
-    /// The medium's FEC path used `ndn-coding`'s generic `FrameIoSink`, constructed with a fixed
-    /// `BROADCAST` dst and one nonce snapshotted for the bridge's whole lifetime — and the FEC
-    /// branch returned *before* the block that computes Tier-0 addressing. So enabling link-FEC
-    /// silently switched off both name addressing and nonce rotation on this face, the same defect
-    /// `WifiPhy` had in its own dialect (#82).
-    ///
-    /// Both faces now share `RadioFecSink` and pin the address the direct path resolves. This
-    /// asserts the coded frames land under the registered prefix, and that addr3 carries a nonce
-    /// rather than the sink's fixed source.
-    #[tokio::test]
-    async fn medium_tier0_addressing_survives_link_fec() {
-        use crate::OPEN_GROUP_KEY;
-
-        const K: usize = 2;
-        let key = OPEN_GROUP_KEY;
-        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
-
-        let bus = LoopbackMonitorBus::new();
-        let sniffer = Arc::new(bus.endpoint(99, -70));
-        let medium = RadioMediumFace::new(
-            FaceId(5),
-            vec![RadioBearer::new(
-                RadioId(0),
-                Arc::new(bus.endpoint(5, -50)),
-                cap(),
-            )],
-        )
-        .with_bloom(&key, &[b"/x/y".as_slice()])
-        .with_link_fec(
-            K,
-            Duration::from_millis(20),
-            Arc::new(AtomicU16::new(1)),
-            Arc::new(LossMeter::default()),
-        )
-        .build();
-
-        let collector = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            while let Ok(Ok(f)) =
-                tokio::time::timeout(Duration::from_millis(150), sniffer.recv_frame()).await
-            {
-                seen.push((f.group, f.addr, f.addr3));
-            }
-            seen
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
-        for _ in 0..K {
-            medium.send_bytes(wire.clone()).await.unwrap();
-        }
-        let frames = collector.await.unwrap();
-
-        assert!(
-            !frames.is_empty(),
-            "the coded generation must reach the bus"
-        );
-        for (i, (a1, a2, a3)) in frames.iter().enumerate() {
-            let (Some(a1), Some(a2)) = (a1, a2) else {
-                panic!("coded frame {i} carries no address pair");
-            };
-            let mut w = [0u8; 16];
-            w[..6].copy_from_slice(a1);
-            w[6..12].copy_from_slice(a2);
-            assert!(
-                masks
-                    .iter()
-                    .any(|m| crate::PrefixFilter::from_wire(w).may_match(m)),
-                "coded frame {i} must stay addressed under /x (addr1={a1:02x?} addr2={a2:02x?})"
-            );
-            assert!(
-                a3.is_some(),
-                "coded frame {i} must carry the doctrine §2 nonce in addr3, displaced there by the \
-                 filter — the old sink dropped it entirely"
-            );
-        }
-    }
-
-    /// Build one LP fragment: `LpPacket(0x64){ Sequence(0x51), FragIndex(0x52), FragCount(0x53),
-    /// Fragment(0x50) }`. Only fragment 0 carries the Name, which is the whole point below.
-    fn lp_frag(seq: u64, index: u64, count: u64, payload: &[u8]) -> Bytes {
-        fn tlv(t: u8, v: &[u8]) -> Vec<u8> {
-            let mut o = vec![t, v.len() as u8];
-            o.extend_from_slice(v);
-            o
-        }
-        let mut inner = Vec::new();
-        inner.extend(tlv(0x51, &seq.to_be_bytes()));
-        inner.extend(tlv(0x52, &index.to_be_bytes()));
-        inner.extend(tlv(0x53, &count.to_be_bytes()));
-        inner.extend(tlv(0x50, payload));
-        let mut out = vec![0x64, inner.len() as u8];
-        out.extend_from_slice(&inner);
-        Bytes::from(out)
-    }
-
-    /// **Every fragment of one object must carry that object's Tier-0 filter, not just the first.**
-    ///
-    /// Only fragment 0 of an LP-fragmented object contains the Name TLV, so a filter derived
-    /// per-frame can only be computed once. `WifiPhy` handles this with a cache keyed by LP
-    /// base sequence (`sequence - frag_index`), so fragments 1..n reuse the opening fragment's
-    /// filter. The medium's `bloom_wire_for_wire` had no cache: it called `inner_name(wire)`, got
-    /// `None` for every continuation fragment, and fell back to broadcast.
-    ///
-    /// That loses no data — broadcast is admitted by every receiver — but it silently surrenders the
-    /// filtering for all but the first frame of every fragmented object, which on a fragmenting MTU
-    /// is nearly all of the traffic. #106 measured 87.32% reject on air using the *caching* path, so
-    /// collapsing the faces onto an uncached medium would have quietly invalidated that number.
-    #[tokio::test]
-    async fn medium_addresses_every_fragment_of_an_object_under_its_prefix() {
-        use crate::OPEN_GROUP_KEY;
-
-        let key = OPEN_GROUP_KEY;
-        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
-
-        let bus = LoopbackMonitorBus::new();
-        let sniffer = Arc::new(bus.endpoint(99, -70));
-        let medium = RadioMediumFace::new(
-            FaceId(6),
-            vec![RadioBearer::new(
-                RadioId(0),
-                Arc::new(bus.endpoint(6, -50)),
-                cap(),
-            )],
-        )
-        .with_bloom(&key, &[b"/x/y".as_slice()])
-        .build();
-
-        let collector = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            while let Ok(Ok(f)) =
-                tokio::time::timeout(Duration::from_millis(120), sniffer.recv_frame()).await
-            {
-                seen.push((f.group, f.addr));
-            }
-            seen
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // One object /x/y split across three fragments; only fragment 0 carries the Name.
-        let named = data_pkt(&name_tlv(&[b"x", b"y"]));
-        medium.send_bytes(lp_frag(100, 0, 3, &named)).await.unwrap();
-        medium
-            .send_bytes(lp_frag(101, 1, 3, b"tail-a"))
-            .await
-            .unwrap();
-        medium
-            .send_bytes(lp_frag(102, 2, 3, b"tail-b"))
-            .await
-            .unwrap();
-
-        let frames = collector.await.unwrap();
-        assert_eq!(frames.len(), 3, "all three fragments must reach the bus");
-        for (i, (a1, a2)) in frames.iter().enumerate() {
-            let (Some(a1), Some(a2)) = (a1, a2) else {
-                panic!("fragment {i} carries no address pair");
-            };
-            let mut w = [0u8; 16];
-            w[..6].copy_from_slice(a1);
-            w[6..12].copy_from_slice(a2);
-            assert!(
-                masks
-                    .iter()
-                    .any(|m| crate::PrefixFilter::from_wire(w).may_match(m)),
-                "fragment {i} must carry the object's /x filter, not fall back to broadcast \
-                 (addr1={a1:02x?} addr2={a2:02x?})"
-            );
-        }
-    }
-
     /// **A rate the plan decides must change what the medium transmits — and must still lose to the
     /// worst-receiver cap.**
     ///
@@ -2729,10 +3026,73 @@ mod tests {
         );
     }
 
+    /// ★ **The in-tree defect behind surface B: the legacy-rate gate silently switched the whole
+    /// data plane out of the slot MAC.**
+    ///
+    /// `TxBearer::inject` selects [`TxIntent::ROBUST`] when the shared legacy gate is up — purely to
+    /// get the basic rate for a legacy-only-RX neighbour. But `TxIntent::ROBUST.reliability ==
+    /// MostRobust`, and `inject_with_intent` derived its GATE decision from that same field. So one
+    /// neighbour advertising legacy-only RX took this node out of the airtime lease entirely, at the
+    /// slowest rate it transmits — the worst possible combination for a shared schedule, and
+    /// invisible to the suite because `medium_actuates_the_planned_rate_but_the_legacy_gate_outranks_it`
+    /// binds no scheduler.
+    ///
+    /// The fix separates the two axes: `robust` still decides rate/FEC/A-MSDU, `control` alone
+    /// decides the gate, and only [`RunningMedium::send_robust`] sets it.
+    ///
+    /// `bypassed` is the faithful proxy for "skipped the slot MAC": it is incremented in the very
+    /// branch that skips `sched.gate`, so it cannot drift from it. Per-face rather than the
+    /// process-global `TXD_BYPASS`, so this is deterministic with other tests running.
+    ///
+    /// Falsified by restoring the old condition (`if robust` instead of `if control`): the
+    /// legacy-gated data frame is then counted as a bypass and the first assertion fires.
+    #[tokio::test]
+    async fn the_legacy_rate_gate_must_not_take_data_out_of_the_airtime_lease() {
+        struct Sink;
+        #[async_trait::async_trait]
+        impl FrameIo for Sink {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+        }
+
+        let gate = Arc::new(AtomicBool::new(true)); // a legacy-only-RX neighbour is present
+        let medium = RadioMediumFace::new(
+            FaceId(21),
+            vec![RadioBearer::new(RadioId(0), Arc::new(Sink), cap())],
+        )
+        .with_legacy_gate(gate.clone())
+        .build();
+
+        // DATA, under the legacy gate. It rides the basic rate (that part is correct and tested
+        // elsewhere) — but it must remain subject to the slot MAC.
+        medium.send_bytes(Bytes::from_static(b"data")).await.unwrap();
+        assert_eq!(
+            medium.gate_counts().bypassed(),
+            0,
+            "a legacy-rate data frame must NOT skip the slot MAC: the intent picks the rate, it \
+             does not buy an exemption from the airtime lease"
+        );
+
+        // CONTROL. This one bypasses on purpose, and is counted so the bypass is visible.
+        medium
+            .send_robust(Bytes::from_static(b"report"))
+            .await
+            .unwrap();
+        assert_eq!(
+            medium.gate_counts().bypassed(),
+            1,
+            "send_robust is the only caller that skips the gate, and every skip is counted"
+        );
+    }
+
     /// **A decided rate must reach FEC-CODED frames too** — the combination, not each feature alone.
     ///
     /// Found on air, not here. `medium_actuates_the_planned_rate_but_the_legacy_gate_outranks_it`
-    /// tests rate with FEC off; `medium_tier0_addressing_survives_link_fec` tests FEC with no rate
+    /// tests rate with FEC off; other tests exercise FEC with no rate
     /// policy. Both passed while the intersection was broken: with a policy bound *and* FEC on,
     /// every data frame takes the FEC branch, which pinned `mcs: None`, so `inject_at` was never
     /// reached and coded frames rode whatever rate happened to be left in the bearer.

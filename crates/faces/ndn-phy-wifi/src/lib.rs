@@ -93,7 +93,6 @@ use ndn_signals_core::SignalStore;
 use ndn_transport::{
     Face, FaceAddr, FaceKind, FacePersistency, LinkType, MtuError, PersistencyError, Transport,
 };
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 // The frame-I/O substrate — the `FrameIo` trait, the inject/capture frame
@@ -111,17 +110,23 @@ pub use ndn_frame_io::{
     RadioCapability, Reach, Reliability, TxIntent, frame, mcs_for_rssi, mcs_phy_rate_bps, radiotap,
 };
 
-// The four userspace USB Wi-Fi driver backends (RTL8812EU/8822E, RTL8821CU,
-// MT7612U, RTL8812AU) were lifted into the standalone `ndn-radio-drivers` crate
-// so drivers have a dedicated home. Re-exported here so existing
-// `ndn_phy_wifi::` paths (and this crate's `crate::LibUsbRtl88xxBackend`
-// etc. references in `control.rs`/`lib.rs`) keep working unchanged.
+// The userspace USB Wi-Fi driver backends were lifted into the standalone
+// `ndn-radio-drivers` crate so drivers have a dedicated home. Re-exported here so existing
+// `ndn_phy_wifi::` paths (and this crate's `crate::LibUsbRtl88xxBackend` etc. references in
+// `control.rs`/`lib.rs`) keep working unchanged.
+//
+// ★ M8: `open_named_radio` and `open_ath9k` are GONE, replaced by the one door
+// `open_radio(pid, &sel, &req)`. `BringUpRequest` and `PartOpts` come with it — a caller names the
+// channel, the width, the role, the power regime and the proof requirement in one value, and
+// `BringUpRequest::from_env` is the only thing in the workspace that reads `NDN_*` for a bring-up.
 #[cfg(feature = "libusb-backend")]
 pub use ndn_radio_drivers::{
     Ath9kHtcBackend, CHIP_ID_8822E, ChannelBw, ChipInfo, DeviceSelect, FwVersion, IqkResult,
     LegacyRate, LibUsbRtl88xxBackend, MT7612U_PIDS, Mt7612uBackend, REALTEK_VID, REG_SYS_CFG,
-    RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PIDS, RTL8821CU_PIDS, RfPath, Rtl8733buBackend,
-    Rtl8812auBackend, Rtl8821cuBackend, open_ath9k, open_named_radio,
+    AR9271_PID, BringUpRequest, PartOpts, RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PID,
+    RTL8812AU_PIDS,
+    RTL8821CU_PIDS, RfPath, Rtl8733buBackend,
+    Rtl8812auBackend, Rtl8821cuBackend, open_radio,
 };
 
 // The serial-bridged 802.11 backend (BW16 / ESP32-C5) — a raw 802.11 node driven
@@ -152,7 +157,7 @@ pub use ndn_radio_cognition::{FULL_RX_MCS, LEGACY_ONLY_RX, SINGLE_STREAM_HT_RX_M
 // TX fan-out), the data plane matching the already-medium-shaped `RadioControl`.
 mod medium;
 pub use medium::{
-    ContextSource, LinkSignalStore, LossMeter, MediumActuator, RadioBearer, RadioId,
+    ContextSource, GateCounts, LinkSignalStore, LossMeter, MediumActuator, RadioBearer, RadioId,
     RadioMediumFace, RunningMedium, StaticContexts, spawn_control_loop,
 };
 
@@ -163,21 +168,19 @@ pub use factory::RadioMediumFaceFactory;
 
 pub mod radio;
 pub use radio::{Bandwidth, DbmRange, OpenRadio, RadioKnobs, RadioProfile, RadioTime};
+// The power vocabulary that `RadioKnobs::set_tx_power` speaks — see the note in `radio.rs`.
+pub use radio::{
+    AppliedPower, BringUpReport, PowerReference, PowerRequest, PowerWrite, RateGroupPolicy,
+    RfAuthority,
+};
 
 // The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
 mod sched;
-pub use sched::{FaceScheduler, GroupTable, TIME_BEACON_MAGIC, TimeStatus};
+pub use sched::{
+    FaceScheduler, GroupTable, SCHED_PARAMS_VERSION, TIME_BEACON_MAGIC, TimeStatus,
+};
 
 pub mod measure;
-
-// #91 Tier-0: the in-frame prefix-set Bloom filter (addr1 ‖ addr2). Zero-parse name matching that
-// replaces the name-group hash; ported from the measured firmware reference. See the module docs.
-pub mod gcs;
-pub mod name_gate;
-pub mod ndn_nic;
-pub use ndn_radio::mac::tier0;
-pub mod tier1;
-pub use tier0::PrefixFilter;
 
 // nl80211 Wi-Fi channel control (Linux), folded in from the former ndn-research
 // draft crate — it belongs with the Wi-Fi monitor face.
@@ -199,12 +202,6 @@ pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 /// so each reconstructed the addressing its direct send path had already computed — badly, and
 /// differently. Both dropped things:
 ///
-/// * **Tier-0 addressing.** Under [`TxAddr::PrefixBloom`] the object's 12-byte prefix-set filter is
-///   split across *both* address fields (addr1 = hi, addr2 = lo) and the receiver reassembles
-///   `addr1 ‖ addr2` before testing it. Pinning only `dst` left the sender's fixed source in addr2,
-///   so a receiver registered on that very prefix reconstructed half a filter and dropped the
-///   frame — a false negative, not a lost optimisation. `tier0_addressing_survives_link_fec` is
-///   the regression test; it failed with `addr2 = 02 4e 44 4e 00 01` (`DEFAULT_SRC`).
 /// * **The doctrine §2 rotating nonce.** The face pinned no `addr3` at all; the medium snapshotted
 ///   one nonce for the bridge's whole lifetime. Either way the rotation that bounds linkability
 ///   stopped happening the moment FEC was enabled.
@@ -216,21 +213,15 @@ pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 /// faces build it from that same code — there is nothing left for a sink to guess.
 ///
 /// The pin is per-*generation*, snapshotted from the opening frame, and that is deliberate: all
-/// k + R frames of a generation share one address, so a receiver that admits the object also admits
-/// its parity. Addressing parity independently would fail — a parity frame carries no NDN name to
-/// derive a filter from.
+/// k + R frames of a generation share one broadcast address and ephemeral nonce.
 #[derive(Clone, Copy)]
 pub(crate) struct RadioFecPin {
-    /// addr1 — the broadcast address, a split per-Data-name address, or the filter's high half.
+    /// addr1 — the broadcast address or a split per-Data-name address.
     pub dst: [u8; 6],
-    /// addr2 — the ephemeral source nonce, or the filter's low half under Tier-0.
+    /// addr2 — the ephemeral source nonce.
     pub src: [u8; 6],
-    /// addr3 — the doctrine §2 nonce when Tier-0 displaced it out of addr2.
+    /// addr3 — the ephemeral §2 id/flags/commitment (bytes [4]/[5]); [0..4] nonce-seeded filler.
     pub addr3: Option<[u8; 6]>,
-    /// addr4 — the wide-profile extra Blur, when this generation rides the wide profile.
-    pub addr4: Option<[u8; 6]>,
-    /// HT Control — the wide-profile fingerprint + marker, paired with `addr4`.
-    pub htc: Option<[u8; 4]>,
     /// The transmit intent (so the medium's legacy-rate gate reaches coded frames too).
     pub intent: TxIntent,
     /// The exact rate, when the bearer takes one per frame (`WifiPhy`). `None` where rate is
@@ -256,8 +247,8 @@ impl GenerationSink for RadioFecSink {
                 dst: pin.dst,
                 src: pin.src,
                 addr3: pin.addr3,
-                addr4: pin.addr4,
-                htc: pin.htc,
+                extra: None,
+                htc: None,
             };
             let _ = match pin.mcs {
                 Some(mcs) => self.radio.inject_at(frame, mcs).await,
@@ -272,44 +263,17 @@ impl GenerationSink for RadioFecSink {
 /// key). See `docs/mac-addressing-doctrine.md` §8.
 #[derive(Clone)]
 pub enum TxAddr {
-    /// No name addressing: broadcast — every receiver in range hears it.
+    /// No name addressing: broadcast — every receiver in range hears it. Relevance is decided by the
+    /// receiver parsing the NDN name, so this is the only addressing mode.
     Broadcast,
-    /// **Tier-0 prefix-set Bloom filter** (#91): every prefix of the object's inner NDN
-    /// name is inserted into a 94-bit filter carried in `addr1 ‖ addr2` (all fragments of
-    /// one object share it), with the ephemeral source nonce in `addr3`. This ships *all*
-    /// name granularities at once, so a receiver matches at *its own* registered prefix —
-    /// longest-prefix match becomes a receiver-local decision and the out-of-band granularity
-    /// agreement the old name-group hash needed disappears. See `tier0` and the redesign §3.
-    PrefixBloom {
-        /// Trust context; keys the filter so a private group is unlinkable.
-        key: GroupKey,
-    },
 }
 
-// `RxFilter` moved to `name_gate` (#82) — the gate is now one implementation shared by both
-// faces, instead of this enum being matched separately in each.
-pub use name_gate::{NameGate, RxFilter};
-
 /// The frame → Name-TLV → `/`-joined-name derivation is a **named-data-radio primitive**, not this
-/// face's private helper: it lives in `ndn_radio_cognition::name` so every bearer (this face's
-/// address Blur, the LoRa body GCS, …) computes filter input over identical bytes (#44). Re-exported
+/// face's private helper: it lives in `ndn_radio_cognition::name` so every bearer derives the name
+/// over identical bytes (#44) when deciding relevance. Re-exported
 /// here so the many `crate::inner_name` / `crate::ndn_name_to_slash` call sites resolve unchanged,
 /// against the one shared implementation.
 pub(crate) use ndn_radio_cognition::name::{inner_name, ndn_name_to_slash};
-
-/// The 64-bit Tier-0 filter key from a [`GroupKey`] (first 8 bytes) — [`OPEN_GROUP_KEY`] a public
-/// keyspace, a shared secret a private one. Shared by the single-radio face and the multi-radio medium.
-/// The Tier-0 filter key **is** the whole [`GroupKey`].
-///
-/// This used to truncate to the low 8 bytes, because the FNV keying took a `u64`. SipHash-2-4 takes
-/// the full 128-bit key, so a private group's key now contributes all of its entropy instead of half.
-pub(crate) fn bloom_key64(key: &GroupKey) -> &[u8; 16] {
-    &key.0
-}
-
-// The name→wire-filter compilation now lives in `Tier0Addresser::compute` (it must branch on the
-// base vs wide profile and share the fragment cache), so the old free `bloom_wire_for_wire` helper
-// is gone — there is exactly one place that turns a name into addressing bytes.
 
 /// **How the next frame's exact rate is chosen** — shared by both faces (#82).
 ///
@@ -403,203 +367,6 @@ impl RatePolicy {
     }
 }
 
-/// **Tier-0 TX addressing for a whole object, fragments included** — shared by both faces (#82).
-///
-/// Only fragment 0 of an LP-fragmented object carries the Name TLV, so the object's prefix-set
-/// filter can be derived exactly once. This caches it by **LP base sequence** (`sequence -
-/// frag_index`) so fragments 1..n are addressed to the same filter as the fragment that opened the
-/// object, and a receiver registered on that prefix admits all of them.
-///
-/// `WifiPhy` had this; `RadioMediumFace` did not — its `bloom_wire_for_wire` asked
-/// `inner_name` per frame, got `None` for every continuation fragment and fell back to broadcast.
-/// That loses no data (broadcast is admitted by everyone) but surrenders the filtering on all but
-/// the first frame of every fragmented object — nearly all traffic at a fragmenting MTU, and
-/// enough to have quietly invalidated #106's measured 87.32% reject had the faces been collapsed
-/// onto the uncached path. `medium_addresses_every_fragment_of_an_object_under_its_prefix` is the
-/// regression test.
-///
-/// Unlike the original, the cache is **bounded**. The face's was a `HashMap` that only ever grew:
-/// one entry per fragmented object, inserted and never removed — a slow leak on a long-running
-/// relay. Entries are dropped when the object's last fragment goes out, and a hard cap covers the
-/// case where that fragment never arrives (a torn-down peer, a reordered tail). Evicting early is
-/// safe: a miss falls back to broadcast, which over-accepts rather than dropping.
-/// The addressing fields one outgoing object contributes to the frame: the 16-byte base Blur
-/// (`addr1‖addr2‖addr3[0:4]`) always, plus — on the **wide** profile — the additive `addr4` extra
-/// Blur and the 24-bit exact-match fingerprint (for HT Control). Cached whole per fragmented object,
-/// so every fragment of one object carries identical addressing (a receiver that admits the object
-/// admits all its fragments and its parity).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct TxWire {
-    pub base: [u8; 16],
-    /// `Some(addr4)` on the wide profile — the extra Blur projection. `None` on the base profile.
-    pub extra: Option<[u8; 6]>,
-    /// The wide-profile fingerprint (0 on the base profile — unused when `extra` is `None`).
-    pub fp: u32,
-}
-
-pub(crate) struct Tier0Addresser {
-    key: GroupKey,
-    /// When true, this face emits the **wide** profile: a 4-address QoS+HTC frame carrying the extra
-    /// Blur (`addr4`) and the fingerprint (HT Control) on top of the base Blur. The base region is
-    /// byte-identical either way, so a base receiver reads a wide frame with zero false negatives.
-    wide: bool,
-    cache: Mutex<HashMap<u64, TxWire>>,
-}
-
-/// Cap on in-flight fragmented objects tracked at once. Generous next to any real fragment window;
-/// it exists so a peer that vanishes mid-object cannot grow the map without bound.
-const TIER0_CACHE_CAP: usize = 4096;
-
-impl Tier0Addresser {
-    pub(crate) fn new(key: GroupKey) -> Self {
-        Self {
-            key,
-            wide: false,
-            cache: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// A **wide-profile** addresser (see [`TxWire`]): identical base Blur, plus the additive extra
-    /// Blur + fingerprint. Paired with [`RxFilter::WideBloom`] by [`RadioMediumFace::with_wide_bloom`].
-    pub(crate) fn new_wide(key: GroupKey) -> Self {
-        Self {
-            key,
-            wide: true,
-            cache: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// How many in-flight objects are currently tracked — the bound this type exists to keep.
-    #[cfg(test)]
-    pub(crate) fn tracked(&self) -> usize {
-        self.cache.lock().unwrap().len()
-    }
-
-    /// Compute the addressing fields for a wire that carries a name (base, and — when wide — the
-    /// extra Blur + fingerprint). The base region is [`PrefixFilter`] either way, so the two profiles
-    /// agree byte-for-byte on `addr1‖addr2‖addr3[0:4]`.
-    fn compute(&self, wire: &[u8]) -> Option<TxWire> {
-        let name = inner_name(wire)?;
-        let slash = ndn_name_to_slash(name);
-        let key = bloom_key64(&self.key);
-        if self.wide {
-            // `WideFrame::of_name`'s id/flags land in addr3[4:6], which the medium fills from its own
-            // deconfliction state — so pass 0 here and take only the blur (base+extra) + fingerprint.
-            let wf = crate::tier0::WideFrame::of_name(key, &slash, 0, 0);
-            Some(TxWire {
-                base: wf.blur.base().to_wire(),
-                extra: Some(*wf.blur.extra_bytes()),
-                fp: wf.fingerprint,
-            })
-        } else {
-            let mut f = PrefixFilter::new();
-            f.insert_name(key, &slash);
-            Some(TxWire {
-                base: f.to_wire(),
-                extra: None,
-                fp: 0,
-            })
-        }
-    }
-
-    /// The addressing fields for this outgoing wire, or `None` to address it broadcast — no name and
-    /// no cached object, a safe over-accept every receiver's filter admits.
-    pub(crate) fn wire_for(&self, wire: &[u8]) -> Option<TxWire> {
-        let Some(h) = ndn_packet::lp::extract_fragment(wire) else {
-            // Unfragmented: the name is right here, nothing to remember.
-            return self.compute(wire);
-        };
-        let base = h.sequence.wrapping_sub(h.frag_index);
-        let last = h.frag_index + 1 >= h.frag_count;
-        if h.frag_index == 0 {
-            let w = self.compute(wire)?;
-            if !last {
-                let mut c = self.cache.lock().unwrap();
-                if c.len() >= TIER0_CACHE_CAP
-                    && let Some(&victim) = c.keys().next()
-                {
-                    c.remove(&victim);
-                }
-                c.insert(base, w);
-            }
-            return Some(w);
-        }
-        let mut c = self.cache.lock().unwrap();
-        if last {
-            c.remove(&base)
-        } else {
-            c.get(&base).copied()
-        }
-    }
-}
-
-/// True if `anc` is a **component-boundary** prefix of `desc` (an ancestor in the name tree),
-/// including equality and the root `/`. `/a` is an ancestor of `/a/b` but NOT of `/ab`.
-pub fn is_component_ancestor(anc: &[u8], desc: &[u8]) -> bool {
-    if anc == b"/" {
-        return true; // the root covers everything
-    }
-    if anc.len() > desc.len() || desc[..anc.len()] != *anc {
-        return false;
-    }
-    // Boundary: exactly equal, or the next byte in `desc` starts a new component.
-    anc.len() == desc.len() || desc[anc.len()] == b'/'
-}
-
-/// **Coverage-dedup** — reduce a registered-prefix set to its *antichain*: drop any prefix that has
-/// a registered ancestor, keeping one of each exact-duplicate.
-///
-/// A frame under the deeper prefix is already admitted by the shorter one's mask, so the deeper mask
-/// is redundant *for admission*. This strictly reduces the receiver's mask count `E` — and therefore
-/// **both** the O(E) per-frame test and the decision false-positive rate `1 − (1 − p)^E` — with
-/// **zero false negatives**: dropping a covered prefix never removes a frame the ancestor does not
-/// also admit. The dominant win is PIT churn: an on-path Interest is under a FIB prefix you already
-/// registered, so its entry collapses to that prefix and adds no mask at all.
-pub fn coverage_antichain<'a>(prefixes: &[&'a [u8]]) -> Vec<&'a [u8]> {
-    (0..prefixes.len())
-        .filter(|&i| {
-            let p = prefixes[i];
-            !prefixes.iter().enumerate().any(|(j, &q)| {
-                // Covered by a strictly-shorter ancestor, or by an earlier exact duplicate.
-                j != i && is_component_ancestor(q, p) && (q.len() < p.len() || j < i)
-            })
-        })
-        .map(|i| prefixes[i])
-        .collect()
-}
-
-/// Precompute one [`PrefixFilter::mask_for`] per registered `/`-string prefix — a receiver's
-/// [`RxFilter::Bloom`] mask set, reusable by the medium's RX reader. The set is coverage-deduped
-/// ([`coverage_antichain`]) so a deep registration under a broader one costs no extra mask or FP.
-pub(crate) fn bloom_masks_for(
-    key: &GroupKey,
-    prefixes: &[impl AsRef<[u8]>],
-) -> std::sync::Arc<[PrefixFilter]> {
-    let k = bloom_key64(key);
-    let refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_ref()).collect();
-    coverage_antichain(&refs)
-        .into_iter()
-        .map(|p| PrefixFilter::mask_for(k, p))
-        .collect()
-}
-
-/// The **wide-profile** counterpart of [`bloom_masks_for`]: one [`tier0::WifiWideBlur::mask_for`] per
-/// registered prefix (base 126-bit region + 48-bit extra projection), for [`RxFilter::WideBloom`].
-/// Same coverage-dedup, so the tighter filter costs no extra masks. A wide receiver built from this
-/// tests a wide frame against both regions (lower FP) yet still admits a base sender's 3-address
-/// frame — the base region of each mask is byte-identical to what [`bloom_masks_for`] produced.
-pub(crate) fn wide_bloom_masks_for(
-    key: &GroupKey,
-    prefixes: &[impl AsRef<[u8]>],
-) -> std::sync::Arc<[tier0::WifiWideBlur]> {
-    let k = bloom_key64(key);
-    let refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_ref()).collect();
-    coverage_antichain(&refs)
-        .into_iter()
-        .map(|p| tier0::WifiWideBlur::mask_for(k, p))
-        .collect()
-}
-
 // `inject_at` / `inject_batch_at` are called straight on `FrameIo` — there are no local helpers.
 //
 // #82 part 1 moved this face from `Arc<dyn FrameIo>` to `Arc<dyn FrameIo>`. That was the right
@@ -632,14 +399,14 @@ pub(crate) fn wide_bloom_masks_for(
 ///
 /// | feature | what the split had done |
 /// |---|---|
-/// | name gate | Tier-1 and the NDN-NIC baseline existed on one side only (part 1) |
+/// | name relevance | the receive gate existed on one side only (part 1; the in-frame gate is since retired) |
 /// | A-MSDU | reached the backend's override from one side only; a helper silently disabled it |
-/// | link-FEC | two sinks, each pinning too little; coded frames lost Tier-0 addressing |
-/// | Tier-0 fragments | the medium had no fragment cache; the face's leaked |
+/// | link-FEC | two sinks, each pinning too little; coded frames lost the ephemeral-id addressing |
+/// | fragment cache | the medium had no fragment cache; the face's leaked |
 /// | rate policy | a decided MCS reached the air from one side only |
 ///
 /// The collapse also fixes one thing on its own, with no code written for it: this face used to
-/// address non-Tier-0 frames `(BROADCAST, DEFAULT_SRC)` — a fixed host tag in the source field,
+/// address non-name-addressed frames `(BROADCAST, DEFAULT_SRC)` — a fixed host tag in the source field,
 /// which is exactly what `docs/mac-addressing-doctrine.md` §2 forbids. The medium has always
 /// stamped the per-boot ephemeral rotating nonce there. Routing this face through it makes the
 /// doctrine hold on both paths, which is the argument for collapsing rather than syncing: a
@@ -653,9 +420,6 @@ pub struct WifiPhy {
     /// The running medium, materialised on first use. Built lazily so the builder chain stays a
     /// plain `mut self -> Self` and no reader task is spawned for a face that is only configured.
     running: tokio::sync::OnceCell<crate::medium::RunningMedium>,
-    /// The very gate the medium's reader uses — held here so `tier1_handle` / `tier1_dropped`
-    /// answer about the live filter rather than a copy of its configuration.
-    gate: Arc<NameGate>,
     /// The very rate policy the medium's bearer uses, for `select_mcs`.
     rate: Arc<RatePolicy>,
 }
@@ -705,7 +469,6 @@ impl WifiPhy {
             mtu: std::sync::atomic::AtomicUsize::new(MONITOR_MTU),
             cfg: Mutex::new(Some(medium)),
             running: tokio::sync::OnceCell::new(),
-            gate: Arc::new(NameGate::open()),
             rate,
         }
     }
@@ -790,10 +553,19 @@ impl WifiPhy {
     /// build a named-radio face over it — the one-call path from a plugged-in dongle to a working
     /// face on a host without a kernel monitor driver (macOS, etc.). Pair with
     /// [`into_face`](Self::into_face) to mount it on the engine.
+    ///
+    /// ★ **M8**: this is `open_radio(0xa81a, …)`, not `open_monitor(channel)`. The old opener
+    /// claimed the FIRST Realtek on the bus — an 8812AU shares `RTL88XX_PIDS` and would be
+    /// claimed by mistake — and discarded the bring-up report. This names the part, honours
+    /// `NDN_USB_ADDR`/`NDN_USB_INDEX`, and starts the RX pump the old path did not.
     #[cfg(feature = "libusb-backend")]
     pub fn open_libusb(id: FaceId, channel: u8) -> Result<Self, FaceError> {
-        let backend = crate::LibUsbRtl88xxBackend::open_monitor(channel)?;
-        Ok(Self::new(id, Arc::new(backend)))
+        let open = ndn_radio_drivers::open_radio(
+            0xa81a,
+            &ndn_radio_drivers::DeviceSelect::from_env(),
+            &ndn_radio_drivers::BringUpRequest::from_env(channel),
+        )?;
+        Ok(Self::new(id, open.io.clone()))
     }
 
     /// Open the RTL8812EU USB dongle in 5 GHz monitor mode on `channel` and build an **ESP-NOW**
@@ -804,11 +576,20 @@ impl WifiPhy {
     /// ESP32-S3 could never close, since these wfb dongles only inject on 5 GHz. Inject at a basic
     /// rate the peer decodes: 6 Mbps OFDM on 5 GHz (`NDN_RADIO_TX_RATE=4`; 1 Mbps DSSS does not
     /// exist on 5 GHz).
+    ///
+    /// ★ **M8**: the ESP-NOW format now travels on the `BringUpRequest`, so the format the radio
+    /// was brought up in is in its own report rather than applied by a `with_format` the report
+    /// never saw.
     #[cfg(feature = "libusb-backend")]
     pub fn open_libusb_espnow(id: FaceId, channel: u8) -> Result<Self, FaceError> {
-        let backend = crate::LibUsbRtl88xxBackend::open_monitor(channel)?
-            .with_format(FrameFormat::EspNow { oui: ESPNOW_OUI });
-        Ok(Self::espnow(id, Arc::new(backend)))
+        let mut req = ndn_radio_drivers::BringUpRequest::from_env(channel);
+        req.format = FrameFormat::EspNow { oui: ESPNOW_OUI };
+        let open = ndn_radio_drivers::open_radio(
+            0xa81a,
+            &ndn_radio_drivers::DeviceSelect::from_env(),
+            &req,
+        )?;
+        Ok(Self::espnow(id, open.io.clone()))
     }
 
     /// Enable **link-layer FEC**: outbound frames are grouped into generations of up to `k` (or a
@@ -834,91 +615,6 @@ impl WifiPhy {
         self.map(|m| m.with_amsdu_batching(max_msdus, window))
     }
 
-    /// Set the TX name-addressing capability directly (compose with [`with_rx_filter`]).
-    pub fn with_tx_addr(self, tx: TxAddr) -> Self {
-        match tx {
-            TxAddr::PrefixBloom { key } => self.map(|m| m.with_tx_bloom(key)),
-            // Broadcast addressing with the doctrine §2 rotating nonce in the source field is the
-            // medium's default, so there is nothing to configure.
-            TxAddr::Broadcast => self,
-        }
-    }
-
-    /// Set the RX name-filtering capability directly (compose with [`with_tx_addr`]).
-    pub fn with_rx_filter(mut self, rx: RxFilter) -> Self {
-        self.gate = Arc::new(NameGate::new(rx, self.gate.tier1()));
-        let g = self.gate.clone();
-        self.map(|m| m.with_rx_gate(g))
-    }
-
-    /// Mount a **Tier-1** table (#92) behind the Tier-0 gate: BF-FIB / BF-PIT / BF-CS consulted on
-    /// the parsed name once Tier-0 admits a frame, registered on `prefixes` with `bits_each` bits
-    /// per table and `k` hashes. Use [`tier1_handle`](Self::tier1_handle) to drive it from the
-    /// forwarder's real PIT/CS — a Tier-1 whose tables drift from the forwarder's does not merely
-    /// lose efficiency, a stale BF-PIT drops Data the node is waiting for.
-    pub fn with_tier1(
-        mut self,
-        key: &GroupKey,
-        prefixes: &[impl AsRef<[u8]>],
-        bits_each: usize,
-        k: u32,
-    ) -> Self {
-        let mut t = crate::tier1::Tier1::new(&key.0, bits_each, k);
-        for p in prefixes {
-            t.register_prefix(p.as_ref());
-        }
-        t.sync();
-        self.gate = Arc::new(NameGate::new(
-            self.gate.filter(),
-            Some(Arc::new(std::sync::RwLock::new(t))),
-        ));
-        let g = self.gate.clone();
-        self.map(|m| m.with_rx_gate(g))
-    }
-
-    /// The live Tier-1 handle, for the forwarder to drive from its real PIT/CS.
-    pub fn tier1_handle(&self) -> Option<Arc<std::sync::RwLock<crate::tier1::Tier1>>> {
-        self.gate.tier1()
-    }
-
-    /// Frames Tier-1 rejected — the tier's contribution, observable rather than assumed.
-    pub fn tier1_dropped(&self) -> u64 {
-        self.gate.dropped_tier1()
-    }
-
-    /// The rate the next frame would be injected at.
-    #[cfg(test)]
-    fn select_mcs(&self) -> McsDescriptor {
-        self.rate.select()
-    }
-
-    /// Precompute the receiver's Tier-0 mask set for `prefixes`.
-    fn bloom_masks(key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> RxFilter {
-        RxFilter::Bloom(crate::bloom_masks_for(key, prefixes))
-    }
-
-    /// **Tier-0 producer** (#91): address every outgoing object by its name's prefix-set filter, and
-    /// accept inbound frames whose filter could be under `routable_prefix`.
-    pub fn with_bloom_producer(self, key: &GroupKey, routable_prefix: impl AsRef<[u8]>) -> Self {
-        let rx = Self::bloom_masks(key, &[routable_prefix.as_ref()]);
-        self.with_tx_addr(TxAddr::PrefixBloom { key: *key })
-            .with_rx_filter(rx)
-    }
-
-    /// **Tier-0 relay** (#91): RX keeps any frame whose in-frame filter could be under one of
-    /// `prefixes` — the aggregation win, expressed as longest-prefix match rather than a single
-    /// fixed-granularity hash. TX is left as configured.
-    pub fn with_bloom_relay(self, key: &GroupKey, prefixes: &[impl AsRef<[u8]>]) -> Self {
-        let rx = Self::bloom_masks(key, prefixes);
-        self.with_rx_filter(rx)
-    }
-
-    /// **Tier-0 consumer** (#91): accept only frames whose filter could be under `prefix`.
-    pub fn with_bloom_consumer(self, key: &GroupKey, prefix: impl AsRef<[u8]>) -> Self {
-        let rx = Self::bloom_masks(key, &[prefix.as_ref()]);
-        self.with_rx_filter(rx)
-    }
-
     /// Inject at a fixed rate.
     pub fn with_fixed_mcs(mut self, mcs: McsDescriptor) -> Self {
         self.rate = Arc::new(RatePolicy::new(McsPolicy::Fixed(mcs)));
@@ -931,6 +627,12 @@ impl WifiPhy {
         self.rate = Arc::new(RatePolicy::new(McsPolicy::Adaptive));
         let r = self.rate.clone();
         self.map(|m| m.with_rate_policy(r))
+    }
+
+    /// The rate the next frame would be injected at.
+    #[cfg(test)]
+    fn select_mcs(&self) -> McsDescriptor {
+        self.rate.select()
     }
 
     /// Override the injected-frame payload budget (defaults to [`MONITOR_MTU`]).
@@ -1023,128 +725,6 @@ fn now_ms() -> u32 {
 mod tests {
     use ndn_signals_core::LinkSignals;
 
-    /// **Coverage-dedup: strictly fewer masks, and never a false negative.** A registration deeper
-    /// than one already registered collapses to the ancestor, and a frame under it is still admitted.
-    #[test]
-    fn coverage_antichain_drops_covered_prefixes_without_false_negatives() {
-        let reg: Vec<&[u8]> = vec![
-            b"/video",
-            b"/video/ep1/v3/seg0", // covered by /video
-            b"/video/ep2",         // covered by /video
-            b"/ndn/edu",
-            b"/ndn/edu/cs",        // covered by /ndn/edu
-            b"/misc",              // unrelated — kept
-            b"/video",             // exact duplicate — one kept
-        ];
-        let anti = super::coverage_antichain(&reg);
-        assert_eq!(
-            anti,
-            vec![b"/video".as_slice(), b"/ndn/edu".as_slice(), b"/misc".as_slice()],
-            "antichain keeps only the shortest of each chain, one per duplicate"
-        );
-
-        // Zero false negatives: a frame under a dropped prefix is still admitted by its ancestor.
-        let k = super::bloom_key64(&super::OPEN_GROUP_KEY);
-        let masks: Vec<super::PrefixFilter> =
-            anti.iter().map(|p| super::PrefixFilter::mask_for(k, p)).collect();
-        for name in [
-            b"/video/ep1/v3/seg0".as_slice(),
-            b"/video/ep9/v2/seg7",
-            b"/ndn/edu/cs/lecture",
-            b"/misc/thing",
-        ] {
-            let mut f = super::PrefixFilter::new();
-            f.insert_name(k, name);
-            assert!(
-                masks.iter().any(|m| f.may_match(m)),
-                "deduped set must still admit {}",
-                std::str::from_utf8(name).unwrap()
-            );
-        }
-        // is_component_ancestor is a component-boundary test, not a byte prefix.
-        assert!(super::is_component_ancestor(b"/a", b"/a/b"));
-        assert!(!super::is_component_ancestor(b"/a", b"/ab"));
-        assert!(super::is_component_ancestor(b"/", b"/anything/deep"));
-    }
-
-    /// **#92 integration — Tier-1 actually gates the RX path.**
-    ///
-    /// Not "the module compiles and has unit tests": a frame whose name misses all three tables must
-    /// be dropped by the face, and the counter must say so. Without this the tier is decided and
-    /// unactuated, which is this codebase's characteristic defect.
-    #[tokio::test]
-    async fn tier1_gates_the_rx_path_and_counts_what_it_drops() {
-        let key = OPEN_GROUP_KEY;
-        let bus = LoopbackMonitorBus::new();
-        // Tier-0 open so this test isolates Tier-1: whatever is dropped, Tier-1 dropped it.
-        let rx = WifiPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -50))).with_tier1(
-            &key,
-            &["/served"],
-            8192,
-            4,
-        );
-        let tx = WifiPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -50)));
-
-        // A name under the registered prefix must pass; one outside must be dropped by Tier-1.
-        for (comps, expect_pass) in [
-            (vec![b"served".as_slice(), b"thing".as_slice()], true),
-            (vec![b"elsewhere".as_slice(), b"thing".as_slice()], false),
-        ] {
-            tx.send_bytes(data_pkt(&name_tlv(&comps))).await.unwrap();
-            let got =
-                tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes()).await;
-            assert_eq!(
-                got.is_ok(),
-                expect_pass,
-                "Tier-1 disagreed on pass={expect_pass}"
-            );
-        }
-        assert_eq!(rx.tier1_dropped(), 1, "the drop was not counted");
-    }
-
-    /// **The failure mode that matters: a stale BF-PIT drops Data we are waiting for.**
-    ///
-    /// Tier-1's tables must be fed from the forwarder's real ones. This shows the consequence of
-    /// *not* doing that — Data for an outstanding Interest is dropped until the PIT entry is
-    /// published — so the requirement in `tier1_handle`'s doc is a demonstrated hazard, not advice.
-    #[tokio::test]
-    async fn an_unfed_bf_pit_drops_data_we_asked_for() {
-        let key = OPEN_GROUP_KEY;
-        let bus = LoopbackMonitorBus::new();
-        let rx = WifiPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -50))).with_tier1(
-            &key,
-            &["/served"],
-            8192,
-            4,
-        );
-        let tx = WifiPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -50)));
-        let comps: Vec<&[u8]> = vec![b"asked", b"for", b"this"];
-        let pkt = data_pkt(&name_tlv(&comps));
-
-        // PIT not yet published: Tier-1 has no reason to want it, so it drops.
-        tx.send_bytes(pkt.clone()).await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes())
-                .await
-                .is_err(),
-            "expected the drop that an unfed BF-PIT causes"
-        );
-
-        // Feed the PIT the way a forwarder must, then the same frame passes.
-        {
-            let h = rx.tier1_handle().expect("tier1 enabled");
-            let mut g = h.write().unwrap();
-            g.add_pit(b"/asked/for/this");
-            g.sync();
-        }
-        tx.send_bytes(pkt).await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv_bytes())
-                .await
-                .is_ok(),
-            "Data for a published PIT entry was still dropped"
-        );
-    }
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1347,7 +927,7 @@ mod tests {
             dst: BROADCAST,
             src: ADDR_A,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         })
         .await
@@ -1384,7 +964,7 @@ mod tests {
             dst: BROADCAST,
             src: ADDR_B,
             addr3: None,
-            addr4: None,
+            extra: None,
             htc: None,
         })
         .await
@@ -1434,72 +1014,6 @@ mod tests {
         let mut d = vec![0x06, name.len() as u8];
         d.extend_from_slice(name);
         Bytes::from(d)
-    }
-
-    /// **Tier-0 prefix-set Bloom filter, end to end** (#91). A producer addresses each
-    /// object by the 94-bit prefix-set filter of its inner name (`addr1 ‖ addr2`), on the
-    /// real loopback medium through `build_dot11`/`parse_dot11`. It proves the two things the
-    /// filter buys over `name_group`:
-    ///
-    /// - a **relay** registered on the coarse `/x` hears BOTH `/x/y` and `/x/z` (prefix match);
-    /// - a **consumer** registered on the *finer* `/x/y/z` — a granularity the producer never
-    ///   "chose" — still hears the producer's `/x/y/z` object, because the sender ships every
-    ///   granularity at once. That receiver-local longest-prefix match is exactly what a name
-    ///   hash cannot express, and it needs no out-of-band agreement.
-    #[tokio::test]
-    async fn bloom_addressing_prefix_and_granularity_decoupling() {
-        let key = OPEN_GROUP_KEY;
-        let bus = LoopbackMonitorBus::new();
-        let xy = name_tlv(&[b"x", b"y"]);
-        let xz = name_tlv(&[b"x", b"z"]);
-        let xyz = name_tlv(&[b"x", b"y", b"z"]);
-
-        let producer =
-            WifiPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -50))).with_bloom_producer(&key, "/x");
-        // Relay on the coarse family /x.
-        let relay =
-            WifiPhy::new(FaceId(2), Arc::new(bus.endpoint(2, -50))).with_bloom_relay(&key, &["/x"]);
-        // Consumer on a FINER prefix than any single granularity the producer commits to.
-        let deep = WifiPhy::new(FaceId(3), Arc::new(bus.endpoint(3, -50)))
-            .with_bloom_consumer(&key, "/x/y/z");
-        // Consumer on an unrelated prefix hears nothing.
-        let other =
-            WifiPhy::new(FaceId(4), Arc::new(bus.endpoint(4, -50))).with_bloom_consumer(&key, "/w");
-
-        producer.send_bytes(data_pkt(&xy)).await.unwrap();
-        producer.send_bytes(data_pkt(&xz)).await.unwrap();
-        producer.send_bytes(data_pkt(&xyz)).await.unwrap();
-
-        // Relay prefix-matches the whole /x family (all three).
-        let mut relayed = Vec::new();
-        for _ in 0..3 {
-            let (b, _) =
-                tokio::time::timeout(Duration::from_millis(300), relay.recv_bytes_with_addr())
-                    .await
-                    .expect("relay hears the /x family")
-                    .unwrap();
-            relayed.push(b);
-        }
-        relayed.sort();
-        let mut want = vec![data_pkt(&xy), data_pkt(&xz), data_pkt(&xyz)];
-        want.sort();
-        assert_eq!(relayed, want, "relay prefix-matches every name under /x");
-
-        // The /x/y/z consumer hears the /x/y/z object — the granularity-decoupling win.
-        let (got, _) =
-            tokio::time::timeout(Duration::from_millis(300), deep.recv_bytes_with_addr())
-                .await
-                .expect("deep consumer hears /x/y/z at its own registered granularity")
-                .unwrap();
-        assert_eq!(got, data_pkt(&xyz));
-
-        // The /w consumer hears none of them (exact negative — no false accept expected here).
-        let none =
-            tokio::time::timeout(Duration::from_millis(150), other.recv_bytes_with_addr()).await;
-        assert!(
-            none.is_err(),
-            "an unrelated prefix must not match the /x family"
-        );
     }
 
     /// **The A-MSDU batcher must reach the backend's `inject_batch_at` override.**
@@ -1573,174 +1087,4 @@ mod tests {
         );
     }
 
-    /// **Tier-0 addressing must survive link-FEC.** Composing the two is offered by construction
-    /// (`with_bloom_producer` + `with_link_fec` are independent builders), so it has to work.
-    ///
-    /// Under `TxAddr::PrefixBloom` the object's 12-byte prefix-set filter is split across *both*
-    /// address fields — `resolve_addr` returns `(w[..6], w[6..])`, addr1 = filter-hi and
-    /// addr2 = filter-lo — and the receiver's `NameGate` reassembles `addr1 ‖ addr2` before testing
-    /// it. So a send path that pins only `dst` puts the face's own source in addr2, the receiver
-    /// reconstructs half a filter, and the Bloom test fails: not a lost optimisation but a **false
-    /// negative**, data dropped for a name the receiver registered.
-    ///
-    /// This asserts on the frames actually on the bus rather than on end-to-end delivery, so it
-    /// isolates the addressing from FEC decode.
-    #[tokio::test]
-    async fn tier0_addressing_survives_link_fec() {
-        use ndn_frame_io::FrameIo;
-        use ndn_transport::Transport;
-
-        const K: usize = 2;
-        let key = OPEN_GROUP_KEY;
-        let masks = crate::bloom_masks_for(&key, &[b"/x".as_slice()]);
-
-        let bus = LoopbackMonitorBus::new();
-        let sniffer = Arc::new(bus.endpoint(99, -70));
-        let producer = WifiPhy::new(FaceId(1), Arc::new(bus.endpoint(1, -50)))
-            .with_bloom_producer(&key, b"/x/y")
-            .with_link_fec(K, 1, Duration::from_millis(20));
-
-        let collector = tokio::spawn(async move {
-            let mut seen = Vec::new();
-            while let Ok(Ok(f)) =
-                tokio::time::timeout(Duration::from_millis(150), sniffer.recv_frame()).await
-            {
-                seen.push((f.group, f.addr));
-            }
-            seen
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
-        for _ in 0..K {
-            producer.send_bytes(wire.clone()).await.unwrap();
-        }
-        let frames = collector.await.unwrap();
-
-        assert!(
-            !frames.is_empty(),
-            "the coded generation must reach the bus"
-        );
-        for (i, (a1, a2)) in frames.iter().enumerate() {
-            let (Some(a1), Some(a2)) = (a1, a2) else {
-                panic!("frame {i} carries no address pair");
-            };
-            let mut w = [0u8; 16];
-            w[..6].copy_from_slice(a1);
-            w[6..12].copy_from_slice(a2);
-            let f = crate::PrefixFilter::from_wire(w);
-            assert!(
-                masks.iter().any(|m| f.may_match(m)),
-                "coded frame {i} must still be addressed under /x — a receiver registered on /x \
-                 reassembles addr1‖addr2 and drops it otherwise (addr1={a1:02x?} addr2={a2:02x?})"
-            );
-        }
-    }
-
-    /// **Wide TX and wide RX are one profile, not two halves.** A wide-enabled addresser produces the
-    /// extra Blur + fingerprint; the wide RX gate admits the result on both regions; a base receiver
-    /// still admits it from the byte-identical base region (coexistence, zero false negatives). This
-    /// pins that `with_wide_bloom` does not emit base frames its own RX filter is stricter than —
-    /// the TX/RX fracture this change removes.
-    #[test]
-    fn wide_tx_addresser_and_wide_gate_are_one_profile() {
-        let key = OPEN_GROUP_KEY;
-        let wire = data_pkt(&name_tlv(&[b"x", b"y"]));
-
-        let wide = Tier0Addresser::new_wide(key);
-        let tw = wide.wire_for(&wire).expect("named wire → addressing");
-        let extra = tw.extra.expect("the wide addresser sets the extra Blur");
-
-        // Reconstruct the frame fields exactly as the medium does.
-        let a1: [u8; 6] = tw.base[..6].try_into().unwrap();
-        let a2: [u8; 6] = tw.base[6..12].try_into().unwrap();
-        let a3 = [tw.base[12], tw.base[13], tw.base[14], tw.base[15], 0, 0];
-        let htc = [
-            tw.fp as u8,
-            (tw.fp >> 8) as u8,
-            (tw.fp >> 16) as u8,
-            crate::tier0::WIDE_PROFILE_MARKER,
-        ];
-
-        // A wide receiver registered on /x admits it on BOTH regions.
-        let wide_gate = NameGate::new(RxFilter::WideBloom(wide_bloom_masks_for(&key, &["/x"])), None);
-        assert!(
-            wide_gate.admits_wide(Some(a1), Some(a2), Some(a3), Some(extra), Some(htc), b""),
-            "the wide gate must admit the wide addresser's own frame"
-        );
-        // A base receiver admits it from the base region alone — no false negative.
-        let base_gate = NameGate::new(RxFilter::Bloom(bloom_masks_for(&key, &["/x"])), None);
-        assert!(
-            base_gate.admits_wide(Some(a1), Some(a2), Some(a3), None, None, b""),
-            "a commodity base receiver must still admit a wide sender's frame"
-        );
-        // The base region is byte-identical to a base addresser's — the coexistence floor.
-        let base_tw = Tier0Addresser::new(key).wire_for(&wire).unwrap();
-        assert_eq!(tw.base, base_tw.base, "wide and base agree on the base Blur");
-        assert!(base_tw.extra.is_none(), "the base addresser sets no extra Blur");
-    }
-
-    /// **The Tier-0 fragment cache must not grow without bound.** The original was a `HashMap` that
-    /// only ever gained entries — one per fragmented object, never removed. A relay forwarding
-    /// fragmented objects indefinitely leaked one entry per object, quietly and forever.
-    ///
-    /// Completing an object releases its entry, and a peer that vanishes mid-object cannot push the
-    /// map past its cap. Both matter: the first is the common path, the second is the one an
-    /// adversary or a flaky link would otherwise exploit.
-    #[test]
-    fn tier0_fragment_cache_is_bounded() {
-        fn tlv(t: u8, v: &[u8]) -> Vec<u8> {
-            let mut o = vec![t, v.len() as u8];
-            o.extend_from_slice(v);
-            o
-        }
-        fn frag(seq: u64, index: u64, count: u64, payload: &[u8]) -> Vec<u8> {
-            let mut inner = Vec::new();
-            inner.extend(tlv(0x51, &seq.to_be_bytes()));
-            inner.extend(tlv(0x52, &index.to_be_bytes()));
-            inner.extend(tlv(0x53, &count.to_be_bytes()));
-            inner.extend(tlv(0x50, payload));
-            let mut out = vec![0x64, inner.len() as u8];
-            out.extend_from_slice(&inner);
-            out
-        }
-
-        let a = Tier0Addresser::new(OPEN_GROUP_KEY);
-        let named = data_pkt(&name_tlv(&[b"x", b"y"]));
-
-        // A complete 3-fragment object: tracked while in flight, released on the last fragment.
-        let opening = a.wire_for(&frag(10, 0, 3, &named));
-        assert!(opening.is_some(), "the opening fragment carries the name");
-        assert_eq!(
-            a.tracked(),
-            1,
-            "the object is tracked while its tail is outstanding"
-        );
-        assert_eq!(
-            a.wire_for(&frag(11, 1, 3, b"mid")),
-            opening,
-            "mid fragment reuses the filter"
-        );
-        assert_eq!(
-            a.wire_for(&frag(12, 2, 3, b"end")),
-            opening,
-            "last fragment reuses it too"
-        );
-        assert_eq!(
-            a.tracked(),
-            0,
-            "completing the object must release its entry"
-        );
-
-        // Objects whose tails never arrive: bounded by the cap, not by the peer's good behaviour.
-        for i in 0..(TIER0_CACHE_CAP + 500) {
-            let seq = 1_000_000 + (i as u64) * 10;
-            let _ = a.wire_for(&frag(seq, 0, 9, &named));
-        }
-        assert!(
-            a.tracked() <= TIER0_CACHE_CAP,
-            "abandoned objects must stay under the cap, got {}",
-            a.tracked()
-        );
-    }
 }

@@ -41,6 +41,38 @@ pub enum PhyKind {
     Other,
 }
 
+impl PhyKind {
+    /// The `NdrCapability::Phys` bit for this bearer (bit0 Wi-Fi, bit1 LoRa, bit2 BLE).
+    fn phys_bit(self) -> u8 {
+        match self {
+            PhyKind::Wifi => 0b001,
+            PhyKind::LoRa => 0b010,
+            PhyKind::Ble => 0b100,
+            PhyKind::Other => 0,
+        }
+    }
+}
+
+/// Derive the capability a [`Radio`] advertises by default (§5) from its phys: the `Phys` bitset (which
+/// bearers it speaks) and `MaxRate` = the best worst-receiver rate any of its radios reports. `Hop`/
+/// `Sleep` stay off until a clock is disciplined (assert them via [`Radio::with_capability`]). A face
+/// with a rate-reporting Wi-Fi radio thus advertises its real capability with **no configuration**.
+fn default_capability(phys: &[Arc<dyn WirelessPhy>]) -> crate::mac::capability::NdrCapability {
+    let mut phys_bits = 0u8;
+    let mut max_rate: Option<u8> = None;
+    for p in phys {
+        phys_bits |= p.kind().phys_bit();
+        if let Some(m) = p.max_rx_mcs() {
+            max_rate = Some(max_rate.map_or(m, |cur| cur.max(m)));
+        }
+    }
+    crate::mac::capability::NdrCapability {
+        max_rate,
+        phys: phys_bits,
+        ..Default::default()
+    }
+}
+
 /// A named-radio **phy** the [`Radio`] multiplexes: a medium with its own airtime-optimal MTU and
 /// reach, that fragments/reassembles *internally* (phy-native framing, below the face). Real backends adapt
 /// to this — a BLE `AdvBackend`, a Wi-Fi `FrameIo`, a LoRa dongle — each already owning its own framing.
@@ -55,6 +87,21 @@ pub trait WirelessPhy: Send + Sync + 'static {
     async fn send(&self, wire: Bytes) -> Result<(), FaceError>;
     /// Receive the next fully-reassembled network packet from this phy.
     async fn recv(&self) -> Result<Bytes, FaceError>;
+
+    /// The highest PHY rate (MCS index) this radio reliably **receives** — feeds the face's advertised
+    /// `NdrCapability::MaxRate` (§5). `None` ⇒ the base-rate floor (a bearer that does not know its own
+    /// worst-receiver rate). Default `None`; a real backend overrides.
+    fn max_rx_mcs(&self) -> Option<u8> {
+        None
+    }
+
+    /// Push the node's **off-host parse relevance set** (§6) to this radio: the `/`-joined served
+    /// prefixes, so the radio parses each RX frame's name and drops off-prefix ones pre-link. Default is
+    /// a no-op (the radio delivers everything — the parse-everywhere floor); a gate-capable backend
+    /// overrides to actuate it. Empty ⇒ floor.
+    fn set_relevance_prefixes(&self, _prefixes: &[Vec<u8>]) -> Result<(), FaceError> {
+        Ok(())
+    }
 }
 
 /// Which phy(s) an outbound packet egresses on — **the reach lever**, name/class-seeded. This is the seam
@@ -122,11 +169,18 @@ impl<F: Fn(&[u8]) -> ReachClass + Send + Sync + 'static> PhyPolicy for ReachClas
 /// framing*; this just attaches the `(kind, mtu, range_rank)` metadata the reach lever needs. Generic because
 /// `Transport` uses native `async fn` (not object-safe) — build one per concrete backend; it erases to
 /// `Arc<dyn WirelessPhy>` at the face boundary.
+/// A closure a backend supplies to actuate the off-host parse gate (§6) — pushes the served prefixes.
+pub type GateFn = Arc<dyn Fn(&[Vec<u8>]) -> Result<(), FaceError> + Send + Sync>;
+
 pub struct TransportPhy<T: Transport + Send + Sync + 'static> {
     inner: T,
     kind: PhyKind,
     mtu: usize,
     range_rank: u8,
+    /// The radio's highest reliably-received MCS (feeds the face's advertised `MaxRate`), if known.
+    max_mcs: Option<u8>,
+    /// The backend's off-host parse-gate actuator (`set_relevance_prefixes`), if it has one.
+    gate: Option<GateFn>,
 }
 
 impl<T: Transport + Send + Sync + 'static> TransportPhy<T> {
@@ -139,11 +193,24 @@ impl<T: Transport + Send + Sync + 'static> TransportPhy<T> {
             kind,
             mtu,
             range_rank,
+            max_mcs: None,
+            gate: None,
         }
     }
     /// Override the advertised MTU (the reach lever's throughput signal).
     pub fn with_mtu(mut self, mtu: usize) -> Self {
         self.mtu = mtu;
+        self
+    }
+    /// Advertise this radio's highest reliably-received MCS — folds into the face's `NdrCapability::MaxRate`.
+    pub fn with_max_rx_mcs(mut self, mcs: u8) -> Self {
+        self.max_mcs = Some(mcs);
+        self
+    }
+    /// Wire the backend's off-host parse-gate actuator, so `Radio::register_prefixes` reaches this radio.
+    /// e.g. `with_gate(Arc::new(move |p| backend.set_relevance_prefixes_bytes(p)))`.
+    pub fn with_gate(mut self, gate: GateFn) -> Self {
+        self.gate = Some(gate);
         self
     }
 }
@@ -164,6 +231,15 @@ impl<T: Transport + Send + Sync + 'static> WirelessPhy for TransportPhy<T> {
     }
     async fn recv(&self) -> Result<Bytes, FaceError> {
         self.inner.recv_bytes().await
+    }
+    fn max_rx_mcs(&self) -> Option<u8> {
+        self.max_mcs
+    }
+    fn set_relevance_prefixes(&self, prefixes: &[Vec<u8>]) -> Result<(), FaceError> {
+        match &self.gate {
+            Some(g) => g(prefixes),
+            None => Ok(()),
+        }
     }
 }
 
@@ -216,6 +292,21 @@ impl PhyPolicy for NameReachClassifier {
             }
         }
     }
+}
+
+/// True if `wire` (bare or LP-wrapped) carries an **Interest** — the packets a capability link field
+/// rides on. LP unwrap mirrors the name-extraction path below.
+fn wraps_interest(wire: &[u8]) -> bool {
+    let raw = Bytes::copy_from_slice(wire);
+    let inner = if ndn_packet::lp::is_lp_packet(wire) {
+        match ndn_packet::lp::LpPacket::decode(raw).ok().and_then(|p| p.fragment) {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        raw
+    };
+    inner.first() == Some(&0x05)
 }
 
 /// Best-effort NDN name from a wire: unwrap an LP frame if present, then decode as Interest or Data.
@@ -393,6 +484,13 @@ pub struct Radio {
     /// Count of outbound `send_bytes` calls (each a forward/re-broadcast) — for measuring, e.g., how many
     /// re-broadcasts a relay's strategy suppressed via defer + overhear-cancel.
     tx_count: Arc<std::sync::atomic::AtomicU64>,
+    /// This node's advertised **NdrCapability** (§5), stamped on the Interests it sends (floor ⇒ omitted).
+    self_cap: crate::mac::capability::NdrCapability,
+    /// Reverse-path soft-state (§5.2): the last capability heard from each neighbour, keyed on the phy it
+    /// arrived on (a coarse per-bearer link id; a per-neighbour key needs the ephemeral source nonce the
+    /// phy strips). A Data return / rate decider consults [`peer_capability`](Self::peer_capability).
+    peer_caps: Mutex<crate::mac::capability::CapabilityStore>,
+    started: std::time::Instant,
 }
 
 impl Radio {
@@ -400,6 +498,7 @@ impl Radio {
     /// (needs a Tokio runtime — the host driving real radios has one).
     pub fn new(id: FaceId, phys: Vec<Arc<dyn WirelessPhy>>, policy: Arc<dyn PhyPolicy>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let self_cap = default_capability(&phys);
         for (idx, phy) in phys.iter().enumerate() {
             let phy = Arc::clone(phy);
             let tx = tx.clone();
@@ -418,7 +517,52 @@ impl Radio {
             rx: AsyncMutex::new(rx),
             dedup: Mutex::new(Dedup::new(DEDUP_CAP)),
             tx_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            self_cap,
+            peer_caps: Mutex::new(crate::mac::capability::CapabilityStore::new(4_000, 64)),
+            started: std::time::Instant::now(),
         }
+    }
+
+    /// **Override** the auto-derived capability this face advertises (§5) — the developer knob. The
+    /// default (from [`new`](Self::new)) already reflects the phys' bearers + worst-receiver rate; use
+    /// this to force a value (e.g. advertise `Hop`/`Sleep` once a clock is disciplined, or the floor).
+    pub fn with_capability(mut self, cap: crate::mac::capability::NdrCapability) -> Self {
+        self.self_cap = cap;
+        self
+    }
+
+    /// The capability this face advertises (auto-derived from the phys, or the `with_capability` override).
+    pub fn capability(&self) -> crate::mac::capability::NdrCapability {
+        self.self_cap
+    }
+
+    /// **Register the node's served prefixes** with every phy that supports the off-host parse gate (§6)
+    /// — default actuation: the radios then drop off-prefix frames pre-link. `/`-joined prefix bytes; an
+    /// empty slice restores the parse-everywhere floor. The forwarder calls this on FIB registration.
+    pub fn register_prefixes(&self, prefixes: &[Vec<u8>]) -> Result<(), FaceError> {
+        let mut last = Ok(());
+        for phy in &self.phys {
+            if let Err(e) = phy.set_relevance_prefixes(prefixes) {
+                last = Err(e);
+            }
+        }
+        last
+    }
+
+    /// The **worst-receiver MCS** to use for the neighbour last heard on `link` (§5): `min(our advertised
+    /// MaxRate, the neighbour's advertised MaxRate)`, or `None` if we heard no fresh capability (⇒ the
+    /// rate decider keeps its own choice / degrades to the floor). The consumable rate hint the medium
+    /// reads on a Data return.
+    pub fn link_rate_hint(&self, link: u64) -> Option<u8> {
+        let our = self.self_cap.max_rate?;
+        self.peer_capability(link).map(|c| c.worst_receiver_mcs(our))
+    }
+
+    /// The fresh capability last heard from `link` (a phy index), or `None` (⇒ floor) — what a rate
+    /// decider reads for the worst-receiver rate to that neighbour (§5.2).
+    pub fn peer_capability(&self, link: u64) -> Option<crate::mac::capability::NdrCapability> {
+        let now = self.started.elapsed().as_millis() as u64;
+        self.peer_caps.lock().unwrap().get(link, now)
     }
 
     /// A shared handle to the outbound-send counter — grab it before moving the face into an engine, then read
@@ -462,6 +606,13 @@ impl Transport for Radio {
     }
 
     async fn send_bytes(&self, wire: Bytes) -> Result<(), FaceError> {
+        // §5: stamp this node's capability onto the Interests it sends (hop-local link field; floor and
+        // non-Interest/non-LP wires are left unchanged by the splice).
+        let wire = if !self.self_cap.is_floor() && wraps_interest(&wire) {
+            crate::mac::capability::splice_into_lp_wire(wire, &self.self_cap)
+        } else {
+            wire
+        };
         let sel = self.policy.select(&wire, &self.phys);
         if sel.is_empty() {
             return Ok(()); // policy dropped it (no eligible phy)
@@ -488,6 +639,14 @@ impl Transport for Radio {
         let mut rx = self.rx.lock().await;
         loop {
             let (phy, wire) = rx.recv().await.ok_or(FaceError::Closed)?;
+            // §5.2: record the neighbour's capability off the reverse path (Interests only), keyed on the
+            // phy it arrived on. Soft-state; a later Interest re-stamps it (mobility-safe).
+            if wraps_interest(&wire)
+                && let Some(cap) = crate::mac::capability::extract_from_lp_wire(&wire)
+            {
+                let now = self.started.elapsed().as_millis() as u64;
+                self.peer_caps.lock().unwrap().observe(phy as u64, cap, now);
+            }
             let dup = self.dedup.lock().unwrap().is_dup(&wire);
             if !dup {
                 // Feedback to the (learning) policy: this phy is the one that delivered the object first.

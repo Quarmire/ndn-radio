@@ -7,7 +7,187 @@
 //! converge on a compatible plan instead of fighting. The single-radio case is
 //! the degenerate one-allocation plan.
 
+use crate::policy::{NameContext, Priority};
 use crate::sense::RadioId;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// ★ **The energy-detect carrier-sense override, and the only class privilege that reaches silicon.**
+///
+/// `edcca_ignore = true` tells the chip to stop deferring to a busy channel and transmit anyway. It
+/// is not a hint: it reaches `RadioKnobs::set_edcca_ignore` and lands as real register writes on
+/// five parts (`0x520[15]`/`0x524[11]` on the RTL88xx, the RTL8733B and mt76 equivalents, the
+/// ath9k_htc path, and the LoRa firmware's LBT toggle). A caller that can set it has taken the
+/// medium from every other node in earshot.
+///
+/// So it is **derived, never asserted**, exactly like [`Priority`] itself. The field is private and
+/// the sole route to `true` is [`ignoring_edcca`](Self::ignoring_edcca), which requires a
+/// [`NameContext`] a [`ClassAuthority`](crate::ClassAuthority) already raised to
+/// [`Priority::Urgent`]. An external crate previously reached the same silicon by writing
+/// `TxParams { edcca_ignore: true, .. }` and handing it to a public actuator — SKIPPING the class
+/// rather than laundering it — and that literal no longer compiles.
+///
+/// ⚠ **What this does and does not close.** It closes the struct literal, which is what the audit
+/// found. It does NOT make the override a capability: a linked crate can still write its own
+/// four-line `ClassAuthority` returning `Urgent` (see [`ClassAuthority`](crate::ClassAuthority)'s
+/// own note), and `ndn-radio-drivers` exposes `set_edcca_ignore` as a `pub fn` on a
+/// publicly-constructible backend, which nothing in this crate can reach. The threat closed is
+/// accidental self-assertion and drift — the same threat, and the same wall, as every other class
+/// decision in this tree. Nothing here defends against a hostile in-process crate holding the radio
+/// handle, and no honest reading of it should claim otherwise.
+///
+/// The escalation is COUNTED where it actuates: see [`ledger`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Contention {
+    ignore_edcca: bool,
+}
+
+impl Contention {
+    /// Defer to a busy medium — ordinary carrier sense, and the default for every transmission.
+    pub const fn deferring() -> Self {
+        Self {
+            ignore_edcca: false,
+        }
+    }
+
+    /// Ask to transmit into a busy channel. **GRANTED only for a [`Priority::Urgent`] ceiling**;
+    /// for any other class this leaves carrier sense armed rather than failing, matching
+    /// [`ClassCeiling::capped_to`](crate::ClassCeiling::capped_to)'s "lower, never raise" shape.
+    ///
+    /// The medium condition (is the channel actually busy?) is the POLICY's to decide and is not
+    /// checked here — this type owns the authority half only.
+    #[must_use]
+    pub fn ignoring_edcca(self, ctx: &NameContext) -> Self {
+        Self {
+            ignore_edcca: ctx.priority() == Priority::Urgent,
+        }
+    }
+
+    /// Whether this transmission ignores energy-detect carrier sense.
+    pub const fn edcca_ignore(self) -> bool {
+        self.ignore_edcca
+    }
+}
+
+/// The band a clear-channel (defer) threshold may occupy, in true dBm, as `(min, max)` for the
+/// busy (`l2h`) edge — **the range the policy can actually decide**, and therefore the range an
+/// actuator will apply.
+///
+/// `min` is the vendor default the Realtek parts boot at; `max` is that plus the most transmit
+/// power the policy will ever give back
+/// (`RadioPolicy::decide_edcca_threshold_dbm` raises the floor by exactly the dB it trimmed).
+///
+/// ☠ This bound is why sealing [`Contention`] alone would have been theatre. `edcca_threshold_dbm`
+/// is the GRADED FORM OF THE SAME DECISION ON THE SAME CHIP, it carried no flag anyone was
+/// watching, and `LibUsbRtl88xxBackend::set_edcca_threshold` range-checks nothing — it encodes
+/// `((dbm + 110 + 0x80) & 0xff)` straight into `0x84c`, so `Some((17, 9))` writes `0xff`: the
+/// highest threshold the register holds, i.e. *the channel is never busy*. That is
+/// `edcca_ignore: true` reached through a field with no gate on it. The field is deliberately left
+/// public — it is a real number in real units that any class may claim once it has MEASURED the
+/// margin — and bounded where it actuates instead. (The `0xff` claim is derived from the encoder
+/// arithmetic in the driver, NOT from a register read-back on hardware.)
+pub const DEFER_THRESHOLD_DBM_BAND: (i8, i8) = (-75, -57);
+
+/// Clamp a decided `(l2h, h2l)` defer threshold into [`DEFER_THRESHOLD_DBM_BAND`], preserving the
+/// downward hysteresis. Returns the pair to apply and whether it had to be moved.
+///
+/// **The one definition every actuator uses**, so the bound and the decision cannot drift.
+pub fn clamp_defer_threshold(l2h: i8, h2l: i8) -> ((i8, i8), bool) {
+    let (lo, hi) = DEFER_THRESHOLD_DBM_BAND;
+    let cl = l2h.clamp(lo, hi);
+    // Hysteresis is downward and bounded by the same span the policy uses; an `h2l` above `l2h`
+    // would invert the busy/idle edges.
+    let ch = h2l.clamp(cl.saturating_sub(DEFER_HYSTERESIS_MAX_DB), cl);
+    ((cl, ch), (cl, ch) != (l2h, h2l))
+}
+
+/// Most hysteresis (dB) between the busy and idle edges the policy ever asks for.
+pub const DEFER_HYSTERESIS_MAX_DB: i8 = 8;
+
+/// ★ **What actually reached the silicon** — the actuator-side half of the class wall.
+///
+/// The decision trace already records what cognition DECIDED (`control.rs`'s `decision` span, and
+/// `radio.N.edcca_ignore` on `/localhost/nfd/ext/list`). What was missing is the count that would
+/// DISAGREE with it: a claim entering an actuator from somewhere other than this node's policy.
+///
+/// House rule — prefer making a defect detectable over asserting it cannot happen. Nothing here
+/// prevents anything; [`Counts::edcca_ignored`](ledger::Counts::edcca_ignored) rising while every plan in the same
+/// snapshot reads `edcca_ignore=false` is a claim that did not come from this node's policy, and
+/// [`Counts::defer_threshold_clamped`](ledger::Counts::defer_threshold_clamped) is sharper still — a threshold
+/// outside [`DEFER_THRESHOLD_DBM_BAND`] cannot have been produced by
+/// `decide_edcca_threshold_dbm` at all.
+///
+/// Process-global and bearer-agnostic on purpose: the Wi-Fi face is not privileged here, and the
+/// LoRa face's LBT toggle counts on the same ledger.
+///
+/// ⚠ NOT MEASURED: no on-air run has been made against these counters; they are wired and unit
+/// tested only. The counts are also not a 1:1 audit of decisions — one decision fans out to one
+/// allocation per radio, and a knob is re-pushed only when it changes — so read them as "did this
+/// move at all", never as an equation.
+pub mod ledger {
+    use super::{AtomicU64, Ordering};
+
+    static EDCCA_IGNORED: AtomicU64 = AtomicU64::new(0);
+    static DEFER_CLAMPED: AtomicU64 = AtomicU64::new(0);
+    static FEC_PARITY_OVER_GEN: AtomicU64 = AtomicU64::new(0);
+    static TX_POWER_CLAMPED: AtomicU64 = AtomicU64::new(0);
+
+    /// A snapshot of the ledger.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Counts {
+        /// Allocations handed to an actuator carrying `edcca_ignore = true`.
+        pub edcca_ignored: u64,
+        /// Defer thresholds an actuator had to pull back into [`super::DEFER_THRESHOLD_DBM_BAND`].
+        pub defer_threshold_clamped: u64,
+        /// Link-FEC generations whose parity budget exceeded the generation size.
+        ///
+        /// NOT clamped, deliberately: `R > K` is a legitimate high-loss configuration and the codec
+        /// already caps `K + R <= 255`.
+        ///
+        /// ⚠ And NOT evidence of a bypass, which this doc used to claim. `RadioPolicy` clamps to
+        /// `PolicyConfig::generation_k`; the faces compare against the generation THEY were built
+        /// with, and nothing ties the two. A face built with `with_link_fec(1, ..)` — K=1, i.e.
+        /// repetition, which the shipped node binary does deliberately — makes every legitimate
+        /// `R >= 2` count here. Read it as "parity exceeded this face's generation", nothing more.
+        pub fec_parity_over_generation: u64,
+        /// TX-power requests an actuator had to pull back into the radio's DECLARED range.
+        ///
+        /// `RadioPolicy` already clamps both forms to the capability (the index to
+        /// `[min_tx_power, max_tx_power]`, the dBm to the declared `DbmRange`), so a value outside
+        /// it cannot have come from cognition — the same reasoning that makes
+        /// [`Self::defer_threshold_clamped`] a bypass signal. Without this the loudest escalation on
+        /// the chip, "pin the part at maximum power", silently reverted the spatial-reuse back-off
+        /// with nothing to disagree with it. ⚠ Counts only where the actuator was GIVEN a
+        /// capability; an actuator built without one has no band and cannot bound anything.
+        pub tx_power_clamped: u64,
+    }
+
+    /// Record that an actuator was handed a transmission that ignores carrier sense.
+    pub fn note_edcca_ignored() {
+        EDCCA_IGNORED.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that an out-of-band defer threshold arrived at an actuator and was clamped.
+    pub fn note_defer_threshold_clamped() {
+        DEFER_CLAMPED.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a parity budget larger than the coding generation reached a FEC consumer.
+    pub fn note_fec_parity_over_generation() {
+        FEC_PARITY_OVER_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record that a TX-power request outside the radio's declared range was clamped.
+    pub fn note_tx_power_clamped() {
+        TX_POWER_CLAMPED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the ledger.
+    pub fn counts() -> Counts {
+        Counts {
+            edcca_ignored: EDCCA_IGNORED.load(Ordering::Relaxed),
+            defer_threshold_clamped: DEFER_CLAMPED.load(Ordering::Relaxed),
+            fec_parity_over_generation: FEC_PARITY_OVER_GEN.load(Ordering::Relaxed),
+            tx_power_clamped: TX_POWER_CLAMPED.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Per-transmission actuator settings for **one** radio. The **bearer-agnostic** knobs every radio
 /// understands live here directly; the PHY rate/robustness knobs live in [`RateParams`], a sum type
@@ -21,8 +201,13 @@ pub struct TxParams {
     /// Link-FEC parity frames per generation (0/None = no link-FEC). Sized by the shared redundancy
     /// budget, discounted by receiver multiplicity. Bearer-agnostic.
     pub link_fec_redundancy: Option<u16>,
-    /// Transmit under contention (ignore EDCCA / LBT) — for priority named data only. Bearer-agnostic.
-    pub edcca_ignore: bool,
+    /// ★ **How this transmission treats a busy medium** — see [`Contention`].
+    ///
+    /// The field is public but its CONTENTS are not: the only way to reach "transmit into a busy
+    /// channel" is [`Contention::ignoring_edcca`], which requires a [`NameContext`] an authority
+    /// has already raised to [`Priority::Urgent`]. `TxParams { edcca_ignore: true, .. }` — a bare
+    /// struct literal that skipped the class entirely and wrote the outcome — no longer compiles.
+    pub contention: Contention,
     /// TX-power index (chip TXAGC scale, higher = more power). **`None` = leave the hard-won
     /// calibrated/regulatory/PA-backoff power untouched** — only ever reduced below the calibrated
     /// max for spatial reuse, never exceeded. Bearer-agnostic.
@@ -59,6 +244,12 @@ pub struct TxParams {
     /// every bearer and can be reasoned about in link budget.
     ///
     /// `None` = no opinion.
+    ///
+    /// ⚠ **Deliberately still a public field, and BOUNDED AT THE ACTUATOR instead** — see
+    /// [`DEFER_THRESHOLD_DBM_BAND`] for why sealing [`Contention`] without this would have left an
+    /// equivalent bypass wide open. A value outside the band cognition can decide is clamped where
+    /// it actuates, and counted on [`ledger`]. Nothing needs permission to *have an opinion* about
+    /// its own defer threshold; what needs bounding is how far that opinion may reach.
     pub edcca_threshold_dbm: Option<(i8, i8)>,
     /// Bearer-specific PHY rate/robustness knobs.
     pub rate: RateParams,
@@ -182,6 +373,14 @@ impl TxParams {
             rate: RateParams::Lora(lora),
             ..Default::default()
         }
+    }
+
+    /// Whether this transmission ignores energy-detect carrier sense — see [`Contention`].
+    ///
+    /// A read-only view of a decision only a [`Priority::Urgent`] [`NameContext`] can make. There is
+    /// deliberately no setter on `TxParams`: the class gate lives on the value, not on this struct.
+    pub const fn edcca_ignore(&self) -> bool {
+        self.contention.edcca_ignore()
     }
 
     /// Wi-Fi MCS, or `None` for a non-Wi-Fi radio.
@@ -437,6 +636,21 @@ pub trait RadioActuators {
     /// Apply this radio's slice of the plan: tune the channel (if set), then set the
     /// per-transmission [`TxParams`]. Implementations apply what they can and ignore
     /// the rest.
+    ///
+    /// ★ **This is the LAST place a decision can be bounded, and some bounds live only here.**
+    /// `apply` takes a `RadioAllocation`, not a [`NameContext`] — deliberately, because it is the
+    /// act plane and has no business re-deciding — so an actuator cannot re-check a class. The
+    /// division of labour is therefore:
+    ///
+    /// * **Class privilege** is enforced on the VALUE, before it ever gets here: [`Contention`] is
+    ///   sealed and only an authorised `Urgent` name produces the carrier-sense override.
+    /// * **Range** is enforced HERE, because a range is a property of the radio and not of the
+    ///   name: an implementation MUST bound `edcca_threshold_dbm` with
+    ///   [`clamp_defer_threshold`] before it reaches a knob (`ndn-phy-wifi`'s `apply_knobs` is the
+    ///   reference, and the LoRa face mirrors it). A driver that range-checks nothing — the
+    ///   Realtek EDCCA encoder does not — makes this the only bound there is.
+    /// * **Visibility** is enforced here too: a claim on the shared medium is tallied on
+    ///   [`ledger`] as it goes past, so it can be compared against what cognition says it decided.
     fn apply(&self, alloc: &RadioAllocation) -> Result<(), RadioError>;
 }
 
@@ -453,6 +667,93 @@ impl std::error::Error for RadioError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{ClassAuthority, ClassCeiling};
+
+    struct Grants(Priority);
+    impl ClassAuthority for Grants {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            self.0
+        }
+    }
+    fn granted(p: Priority) -> NameContext {
+        NameContext::new(0xAB).with_ceiling(ClassCeiling::authorised(&Grants(p), 0xAB))
+    }
+
+    /// ★ **The audit's scenario, as a test.** An external crate compiled
+    /// `TxParams { edcca_ignore: true, tx_power: Some(63), .. }` and handed it to a public
+    /// actuator — SKIPPING the class rather than laundering it — and energy-detect carrier sense
+    /// went off at the chip. That literal no longer exists; this asserts the replacement is the
+    /// class gate and not just a rename.
+    ///
+    /// Falsified by making `ignoring_edcca` set the flag unconditionally: the first three
+    /// assertions fail.
+    #[test]
+    fn only_an_authorised_urgent_name_can_turn_off_carrier_sense() {
+        // The default is to defer, and that is what an unauthorised name gets.
+        assert!(!TxParams::default().edcca_ignore());
+        assert!(
+            !Contention::deferring()
+                .ignoring_edcca(&NameContext::new(0xAB))
+                .edcca_ignore(),
+            "a name with no authority cannot buy the override"
+        );
+        assert!(
+            !Contention::deferring()
+                .ignoring_edcca(&granted(Priority::Bulk))
+                .edcca_ignore(),
+            "Bulk SELECTS rendezvous parameters; it is not a route to privilege"
+        );
+        assert!(
+            !Contention::deferring()
+                .ignoring_edcca(&granted(Priority::Normal))
+                .edcca_ignore()
+        );
+        assert!(
+            Contention::deferring()
+                .ignoring_edcca(&granted(Priority::Urgent))
+                .edcca_ignore(),
+            "an authority's Urgent ceiling is the one thing that grants it"
+        );
+        // And the grant is not sticky: `capped_by` lowers with no inverse, so a context that has
+        // given the class up cannot re-buy the override afterwards.
+        assert!(
+            !Contention::deferring()
+                .ignoring_edcca(&granted(Priority::Urgent).capped_by(Priority::Normal))
+                .edcca_ignore(),
+            "a capped context must not still reach the override"
+        );
+    }
+
+    /// ☠ The equivalent bypass with no flag on it: `edcca_threshold_dbm` is the graded form of the
+    /// same decision on the same chip, and the Realtek encoder range-checks nothing — `(17, 9)`
+    /// writes `0xff`, i.e. the channel is never busy. Bounded to the range the policy can decide.
+    ///
+    /// Falsified by making `clamp_defer_threshold` return its input unchanged.
+    #[test]
+    fn a_defer_threshold_outside_what_the_policy_can_decide_is_clamped() {
+        let (lo, hi) = DEFER_THRESHOLD_DBM_BAND;
+
+        // The audit's value: "never busy" becomes "the loudest reuse claim the policy could make".
+        let ((l2h, h2l), moved) = clamp_defer_threshold(17, 9);
+        assert!(moved);
+        assert_eq!(l2h, hi, "clamped to the top of the decidable band");
+        assert!(h2l <= l2h && h2l >= l2h - DEFER_HYSTERESIS_MAX_DB);
+
+        // The other end: an absurdly low floor would make the node defer to nothing... by deferring
+        // to everything, which is self-harm, but it is still not a decision the policy can produce.
+        let ((l2h, _), moved) = clamp_defer_threshold(-120, -128);
+        assert!(moved);
+        assert_eq!(l2h, lo);
+
+        // Everything the policy CAN emit passes through untouched — the bound must not perturb a
+        // legitimate decision.
+        for backoff in 0..=18i8 {
+            let want = (lo + backoff, lo + backoff - DEFER_HYSTERESIS_MAX_DB);
+            let (got, moved) = clamp_defer_threshold(want.0, want.1);
+            assert_eq!(got, want, "policy-reachable value perturbed: {want:?}");
+            assert!(!moved);
+        }
+    }
 
     #[test]
     fn single_plan_degenerate() {

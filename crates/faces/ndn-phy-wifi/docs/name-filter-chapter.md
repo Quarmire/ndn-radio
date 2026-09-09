@@ -1,3 +1,10 @@
+> # ⛔ RETIRED — the in-frame name filter is dropped from the design.
+> This document designs the in-frame **name filter** (Blur / Tier-0 / fingerprint / GCS). That
+> mechanism has been **removed**. Relevance is now decided by **parsing the NDN name** the frame
+> already carries (off-host where the radio keeps up, host-fallback where it doesn't).
+> **Design of record: `firmware/NDR_MAC_SPEC.md`.** This file is kept only as the historical record
+> that led to retiring the filter — see `reports/ndr-mac-report/REPORT.md` for the measured evidence.
+
 # The Name Filter — the Blurred Name
 
 **Status: design hypothesis for one MAC subsystem, validated in isolation.** This chapter specifies

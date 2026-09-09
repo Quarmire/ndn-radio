@@ -252,8 +252,9 @@ impl RadioControl {
         knobs: Arc<dyn crate::RadioKnobs>,
     ) -> Arc<std::sync::RwLock<Option<ndn_radio_cognition::TxParams>>> {
         let cell = Arc::new(std::sync::RwLock::new(None));
+        let cap = self.medium.lock().unwrap().capability(radio);
         self.actuators
-            .push(Arc::new(LibUsbActuator::new(radio, knobs, cell.clone())));
+            .push(Arc::new(LibUsbActuator::new(radio, knobs, cell.clone(), cap)));
         cell
     }
 
@@ -273,6 +274,11 @@ impl RadioControl {
                 .lock()
                 .unwrap()
                 .on_interest(prefix_hash, downstream_face.0, now_ms);
+        // ★ Item 4a: feed the re-Interest RATE (the ARQ signal `RadioPolicy::fec_redundancy` reads)
+        // as an EWMA of the re-expression fraction — 1.0 when this Interest re-expresses a still-
+        // pending object, 0.0 on a fresh first expression. Until this producer existed, nothing
+        // computed the rate from live state and `fec_redundancy` ran on injected test values only.
+        self.observe_reinterest(prefix_hash, if reexpressed { 1.0 } else { 0.0 }, now_ms);
         if reexpressed {
             self.observe_delivery(false);
         }
@@ -625,25 +631,76 @@ impl RadioControl {
     /// DECIDE stage — run the policy over each active object, returning plans and
     /// their rationales. Its own `decide` span so the phase latency is measurable.
     #[tracing::instrument(target = "named_radio", name = "decide", skip_all, fields(objects = active.len()))]
+    /// Returns the contexts **in the order they were decided**, alongside their plans and
+    /// rationales.
+    ///
+    /// ☠ Returning the order is not a convenience — it is a correctness fix. This function sorts
+    /// its input, so `plans[i]` corresponds to the *sorted* i-th object, while the caller still
+    /// held the unsorted `active`. Every `active.iter().zip(plans.iter())` in `tick_now` therefore
+    /// paired object A's context with object B's plan the moment the sort moved anything: the
+    /// bandit binned its context on the wrong name's class and wrote `last_arm` against the wrong
+    /// radio's plan, and the decision trace attributed each plan to the wrong prefix. Latent until
+    /// the class/rank ordering was introduced above; silent, because both vectors have the same
+    /// length.
     fn decide_all(
         &self,
         active: &[NameContext],
         now_ms: u64,
-    ) -> (Vec<RadioPlan>, Vec<DecisionRationale>) {
+    ) -> (Vec<NameContext>, Vec<RadioPlan>, Vec<DecisionRationale>) {
         let m = self.medium.lock().unwrap();
-        active
+        // ★ **Where the two class axes actually decide something.**
+        //
+        // ACT below is last-writer-wins per radio, so when several active objects target the same
+        // radio the winner was previously whichever happened to be LAST in insertion order — an
+        // arbitrary tiebreak standing in for a policy. Order them instead by the granted class and
+        // then by measured demand, so the object that survives is the one that earned it.
+        //
+        // Both axes, because neither subsumes the other: the ceiling is an authority's verdict about
+        // what a name MAY be, and the rank is a measurement of what the network is actually asking
+        // for right now. Ten prefixes all authorised `Urgent` still compete, and the schema says
+        // nothing about which of them goes first.
+        //
+        // Sorted ASCENDING on purpose: under last-writer-wins the object that must WIN is the one
+        // handed over LAST. (`DemandRank` is an f32, so the compare is total-ordered by hand rather
+        // than via `Ord`, which it cannot implement.)
+        let mut ordered: Vec<&NameContext> = active.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.priority().cmp(&b.priority()).then(
+                a.demand_rank()
+                    .get()
+                    .partial_cmp(&b.demand_rank().get())
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        });
+        let ordered: Vec<NameContext> = ordered.into_iter().copied().collect();
+        let (plans, why): (Vec<_>, Vec<_>) = ordered
             .iter()
             .map(|ctx| self.policy.decide_traced(ctx, &*m, now_ms))
-            .unzip()
+            .unzip();
+        (ordered, plans, why)
     }
 
     /// ACT stage — apply each radio's decided slice to its actuator (last-writer-
     /// wins on a radio when several managed objects target it). Its own `actuate`
     /// span, with each actuator's `apply` timed beneath it.
     #[tracing::instrument(target = "named_radio", name = "actuate", skip_all, fields(plans = plans.len()))]
-    fn actuate(&self, plans: &[RadioPlan], now_ms: u64) {
-        for plan in plans {
+    fn actuate(&self, ordered: &[NameContext], plans: &[RadioPlan], now_ms: u64) {
+        for (ctx, plan) in ordered.iter().zip(plans.iter()) {
             for alloc in &plan.allocations {
+                // ★ The class/rank sort in `decide_all` is the ONLY reader of `demand_rank()`, and
+                // its effect was invisible in telemetry: `last_plans` records the plans, not the
+                // order they were applied in, and this loop logged only failures. Under
+                // last-writer-wins the LAST event emitted for a radio names the object that won it,
+                // so if a rank ever decides a contended radio wrongly, this line is the difference
+                // between noticing and not.
+                tracing::debug!(
+                    target: "named_radio::decision",
+                    radio = alloc.radio.0,
+                    prefix = ctx.prefix_hash,
+                    priority = ?ctx.priority(),
+                    demand_rank = ctx.demand_rank().get(),
+                    "radio: allocation applied (last writer wins this radio)"
+                );
                 // Remember what this radio sent at, so a later delivery outcome can
                 // train the calibrator and/or the bandit.
                 if (self.calibrator.is_some()
@@ -740,7 +797,8 @@ impl RadioControl {
         };
 
         // DECIDE: run the policy over each active object (own timed span).
-        let (mut plans, rationales) = self.decide_all(&active, now_ms);
+        // ★ `ordered` — not `active` — is what the plans correspond to. See `decide_all`.
+        let (ordered, mut plans, rationales) = self.decide_all(&active, now_ms);
 
         // REFINE the joint operating point. The bandit (if on) selects + applies an
         // arm per managed object and remembers it for reward; otherwise calibration
@@ -751,7 +809,7 @@ impl RadioControl {
                 .entered();
         self.last_arm.lock().unwrap().clear();
         if let Some(bandit) = &self.bandit {
-            for (name_ctx, plan) in active.iter().zip(plans.iter_mut()) {
+            for (name_ctx, plan) in ordered.iter().zip(plans.iter_mut()) {
                 if let Some(alloc) = plan.allocations.first_mut() {
                     let (rssi, busy, recv, max_mcs, max_power, db_per_idx, power_floor) = {
                         let m = self.medium.lock().unwrap();
@@ -775,7 +833,7 @@ impl RadioControl {
                             cap.as_ref().and_then(|c| c.min_tx_power).unwrap_or(0),
                         )
                     };
-                    let ctx = Context::new(rssi, busy, recv, name_ctx.priority.rank());
+                    let ctx = Context::new(rssi, busy, recv, name_ctx);
                     let choice = bandit.lock().unwrap().select_traced(&ctx);
                     let arm = choice.arm;
                     // Decision observability: emit WHY the bandit chose this arm — the per-arm UCB
@@ -837,7 +895,7 @@ impl RadioControl {
         // `apply` spans nested under it). End the refine span first so act is a
         // sibling, not a child.
         drop(_refine);
-        self.actuate(&plans, now_ms);
+        self.actuate(&ordered, &plans, now_ms);
 
         // OBSERVE: emit an input→output span tree per decision so a trace shows
         // *why* each plan came out this way. Under `radio_tick`, each object opens a
@@ -846,7 +904,7 @@ impl RadioControl {
         // per-radio input drivers + the chosen OUTPUT params. Zero-cost without a
         // subscriber; a `tracing` subscriber (incl. the ndn-observability OTLP layer)
         // turns the tree into spans consumers can Interest by trace-id.
-        for ((name_ctx, plan), why) in active.iter().zip(plans.iter()).zip(rationales.iter()) {
+        for ((name_ctx, plan), why) in ordered.iter().zip(plans.iter()).zip(rationales.iter()) {
             let _decision = tracing::debug_span!(
                 target: "named_radio", "decision",
                 prefix = name_ctx.prefix_hash,
@@ -895,7 +953,7 @@ impl RadioControl {
                     er_su = a.params.er_su(),
                     tx_power = ?a.params.tx_power,
                     link_fec = ?a.params.link_fec_redundancy,
-                    edcca_ignore = a.params.edcca_ignore,
+                    edcca_ignore = a.params.edcca_ignore(),
                     radios = plan.allocations.len(),
                     relay = plan.relay,
                     objective = plan.objective,
@@ -1052,6 +1110,11 @@ pub struct LibUsbActuator {
     /// re-applied every frame (a channel retune per frame is ~16 ms — it would
     /// dominate, as the on-air run showed). Shared type with the `MediumActuator`.
     last: Mutex<crate::medium::AppliedKnobs>,
+    /// The radio's HAL capability, so this path applies the same **TX-power clamp** the
+    /// `MediumActuator` does. Captured at construction from the already-registered radio
+    /// (every caller calls `register_radio` first) rather than offered as an opt-in builder —
+    /// an opt-in is exactly how the clamp came to be missing here in the first place.
+    cap: Option<RadioCapability>,
 }
 
 #[cfg(feature = "libusb-backend")]
@@ -1060,12 +1123,14 @@ impl LibUsbActuator {
         radio: RadioId,
         knobs: Arc<dyn crate::RadioKnobs>,
         planned: Arc<std::sync::RwLock<Option<ndn_radio_cognition::TxParams>>>,
+        cap: Option<RadioCapability>,
     ) -> Self {
         Self {
             radio,
             knobs,
             planned,
             last: Mutex::new(crate::medium::AppliedKnobs::default()),
+            cap,
         }
     }
 }
@@ -1086,7 +1151,8 @@ impl RadioActuators for LibUsbActuator {
         // this path can no longer diverge from the MediumActuator (it used to lack the dBm-power
         // branch entirely, dropping every absolute-power decision on a dBm-capable radio).
         let mut last = self.last.lock().unwrap();
-        crate::medium::apply_knobs(&mut last, self.knobs.as_ref(), alloc).map_err(to_err)?;
+        crate::medium::apply_knobs(&mut last, self.knobs.as_ref(), alloc, self.cap.as_ref())
+            .map_err(to_err)?;
         drop(last);
 
         // Per-frame: hand the decided params to the face's send path.
@@ -1121,6 +1187,19 @@ impl ndn_radio_cognition::OccupancySink for RadioControl {
 
 #[cfg(test)]
 mod tests {
+    use ndn_radio_cognition::{ClassAuthority, ClassCeiling};
+
+    /// Test-only authority — the same gate production uses; see `policy::Priority`.
+    struct Urgent;
+    impl ClassAuthority for Urgent {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            Priority::Urgent
+        }
+    }
+    fn urgent_ctx(h: u64) -> NameContext {
+        NameContext::new(h).with_ceiling(ClassCeiling::authorised(&Urgent, h))
+    }
+
     use super::*;
     use ndn_radio_cognition::{AllocRole, Priority, RadioError, TxParams};
     use std::sync::RwLock;
@@ -1245,10 +1324,7 @@ mod tests {
     fn relay_with_no_rank_suppresses_no_apply() {
         let (c, mock) = control_with_mock();
         c.observe_rank_deficit(0xABCD, 0.0, 1_000); // downstream satisfied
-        let ctx = NameContext {
-            is_origin: false,
-            ..NameContext::new(0xABCD)
-        };
+        let ctx = NameContext::relayed(0xABCD);
         c.set_active(vec![ctx]);
         let plans = c.tick_now(1_000);
         assert!(plans[0].suppress);
@@ -1282,14 +1358,146 @@ mod tests {
             busy_pct: 95,
             ts_ms: 1_000,
         });
-        let ctx = NameContext {
-            priority: Priority::Urgent,
-            ..NameContext::new(0xABCD)
-        };
+        let ctx = urgent_ctx(0xABCD);
         c.set_active(vec![ctx]);
         c.tick_now(1_000);
         let applied = mock.last.read().unwrap().unwrap();
-        assert!(applied.params.edcca_ignore, "urgent + busy ⇒ ignore EDCCA");
+        assert!(applied.params.edcca_ignore(), "urgent + busy ⇒ ignore EDCCA");
+    }
+
+    /// ★ The class axes must DECIDE something, not merely be stored.
+    ///
+    /// ACT is last-writer-wins per radio, so before `decide_all` ordered its input the winner among
+    /// competing objects was whichever happened to be last in insertion order. Here the Urgent
+    /// object is inserted FIRST and the Bulk one LAST: under insertion order Bulk would overwrite
+    /// it and `edcca_ignore` would be false. It is true, so the granted class — not arrival order —
+    /// picked the winner.
+    #[test]
+    fn the_granted_class_beats_insertion_order_at_the_actuator() {
+        let (c, mock) = control_with_mock();
+        c.observe_rx(W, 99, Some(-55), 1_000);
+        for (ch, busy) in [(149u8, 80u8), (161, 90), (165, 95)] {
+            c.observe_occupancy(ChannelOccupancy {
+                radio: W,
+                channel: ch,
+                busy_pct: busy,
+                ts_ms: 1_000,
+            });
+        }
+        // Urgent first, Bulk last — the order that loses without the sort.
+        c.set_active(vec![urgent_ctx(0xABCD), bulk_ctx(0xBEEF)]);
+        c.tick_now(1_000);
+        let applied = mock.last.read().unwrap().unwrap();
+        assert!(
+            applied.params.edcca_ignore(),
+            "the Urgent object must win the radio even though Bulk was inserted last"
+        );
+    }
+
+    /// ☠ **The sort silently mis-paired every plan with a context.**
+    ///
+    /// `decide_all` sorts its input by `(class, rank)`, so `plans[i]` belongs to the *sorted* i-th
+    /// object — but `tick_now` still held the unsorted `active` and zipped that against the plans.
+    /// The moment the sort moved anything, the bandit binned its situation on the wrong name's
+    /// class and stored `last_arm` against the wrong radio's plan, and the decision trace
+    /// attributed each plan to the wrong prefix. Silent, because both vectors have the same length.
+    /// Latent until the class/rank ordering (surface D's own sort) was introduced.
+    ///
+    /// `decide_all` now returns the order, and this asserts the returned pairing is truthful: the
+    /// Urgent context is the one paired with the plan that ignores carrier sense.
+    ///
+    /// Falsified by zipping `active` instead of `ordered` — the loop below then finds the Urgent
+    /// context beside the Normal object's plan and fires.
+    #[test]
+    fn decide_all_pairs_each_plan_with_the_context_that_produced_it() {
+        let (c, _mock) = control_with_mock();
+        c.observe_rx(W, 99, Some(-55), 1_000);
+        for (ch, busy) in [(149u8, 80u8), (161, 90), (165, 95)] {
+            c.observe_occupancy(ChannelOccupancy {
+                radio: W,
+                channel: ch,
+                busy_pct: busy,
+                ts_ms: 1_000,
+            });
+        }
+
+        // Urgent FIRST, plain Normal second — the input order the ascending sort must reverse.
+        let active = vec![urgent_ctx(0xABCD), NameContext::new(0xBEEF)];
+        let (ordered, plans, _why) = c.decide_all(&active, 1_000);
+
+        assert_eq!(
+            ordered.iter().map(|c| c.prefix_hash).collect::<Vec<_>>(),
+            vec![0xBEEF, 0xABCD],
+            "ascending sort: under last-writer-wins the object that must WIN goes last"
+        );
+        assert_ne!(
+            ordered[0].prefix_hash, active[0].prefix_hash,
+            "the sort really did reorder — otherwise this test proves nothing"
+        );
+
+        // The pairing must be truthful: only the Urgent context's plan claims the busy medium.
+        for (ctx, plan) in ordered.iter().zip(plans.iter()) {
+            let claims = plan.allocations.iter().any(|a| a.params.edcca_ignore());
+            assert_eq!(
+                claims,
+                ctx.priority() == Priority::Urgent,
+                "plan for prefix {:#x} (class {:?}) claims the medium: {claims}",
+                ctx.prefix_hash,
+                ctx.priority()
+            );
+        }
+    }
+
+    /// And within ONE class, the measured demand breaks the tie — the half of the contract that
+    /// exists because competing traffic is present at every level, not only across levels.
+    /// ★ Rewritten for surface D: the ranks now come from a [`DemandTracker`], the only producer
+    /// entitled to attach one. `NameContext::with_demand` is `pub(crate)`, so this test — an
+    /// out-of-crate caller, exactly like the audit's — can no longer fabricate a rank at all. The
+    /// migration IS the proof the change bites: the previous body failed to compile with
+    /// `E0624: method \`with_demand\` is private`.
+    ///
+    /// Bill it honestly: a consistency fix. Today a forged rank could not have beaten a measured
+    /// one anyway (`tick_now` is strictly either/or — the tracker's contexts or the manual set,
+    /// never both), so nothing exploitable closed. What closed is the seam a future multi-origin
+    /// context producer would have walked through silently.
+    #[test]
+    fn within_a_class_measured_demand_breaks_the_tie() {
+        let mut t = ndn_radio_cognition::DemandTracker::new(4_000);
+        // 0xAA: four distinct downstreams, all re-expressing ⇒ high measured rank.
+        for face in 1..=4u64 {
+            t.on_interest(0xAA, face, 1_000);
+            t.on_interest(0xAA, face, 1_100); // a repeat inside the PIT lifetime = a miss signal
+        }
+        // 0xBB: one downstream, asking once ⇒ low measured rank.
+        t.on_interest(0xBB, 9, 1_000);
+
+        let ctxs = t.active_contexts(1_100);
+        let hi = *ctxs.iter().find(|c| c.prefix_hash == 0xAA).unwrap();
+        let lo = *ctxs.iter().find(|c| c.prefix_hash == 0xBB).unwrap();
+        assert_eq!(hi.priority(), lo.priority(), "same class: the tracker grants none");
+        assert!(
+            hi.demand_rank().get() > lo.demand_rank().get(),
+            "the rank is MEASURED: {} vs {}",
+            hi.demand_rank().get(),
+            lo.demand_rank().get()
+        );
+
+        let (c, _mock) = control_with_mock();
+        c.observe_rx(W, 99, Some(-55), 1_000);
+        // High demand inserted FIRST; the sort must still hand it over last.
+        c.set_active(vec![hi, lo]);
+        let plans = c.tick_now(1_000);
+        assert_eq!(plans.len(), 2, "both objects decided");
+    }
+
+    fn bulk_ctx(h: u64) -> NameContext {
+        NameContext::new(h).with_ceiling(ClassCeiling::authorised(&Bulky, h))
+    }
+    struct Bulky;
+    impl ClassAuthority for Bulky {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            Priority::Bulk
+        }
     }
 
     #[test]

@@ -139,11 +139,12 @@ impl ClockSource {
 /// replaces it: the slot key is the **longest registered prefix covering the name**, and the
 /// registration set is what nodes must share (they already must, to talk at all).
 ///
-/// Each entry carries the prefix's Tier-0 mask, so an inbound frame is attributed by a mask AND
-/// against `addr1‖addr2` — no TLV parse — and the entry's hash, precomputed in the scheduler's
-/// cheap `prefix_hash` keyspace (#44: deliberately NOT the wire's keyed SipHash — the slot map must
-/// be computable by every node identically, the wire filter must be unforgeable; different
-/// requirements, different hashes, shared *normalization*).
+/// Each entry carries the prefix's `/`-joined bytes and its hash, precomputed in the scheduler's
+/// cheap `prefix_hash` keyspace (#44). An inbound frame is attributed by **parsing its NDN name** and
+/// taking the longest registered prefix that covers it — relevance is the name, not any in-frame
+/// filter. The slot key uses the unkeyed `prefix_hash` (not the keyed wire SipHash) deliberately: the
+/// slot map must be computable by every node identically, while the keyed wire derivations stay
+/// unforgeable — different requirements, different hashes, shared *normalization*.
 pub struct GroupTable {
     /// Sorted longest-prefix-first, so the first match IS the longest match on both paths.
     entries: Vec<GroupEntry>,
@@ -158,8 +159,6 @@ pub struct GroupTable {
 struct GroupEntry {
     /// The `/`-joined prefix bytes (the shared normalization).
     prefix: Vec<u8>,
-    /// Tier-0 mask for RX attribution without a parse.
-    mask: crate::PrefixFilter,
     /// `prefix_hash` over the prefix's components — the slot key.
     hash: u64,
     /// The prefix's lease class (#93): `Latency` names are placed among the reserved lanes,
@@ -170,10 +169,10 @@ struct GroupEntry {
 }
 
 impl GroupTable {
-    /// Build from the same `(key, prefixes)` the Tier-0 RX gate is built from, so the gate and the
-    /// scheduler cannot disagree about what is registered.
-    pub fn new(key: &crate::GroupKey, prefixes: &[impl AsRef<[u8]>]) -> Self {
-        Self::new_with_depth(key, prefixes, SchedParams::default().slot_depth as usize)
+    /// Build from the registered `prefixes` — the same set the forwarder registers, so every node
+    /// computes the same slot map.
+    pub fn new(prefixes: &[impl AsRef<[u8]>]) -> Self {
+        Self::new_with_depth(prefixes, SchedParams::default().slot_depth as usize)
     }
 
     /// As [`new`](Self::new), but truncating every registered prefix to `slot_depth` components — the
@@ -184,12 +183,7 @@ impl GroupTable {
     /// slot group are deduplicated — they share one slot, the coarsening the shared granularity
     /// intends. `slot_depth` MUST equal the scheduler's [`SchedParams::slot_depth`], or TX and RX key
     /// slots at different depths; that coupling is exactly what `SchedParams` exists to pin.
-    pub fn new_with_depth(
-        key: &crate::GroupKey,
-        prefixes: &[impl AsRef<[u8]>],
-        slot_depth: usize,
-    ) -> Self {
-        let k = crate::bloom_key64(key);
+    pub fn new_with_depth(prefixes: &[impl AsRef<[u8]>], slot_depth: usize) -> Self {
         let depth = slot_depth.max(1);
         let mut entries: Vec<GroupEntry> = Vec::new();
         for p in prefixes {
@@ -198,7 +192,6 @@ impl GroupTable {
                 continue; // empty name, or a distinct prefix sharing this slot group — dedup
             }
             entries.push(GroupEntry {
-                mask: crate::PrefixFilter::mask_for(k, &slash),
                 hash,
                 prefix: slash,
                 class: LeaseClass::Bulk,
@@ -323,7 +316,7 @@ impl GroupTable {
     /// **What is deliberately OUT, because committing to it would false-partition honest
     /// neighbours:** `Bulk` entries at or below the slot depth — a depth-exact bulk entry yields the
     /// same `(key, class)` pair as no entry at all, so two nodes with *disjoint* bulk registrations
-    /// and a shared lane set compute a bit-identical map and must digest alike; the entries' masks
+    /// and a shared lane set compute a bit-identical map and must digest alike; the entries' hashes
     /// (RX attribution only, legitimately different per registration set); the entry ORDER
     /// ([`new_with_depth`](Self::new_with_depth) sorts by prefix *length* only, so equal-length
     /// prefixes keep the caller's slice order — an in-order fold would partition two nodes over a
@@ -382,15 +375,6 @@ impl GroupTable {
             })
             .map(|e| (e.hash, e.class))
     }
-
-    /// Slot key + class for a received Tier-0 filter: first (= longest) registered mask it may be
-    /// under.
-    fn hash_for_filter(&self, f: &crate::PrefixFilter) -> Option<(u64, LeaseClass)> {
-        self.entries
-            .iter()
-            .find(|e| f.may_match(&e.mask))
-            .map(|e| (e.hash, e.class))
-    }
 }
 
 /// Truncate a `/`-joined prefix (or name) to its first `depth` components — the shared slot
@@ -415,12 +399,11 @@ fn slot_trunc(slash: &[u8], depth: usize) -> (Vec<u8>, u64) {
 
 /// **The shared schedule parameters — the pin (D2/D3).** Everything that must be identical at every
 /// node for the slot map to converge, named as one *versioned* set so a mismatch is **detectable**
-/// rather than silent. This is the schedule's [`Tier0Params`](crate::tier0): the name filter deleted
-/// the granularity agreement (every receiver matches at its own depth — its whole virtue), but the
-/// slot key quietly re-required one, and the other schedule-map inputs (slot width, reserve lanes,
+/// rather than silent. Relevance is now decided by parsing the name; the slot key still requires a
+/// shared granularity, and the other schedule-map inputs (slot width, reserve lanes,
 /// clock class, hop dwell) are a wire-compat surface that nothing pins. The doctrine already killed a
 /// per-node env var deciding a shared map (`NDN_SCHED_GROUP_DEPTH`); a **shared, versioned constant is
-/// a different animal**, and the schedule needs one even though the filter proudly does not.
+/// a different animal**, and the schedule needs one.
 ///
 /// `slot_depth` is the specific D3 fix: the slot key is `H(first slot_depth name components)`. It is
 /// the shared-constant successor to the deleted `NDN_SCHED_GROUP_DEPTH` — legal precisely because it
@@ -596,30 +579,13 @@ fn nonce_u64(n: &[u8; 6]) -> u64 {
     u64::from_le_bytes(b).max(1) // an all-zero on-air nonce still counts as "known"
 }
 
-/// The §2 presence nonce for a Tier-0 frame: the 8-bit ephemeral ID (`addr3[4]`), tagged into a
+/// The §2 presence nonce for an id-carrying frame: the 8-bit ephemeral ID (`addr3[4]`), tagged into a
 /// range no legacy 48-bit `addr2` nonce can reach so the two layouts never alias — and never `0`,
 /// which is reserved for "unknown transmitter" (ID `0` is a perfectly ordinary ID).
 fn id_nonce(id: u8) -> u64 {
     (1u64 << 63) | id as u64
 }
 
-/// Bound on the learned-group mask cache (P1.5): filters we could not attribute to a registered
-/// prefix, parsed once and remembered so an unregistered group's slot stays claimable without a
-/// per-frame parse.
-///
-/// **A security bound, not a tuning knob**: the cache is memory an unauthenticated sender can fill
-/// — each novel filter costs one parse and one entry — so it gets the FILL_CAP treatment. Eviction
-/// is oldest-last-heard first, which is simultaneously LRU *and* the presence-pinning the design
-/// asked for: a group with live presence evidence is by definition recently heard. Under a
-/// novel-group spray the cache degrades toward known-groups-only — fewer opportunistic claims,
-/// never a collision, never a false negative — i.e. the adversary's best case is the design
-/// alternative we rejected, with `ambient`-style counters watching.
-///
-/// Deliberately NOT in `Tier0Params`/the golden vectors, despite the plan doc: it is a node-local
-/// resource bound with no wire-compat consequence — two nodes with different caps still interoperate
-/// — and pinning it cross-implementation would force the receive-only C copy to assert a parameter
-/// that is meaningless to it.
-const LEARNED_GROUP_CAP: usize = 64;
 
 /// The 3-byte tag that marks a [`FaceScheduler`] time-beacon on the wire, chosen to not collide with
 /// an NDN packet's first byte (Interest `0x05` / Data `0x06` / LP `0x64`). Followed by the master's
@@ -692,8 +658,8 @@ pub struct FaceScheduler {
     slot: Option<SlotSchedule>,
     hop: Option<HopSchedule>,
     /// Name-group depth — how many leading name components define the group the schedule keys on.
-    /// Registered name-groups (P1): slot key = longest registered prefix; RX attribution by mask
-    /// AND. `None` ⇒ the depth-1 fallback below — the pre-P1 default behaviour, kept so every
+    /// Registered name-groups (P1): slot key = longest registered prefix; RX attribution by parsing
+    /// the name. `None` ⇒ the depth-1 fallback below — the pre-P1 default behaviour, kept so every
     /// measurement taken without a registration set still describes the shipping code.
     groups: Option<std::sync::Arc<GroupTable>>,
     /// The shared schedule pin (D2/D3). Its `slot_depth` sizes the no-table slot-key fallback; when a
@@ -701,10 +667,6 @@ pub struct FaceScheduler {
     /// the registered and fallback paths cannot disagree. `digest()` is the value the time beacon will
     /// carry for partition detection.
     sched_params: SchedParams,
-    /// Parse-once cache for unregistered Tier-0 groups: wire bytes → slot hash, bounded by
-    /// [`LEARNED_GROUP_CAP`] with oldest-last-heard eviction (= LRU = presence-pinning, see the
-    /// constant). Keyed on the raw 12 bytes so a hit costs a HashMap probe, not a parse.
-    learned: Mutex<std::collections::HashMap<[u8; 16], (u64, u64)>>,
     clock_source: ClockSource,
     /// Retune knob for FHSS (per-bearer; `None` ⇒ can't hop this bearer, slot-only).
     knobs: Option<std::sync::Arc<dyn RadioKnobs>>,
@@ -877,7 +839,6 @@ impl FaceScheduler {
             hop,
             groups: None,
             sched_params,
-            learned: Mutex::new(std::collections::HashMap::new()),
             clock_source,
             knobs,
             bw,
@@ -1058,8 +1019,7 @@ impl FaceScheduler {
     /// [`ephemeral_id::fold_commitment`](ndn_radio_cognition::ephemeral_id::fold_commitment): the
     /// 32 -> 64 widening of [`SchedParams::class_digest`] was bought because a 32-bit collision was
     /// forged offline in ~10 s, and a 21-bit fold is forgeable instantly. It catches a neighbour
-    /// whose configuration HONESTLY differs, which is the #93 scenario
-    /// ([`with_bloom_latency_unauthorised`](crate::MediumConfig::with_bloom_latency_unauthorised)).
+    /// whose configuration HONESTLY differs, which is the #93 scenario.
     ///
     /// [`fold_commitment`]: ndn_radio_cognition::ephemeral_id::fold_commitment
     /// [`map_digest`]: Self::map_digest
@@ -1071,7 +1031,7 @@ impl FaceScheduler {
     ///
     /// ⚠ **A single mismatching slice is evidence, not a verdict**, and this must not be wired
     /// straight to a partition report: the caller has no way here to know the byte really is a
-    /// Tier-0 flags byte (`addr3` is overwritten with `addr1` by the A-MSDU and legacy builders).
+    /// id-carrying flags byte (`addr3` is overwritten with `addr1` by the A-MSDU and legacy builders).
     /// The reporting path is
     /// [`ClassCommitmentWatch`](ndn_radio_cognition::ephemeral_id::ClassCommitmentWatch), which
     /// debounces and — critically — reports a half-collected round as `Unknown`/`Agreeing`, never as
@@ -1209,11 +1169,10 @@ impl FaceScheduler {
     /// throughput gain with the evidence gate forced open — delivered ~0 with it closed. Foreign
     /// traffic is interference, not a statement about the slot owner, so it is counted and dropped
     /// here rather than allowed to veto a claim.
-    /// `group`/`addr` are the frame's addr1/addr2 — the Tier-0 bytes when the sender addresses by
-    /// name. **P1 makes them the primary attribution path**: on a Tier-0 medium the hot path is an
-    /// origin check plus a mask AND, and the TLV parse survives only on the broadcast-addressed
-    /// legacy path (the pre-Tier-0 frame shape every pre-P1 measurement, including the +119% claim
-    /// run, was taken under) and on the first sighting of an unregistered group.
+    /// `group`/`addr` are the frame's addr1/addr2. They no longer attribute the frame — the group is
+    /// derived by parsing the name (above) — they feed the **§2 presence nonce** alone: which
+    /// transmitter is audible in this slot (an id-carrying frame's `addr3[4]`, else the legacy addr2
+    /// nonce), so the claim path can tell "this group's OWNER is audible" from a mere relay.
     pub fn observe_rx(
         &self,
         group: Option<&[u8; 6]>,
@@ -1232,28 +1191,9 @@ impl FaceScheduler {
         }
         let now = self.now_us();
 
-        // ---- Triage by frame shape, cheapest test first (P1.5) ----
-        let group_of = match (group, addr) {
-            // Broadcast addr1 = the legacy NDN frame shape (no filter on the wire; the name is the
-            // only group evidence). Parse, exactly as before P1 — dropping this would regress the
-            // non-Tier-0 configuration the slot MAC was measured under.
-            (Some(g), _) if *g == ndn_radio_hal::BROADCAST => self.name_group(wire),
-            // Possible Tier-0 filter: addr1‖addr2‖addr3[0..4] carry the 126-bit prefix set
-            // (wire-format-spec §5.3). A legacy frame with no addr3 leaves the last four filter bytes
-            // clear, which only over-accepts, never a false negative.
-            (Some(g), Some(a)) => {
-                let mut w = [0u8; 16];
-                w[..6].copy_from_slice(g);
-                w[6..12].copy_from_slice(a);
-                if let Some(a3) = addr3 {
-                    w[12..16].copy_from_slice(&a3[..4]);
-                }
-                self.attribute_filter(w, wire, now)
-            }
-            // A capture path that surfaces no addresses cannot be attributed by filter; fall back
-            // to the parse rather than silently blinding the busy mark.
-            _ => self.name_group(wire),
-        };
+        // Relevance is decided by PARSING the NDN name — the group a frame belongs to is `H(first
+        // slot_depth components)`, the same key TX derived. A frame with no parseable Name is ambient.
+        let group_of = self.name_group(wire);
         let Some((hash, class)) = group_of else {
             self.stats.ambient_rx.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1275,12 +1215,12 @@ impl FaceScheduler {
             if let Some(cell) = self.slots.co_owner_hash.get(k) {
                 cell.store(keyed, Ordering::Relaxed);
             }
-            // The transmitter's §2 nonce: addr3 on a Tier-0-addressed frame (the filter displaced
-            // it there), addr2 on the legacy broadcast shape. Recorded per slot so the claim can
+            // The transmitter's §2 nonce: addr3 on an id-carrying frame (the ephemeral ID lives there),
+            // addr2 on the legacy broadcast shape. Recorded per slot so the claim can
             // tell "this group's OWNER is audible" from "somebody audibly relayed this group".
             let nonce = match (group, addr3, addr) {
                 // ⚠ The §2 presence nonce is the **8-bit ephemeral ID alone** (`addr3[4]`), not all
-                // six bytes. `addr3[0..4]` are the name-derived Blur filter and `addr3[5]` is the
+                // six bytes. `addr3[0..4]` are pseudo-random nonce seed bytes and `addr3[5]` is the
                 // flags byte — both vary per frame — so folding them in made two sightings of the
                 // SAME transmitter compare unequal, and the relay discount below (which asks "did
                 // this nonce evidence two slots?") could almost never fire. It biased
@@ -1291,7 +1231,7 @@ impl FaceScheduler {
                 //
                 // `addr3 == addr1` is the A-MSDU / legacy frame shape (`build_amsdu` writes
                 // `addr3 = ra`; the base builder falls back to `addr3 = dst`), where these bytes are
-                // filler, not an ID — an exact discriminator, since a real Tier-0 `addr3[0..4]`
+                // filler, not an ID — an exact discriminator, since a real id-carrying `addr3[0..4]`
                 // equals `addr1[0..4]` only by ~2^-32 coincidence.
                 (Some(g), Some(a3), _) if *g != ndn_radio_hal::BROADCAST && a3 != g => {
                     id_nonce(a3[4])
@@ -1334,8 +1274,8 @@ impl FaceScheduler {
     }
 
     /// Attach the registered-prefix table (P1): the slot key becomes the longest registered prefix
-    /// covering a name, and RX attribution becomes a mask AND on the Tier-0 bytes instead of a
-    /// per-frame TLV parse.
+    /// covering a name, and RX attribution is by parsing that name and taking the longest registered
+    /// prefix that covers it.
     #[must_use]
     pub fn with_groups(mut self, groups: std::sync::Arc<GroupTable>) -> Self {
         // Keep the pin honest: the digest must reflect the slot granularity actually in force, so a
@@ -2051,54 +1991,7 @@ impl FaceScheduler {
         self.current_ch.store(ch, Ordering::Relaxed);
     }
 
-    /// Hash the frame's first `group_depth` name components — the shared `prefix_hash` keyspace (§44),
-    /// so the schedule keys on the same name-group as demand/consistency. `None` if the wire carries no
-    /// parseable Name (non-first LP fragment, control frame, parse miss).
-    /// **Attribute a Tier-0-shaped frame without parsing it** (P1.5): origin gate, then the
-    /// registered masks, then the learned cache; the TLV parse is the cold path for the first
-    /// sighting of an unregistered group only.
-    fn attribute_filter(&self, w: [u8; 16], wire: &[u8], now: u64) -> Option<(u64, LeaseClass)> {
-        // Origin gate — no parse, no allocation. Our Tier-0 frames force octet 0's I/G+U/L to
-        // local-group (`to_wire`); foreign unicast has U/L=0 and fails the bit test; foreign
-        // broadcast/high-fill fails the FILL_CAP that F1 installed for exactly this dual purpose.
-        // Frames failing here are AMBIENT: they touch neither the busy mark nor presence.
-        if w[0] & 0b0000_0011 != 0b0000_0011 {
-            return None;
-        }
-        let f = crate::PrefixFilter::from_wire(w);
-        let pc = f.popcount();
-        if pc == 0 || pc > crate::tier0::FILL_CAP {
-            return None;
-        }
-        // Registered groups: longest-first mask AND — the map the slot key uses, so TX and RX land
-        // on the same slot by construction.
-        if let Some(groups) = &self.groups
-            && let Some(hc) = groups.hash_for_filter(&f)
-        {
-            return Some(hc);
-        }
-        // Learned cache: an unregistered group's slot stays claimable at the cost of ONE parse ever
-        // (bounded — see LEARNED_GROUP_CAP for why this is a security bound, not a tuning knob).
-        let mut learned = self.learned.lock().ok()?;
-        if let Some((h, seen)) = learned.get_mut(&w) {
-            *seen = now;
-            return Some((*h, LeaseClass::Bulk)); // unregistered ⇒ Bulk: lanes are for registered latency names
-        }
-        let h = self.name_group_hash(wire)?; // cold path: first sighting only
-        if learned.len() >= LEARNED_GROUP_CAP
-            && let Some(oldest) = learned
-                .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
-                .map(|(k, _)| *k)
-        {
-            // Oldest-last-heard first = LRU = presence-pinning in one rule: a presence-active
-            // group is by definition recently heard, so it is never the eviction victim.
-            learned.remove(&oldest);
-        }
-        learned.insert(w, (h, now));
-        Some((h, LeaseClass::Bulk))
-    }
-
+    #[cfg(test)]
     fn name_group_hash(&self, wire: &[u8]) -> Option<u64> {
         self.name_group(wire).map(|(h, _)| h)
     }
@@ -2274,7 +2167,6 @@ mod tests {
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
-            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -2322,7 +2214,6 @@ mod tests {
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
-            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -2410,7 +2301,6 @@ mod tests {
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
-            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::CommonView,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -2603,7 +2493,6 @@ mod tests {
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
-            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
             bw: crate::Bandwidth::default(),
@@ -2741,9 +2630,9 @@ mod tests {
     /// **The §2 presence nonce is the ephemeral ID, not the whole `addr3`** — the prerequisite the
     /// piggybacked class commitment forced, and a live defect on its own.
     ///
-    /// `observe_rx` folded all six bytes of `addr3` into the per-slot presence nonce. But under
-    /// Tier-0 only `addr3[4]` identifies the transmitter: `addr3[0..4]` are the NAME-derived Blur
-    /// filter and `addr3[5]` is the flags byte. So the same node relaying two different names wrote
+    /// `observe_rx` folded all six bytes of `addr3` into the per-slot presence nonce. But in the
+    /// id-carrying shape only `addr3[4]` identifies the transmitter: `addr3[0..4]` are pseudo-random
+    /// nonce seed bytes and `addr3[5]` is the flags byte. So the same node relaying two different names wrote
     /// two DIFFERENT nonces, the relay discount below (`owner_in_range`: "did this nonce evidence a
     /// second slot?") could essentially never fire, and the bias was toward `true` — toward MORE
     /// claims, the unsafe direction, which is the opposite of what that code's own comment claims.
@@ -2751,11 +2640,11 @@ mod tests {
     #[test]
     fn the_presence_nonce_is_the_ephemeral_id_not_the_whole_addr3() {
         let sched = mk_claim_sched();
-        // Tier-0 shape: addr1's octet 0 carries the forced local/group bits the origin gate tests.
+        // id-carrying shape: addr1's octet 0 carries the forced local/group bits the origin gate tests.
         let g = [0x03u8, 0x00, 0x00, 0x00, 0x00, 0x01];
         let a2 = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x02];
-        // ONE transmitter (ephemeral ID 0x5a) carrying TWO names: the filter bytes differ (they are
-        // name-derived) and so does the flags byte (it now carries a rotating commitment slice).
+        // ONE transmitter (ephemeral ID 0x5a) carrying TWO names: the addr3[0..4] seed bytes differ
+        // (they vary per frame) and so does the flags byte (it carries a rotating commitment slice).
         let a3_alarm = [0x04u8, 0x00, 0x00, 0x00, 0x5a, 0b0000_0100];
         let a3_bulk = [0x08u8, 0x00, 0x00, 0x00, 0x5a, 0b1010_1000];
         // Different FIRST components: the slot key is H(first `slot_depth` = 1 components).
@@ -2787,7 +2676,7 @@ mod tests {
 
         // And the shapes where `addr3` is NOT `id ‖ flags` must not be read as one: the A-MSDU
         // builder writes `addr3 = addr1` and the legacy builder writes `addr3 = dst`, so those bytes
-        // are filler. Fall back to addr2, exactly as before Tier-0.
+        // are filler. Fall back to addr2, exactly as the legacy shape.
         let s2 = mk_claim_sched();
         s2.observe_rx(Some(&g), Some(&a2), Some(&g), &w_alarm);
         let aggregate: Vec<u64> = s2
@@ -3083,24 +2972,23 @@ mod tests {
     }
 
     /// **One filter, one map** (P1, D3): the slot key a TX node derives from the wire name and the
-    /// slot a RX node attributes from the Tier-0 bytes must agree — both on the SHARED slot group
+    /// slot a RX node attributes from the parsed name must agree — both on the SHARED slot group
     /// (`H(first slot_depth components)`, default depth 1), NOT on a per-node longest-registered
     /// prefix — and a foreign unicast frame must die at the origin gate without a parse. This is the
     /// property the whole redesign exists for; if it fails, two nodes compute different maps and every
     /// downstream measurement is noise.
     #[test]
     fn tx_keying_and_rx_attribution_land_on_the_same_slot() {
-        let key = crate::GroupKey([9u8; 16]);
-        let table = std::sync::Arc::new(super::GroupTable::new(
-            &key,
-            &[b"/ndn".as_slice(), b"/ndn/alarm".as_slice()],
-        ));
+        let table = std::sync::Arc::new(super::GroupTable::new(&[
+            b"/ndn".as_slice(),
+            b"/ndn/alarm".as_slice(),
+        ]));
         let mut s = mk_claim_sched();
         s.groups = Some(table.clone());
 
-        // TX path: at the shared depth 1, an /ndn/alarm/… name keys on the /ndn group — the deeper
-        // /ndn/alarm registration does NOT pull the slot key deeper (D3: slot granularity is a shared
-        // constant, not the per-node longest registration; both regs truncate to /ndn and dedup).
+        // Relevance is decided by PARSING the name (no in-frame filter). At the shared depth 1, an
+        // /ndn/alarm/… name keys on the /ndn group — the deeper /ndn/alarm registration does NOT pull
+        // the slot key deeper (D3: slot granularity is a shared constant; both regs truncate to /ndn).
         let wire = data_wire(&[b"ndn", b"alarm", b"7"]);
         let tx_hash = s.name_group_hash(&wire).expect("keyed");
         assert_eq!(
@@ -3109,43 +2997,16 @@ mod tests {
             "shared depth-1 group keys TX"
         );
 
-        // RX path: the same object's Tier-0 bytes attribute to the same hash via mask AND — no parse
-        // (the wire handed over is garbage on purpose: reaching the parser would panic the premise).
-        let mut f = crate::PrefixFilter::default();
-        f.insert_name(crate::bloom_key64(&key), b"/ndn/alarm/7");
-        let w = f.to_wire();
-        let (rx_hash, _) = s
-            .attribute_filter(w, b"\xff not parseable", s.now_us())
-            .expect("attributed");
+        // RX takes the SAME parse path, so TX keying and RX attribution land on one slot by
+        // construction — the same name parses to the same shared-depth group.
+        let (rx_hash, _) = s.name_group(&wire).expect("attributed");
         assert_eq!(
             rx_hash, tx_hash,
-            "RX mask attribution and TX keying disagree — two maps"
+            "RX parse attribution and TX keying disagree — two maps"
         );
 
-        // Foreign unicast (U/L=0 first octet): ambient at the origin gate, nothing marked.
-        let mut foreign = w;
-        foreign[0] = 0x00;
-        assert_eq!(
-            s.attribute_filter(foreign, b"", s.now_us()),
-            None,
-            "foreign unicast is ambient"
-        );
-
-        // Unregistered group: parse-once, then cache hits keep the slot claimable with no parse.
-        let mut other = crate::PrefixFilter::default();
-        other.insert_name(crate::bloom_key64(&key), b"/zzz/bulk");
-        let ow = other.to_wire();
-        let good_wire = data_wire(&[b"zzz", b"bulk"]);
-        let (first, _) = s
-            .attribute_filter(ow, &good_wire, s.now_us())
-            .expect("cold parse");
-        let (second, _) = s
-            .attribute_filter(ow, b"unparseable", s.now_us())
-            .expect("cache hit");
-        assert_eq!(
-            first, second,
-            "the learned cache must return the parsed hash"
-        );
+        // A wire with no parseable Name is ambient — nothing to attribute.
+        assert_eq!(s.name_group(b"\xff not parseable"), None, "unparseable is ambient");
     }
 
     /// **D3 regression — the slot key is shared across heterogeneous registration tables.** The roles
@@ -3155,7 +3016,6 @@ mod tests {
     /// shallow-registering node and a deep-registering node agree on the slot for a covered name.
     #[test]
     fn slot_key_is_shared_across_heterogeneous_registrations() {
-        let key = crate::GroupKey([7u8; 16]);
         let name = b"/ndn/x/y/z".as_slice();
         let comps: Vec<&[u8]> = name
             .split(|&c| c == b'/')
@@ -3163,8 +3023,8 @@ mod tests {
             .collect();
         for depth in [1usize, 2] {
             // Node A registered shallow, node B registered deep — different tables, same shared depth.
-            let a = super::GroupTable::new_with_depth(&key, &[b"/ndn/x".as_slice()], depth);
-            let b = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], depth);
+            let a = super::GroupTable::new_with_depth(&[b"/ndn/x".as_slice()], depth);
+            let b = super::GroupTable::new_with_depth(&[b"/ndn/x/y".as_slice()], depth);
             let ka = a.hash_for_name(name).map(|(h, _)| h);
             let kb = b.hash_for_name(name).map(|(h, _)| h);
             assert_eq!(
@@ -3179,7 +3039,7 @@ mod tests {
             );
         }
         // The pre-fix behaviour would have diverged: the deep node's OWN registration hashed elsewhere.
-        let b2 = super::GroupTable::new_with_depth(&key, &[b"/ndn/x/y".as_slice()], 2);
+        let b2 = super::GroupTable::new_with_depth(&[b"/ndn/x/y".as_slice()], 2);
         assert_ne!(
             b2.hash_for_name(name).map(|(h, _)| h),
             Some(prefix_hash(&[&b"ndn"[..], &b"x"[..], &b"y"[..]])),
@@ -3304,7 +3164,6 @@ mod tests {
     /// let the claim overstate its coverage — see the D2 retraction in `mac-design-roots.md`.
     #[test]
     fn class_divergence_moves_the_digest_and_trips_partition_detection() {
-        let key = crate::GroupKey([5u8; 16]);
         let prefixes = [
             b"/alarm".as_slice(),
             b"/bulk".as_slice(),
@@ -3312,9 +3171,9 @@ mod tests {
         ];
         // Two nodes, IDENTICAL registration sets and identical schedule inputs. The only difference
         // is that one of them promoted `/bulk` — its own traffic — into the reserved lanes.
-        let honest = mk_lane_sched(std::sync::Arc::new(GroupTable::new(&key, &prefixes)));
+        let honest = mk_lane_sched(std::sync::Arc::new(GroupTable::new(&prefixes)));
         let defector = mk_lane_sched(std::sync::Arc::new(
-            GroupTable::new(&key, &prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]),
+            GroupTable::new(&prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]),
         ));
 
         // The promotion is not cosmetic: it moves /bulk out of the open slots into a reserved lane,
@@ -3393,15 +3252,10 @@ mod tests {
     /// ordering — a false positive is how a detector's information content goes to zero.
     #[test]
     fn the_class_commitment_is_order_independent() {
-        let key = crate::GroupKey([6u8; 16]);
-        let a = GroupTable::new(
-            &key,
-            &[b"/aa".as_slice(), b"/bb".as_slice(), b"/cc".as_slice()],
+        let a = GroupTable::new(&[b"/aa".as_slice(), b"/bb".as_slice(), b"/cc".as_slice()],
         )
         .with_latency_unauthorised(&[b"/aa".as_slice(), b"/cc".as_slice()]);
-        let b = GroupTable::new(
-            &key,
-            &[b"/cc".as_slice(), b"/bb".as_slice(), b"/aa".as_slice()],
+        let b = GroupTable::new(&[b"/cc".as_slice(), b"/bb".as_slice(), b"/aa".as_slice()],
         )
         .with_latency_unauthorised(&[b"/cc".as_slice(), b"/aa".as_slice()]);
 
@@ -3430,13 +3284,12 @@ mod tests {
     /// lane set produce a bit-identical map for every name, registered or not.
     #[test]
     fn a_different_registration_set_with_one_lane_policy_does_not_false_partition() {
-        let key = crate::GroupKey([3u8; 16]);
         let a = mk_lane_sched(std::sync::Arc::new(
-            GroupTable::new(&key, &[b"/a".as_slice(), b"/alarm".as_slice()])
+            GroupTable::new(&[b"/a".as_slice(), b"/alarm".as_slice()])
                 .with_latency_unauthorised(&[b"/alarm".as_slice()]),
         ));
         let b = mk_lane_sched(std::sync::Arc::new(
-            GroupTable::new(&key, &[b"/b".as_slice(), b"/alarm".as_slice()])
+            GroupTable::new(&[b"/b".as_slice(), b"/alarm".as_slice()])
                 .with_latency_unauthorised(&[b"/alarm".as_slice()]),
         ));
 
@@ -3473,17 +3326,16 @@ mod tests {
     /// commitment is inert, because so is the class.
     #[test]
     fn with_no_reserved_lanes_the_class_is_not_committed() {
-        let key = crate::GroupKey([4u8; 16]);
         let prefixes = [b"/alarm".as_slice(), b"/bulk".as_slice()];
         let promoted =
-            GroupTable::new(&key, &prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]);
+            GroupTable::new(&prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]);
         assert_eq!(
             promoted.class_digest(false),
             0,
             "no lanes ⇒ nothing to commit to"
         );
 
-        let a = mk_open_sched(std::sync::Arc::new(GroupTable::new(&key, &prefixes)));
+        let a = mk_open_sched(std::sync::Arc::new(GroupTable::new(&prefixes)));
         let b = mk_open_sched(std::sync::Arc::new(promoted));
         let slot = a.slot.unwrap();
         let h = prefix_hash(&[b"bulk".as_slice()]);
@@ -3510,15 +3362,10 @@ mod tests {
     /// latent rather than impossible, and a latent silent divergence is worth making loud.
     #[test]
     fn a_shallower_than_depth_registration_is_committed() {
-        let key = crate::GroupKey([8u8; 16]);
-        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(
-            &key,
-            &[b"/ndn".as_slice()],
+        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn".as_slice()],
             2,
         ));
-        let exact = std::sync::Arc::new(GroupTable::new_with_depth(
-            &key,
-            &[b"/ndn/x".as_slice()],
+        let exact = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn/x".as_slice()],
             2,
         ));
         let a = mk_lane_sched(shallow);
@@ -3559,18 +3406,17 @@ mod tests {
                 }
             }
         }
-        let key = crate::GroupKey([9u8; 16]);
         let prefixes = [b"/alarm".as_slice(), b"/bulk".as_slice()];
         let both = [b"/alarm".as_slice(), b"/bulk".as_slice()];
 
-        let bare = GroupTable::new(&key, &prefixes).with_latency_unauthorised(&both);
+        let bare = GroupTable::new(&prefixes).with_latency_unauthorised(&both);
         assert_eq!(
             bare.hash_for_name(b"/bulk/1").map(|(_, c)| c),
             Some(LeaseClass::Latency),
             "the bare path promotes whatever it is handed — that is the finding"
         );
 
-        let gated = GroupTable::new(&key, &prefixes).with_latency_authorised(&OnlyAlarm, &both);
+        let gated = GroupTable::new(&prefixes).with_latency_authorised(&OnlyAlarm, &both);
         assert_eq!(
             gated.hash_for_name(b"/alarm/1").map(|(_, c)| c),
             Some(LeaseClass::Latency),
@@ -3718,7 +3564,6 @@ mod tests {
             hop: None,
             groups: None,
             sched_params: SchedParams::default(),
-            learned: super::Mutex::new(std::collections::HashMap::new()),
             clock_source: ClockSource::Wall,
             knobs: None,
             bw: crate::Bandwidth::default(),

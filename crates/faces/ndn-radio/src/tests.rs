@@ -532,3 +532,76 @@ async fn face_rx_teaches_the_learning_policy() {
         "face RX taught the policy → BLE"
     );
 }
+
+/// §5 wiring: a node stamps its `NdrCapability` on the Interests it sends, and the receiver reads it
+/// off the reverse path into its soft-state store (item-8 on-wire integration).
+#[tokio::test]
+async fn ndr_capability_rides_interests_and_is_stored() {
+    use crate::mac::capability::NdrCapability;
+    let wifi = LoopbackBus::new();
+    let cap = NdrCapability { max_rate: Some(6), hop: true, phys: 0b0000_0101, ..Default::default() };
+    let a = Radio::broadcast(FaceId(1), vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)])
+        .with_capability(cap);
+    let b = Radio::broadcast(FaceId(2), vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)]);
+    // LP-wrapped Interest: 0x64 { 0x50 { 0x05 len { 0x07 { /w/1 } } } }
+    let name = [0x07u8, 0x06, 0x08, 0x01, b'w', 0x08, 0x01, b'1'];
+    let mut interest = vec![0x05u8, name.len() as u8];
+    interest.extend_from_slice(&name);
+    let mut frag = vec![0x50u8, interest.len() as u8];
+    frag.extend_from_slice(&interest);
+    let mut lp = vec![0x64u8, frag.len() as u8];
+    lp.extend_from_slice(&frag);
+    a.send_bytes(Bytes::from(lp)).await.unwrap();
+    let _got = tokio::time::timeout(std::time::Duration::from_secs(1), b.recv_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        b.peer_capability(0),
+        Some(cap),
+        "the neighbour's NdrCapability was read off the Interest into the reverse-path store"
+    );
+    // And the worst-receiver merge a Data return would apply: min(our MCS 7, peer MaxRate 6) = 6.
+    assert_eq!(b.peer_capability(0).unwrap().worst_receiver_mcs(7), 6);
+}
+
+/// Default actuation (integration pass): a face **auto-derives** its advertised capability from its phys
+/// (no config), and `register_prefixes` reaches every gate-capable phy — the off-host parse gate's
+/// default-actuation seam.
+struct CapPhy {
+    mcs: Option<u8>,
+    prefixes: Mutex<Vec<Vec<u8>>>,
+}
+#[async_trait]
+impl super::WirelessPhy for CapPhy {
+    fn kind(&self) -> PhyKind { PhyKind::Wifi }
+    fn mtu(&self) -> usize { 2000 }
+    fn range_rank(&self) -> u8 { 1 }
+    async fn send(&self, _wire: Bytes) -> Result<(), FaceError> { Ok(()) }
+    async fn recv(&self) -> Result<Bytes, FaceError> { std::future::pending().await }
+    fn max_rx_mcs(&self) -> Option<u8> { self.mcs }
+    fn set_relevance_prefixes(&self, p: &[Vec<u8>]) -> Result<(), FaceError> {
+        *self.prefixes.lock().unwrap() = p.to_vec();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn capability_is_auto_derived_and_prefixes_actuate_the_gate() {
+    let phy = Arc::new(CapPhy { mcs: Some(7), prefixes: Mutex::new(vec![]) });
+    let face = Radio::broadcast(FaceId(1), vec![phy.clone() as Arc<dyn super::WirelessPhy>]);
+    // Advertised capability is derived from the phys with NO configuration.
+    let cap = face.capability();
+    assert_eq!(cap.max_rate, Some(7), "MaxRate auto-derived from the radio's max RX MCS");
+    assert_eq!(cap.phys, 0b0000_0001, "Wi-Fi bearer bit set from the phy kind");
+    assert!(!cap.is_floor(), "a real radio advertises a real capability by default");
+    // Registering served prefixes actuates the off-host parse gate on every gate-capable phy.
+    face.register_prefixes(&[b"/ndn/svc".to_vec(), b"/ndn/alarm".to_vec()]).unwrap();
+    assert_eq!(
+        phy.prefixes.lock().unwrap().as_slice(),
+        &[b"/ndn/svc".to_vec(), b"/ndn/alarm".to_vec()],
+        "register_prefixes reached the phy's off-host gate"
+    );
+    // The consumable rate hint: with a peer we haven't heard, None (rate decider keeps its choice).
+    assert_eq!(face.link_rate_hint(0), None);
+}

@@ -23,16 +23,32 @@
 
 use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfThresholds};
 use crate::plan::{
-    AllocRole, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams, TxParams,
-    WifiRate,
+    AllocRole, Contention, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams,
+    TxParams, WifiRate,
 };
 use crate::phy::{PhyDial, PhyHold};
 use crate::sense::{MediumView, PhyMode, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
 use std::sync::Arc;
 
-/// Delivery priority derived from the name / Interest (urgency, freshness, trust).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// Delivery **class** a name is permitted to reach.
+///
+/// ⚠ This is a CEILING granted by authority, never a wish carried in a frame. The distinction is
+/// the whole design: a class that a sender can simply assert is the DiffServ/802.11e failure — the
+/// marking is free, so everyone marks everything urgent and the field stops meaning anything. It is
+/// also unverifiable state below the network layer, which fails the §7 test in
+/// `ndn-phy-wifi/docs/mac-addressing-doctrine.md`: L2 would be holding something the forwarder
+/// cannot recompile.
+///
+/// So a class is **derived, never asserted**, from two independent inputs that both always apply:
+/// * an authority ([`ClassAuthority`]) says how high this NAME may go — the ceiling, this enum;
+/// * measured demand ([`DemandRank`]) orders traffic WITHIN whatever ceiling it was granted.
+///
+/// They are not alternatives and neither substitutes for the other. A fully schematised deployment
+/// still needs the rank, because ten prefixes all authorised `Urgent` still compete with each other
+/// and the schema says nothing about which of them should go first right now. A deployment with no
+/// authority at all still gets useful ordering from demand, capped at `Normal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub enum Priority {
     /// Background bulk — favour throughput (high rate, aggregation).
     Bulk,
@@ -53,12 +69,139 @@ impl Priority {
     }
 }
 
+/// The gate that decides how high a NAME may be classed.
+///
+/// A trust-schema / LVS evaluation implements this: "may the key that signed this name legitimately
+/// claim this class?". There is deliberately **no blanket implementation and no default that returns
+/// anything above [`Priority::Normal`]** — a deployment without a trust anchor cannot offer
+/// authority-based classes, and the honest response is to say so rather than to offer them and hope
+/// nobody lies.
+///
+/// The signature keys on `prefix_hash` — the compiled form of the name the radio already carries —
+/// so an implementation CAN answer from the forwarder's own state with nothing host-shaped entering
+/// L2. ⚠ It cannot *enforce* that: an implementor may close over anything, and the one
+/// implementation in this tree (`examples/lora_cognition.rs`'s `NameTrusting`) ignores the hash
+/// entirely. Implementations are therefore the thing to audit — which is the reason this is a named
+/// trait rather than an `if` inside a parser. Grep for `impl ClassAuthority` to enumerate everything
+/// a deployment has chosen to trust.
+///
+/// ⚠ It is also not a capability: a linked crate can write its own permissive impl in four lines.
+/// The threat this closes is the REMOTE one — a peer buying priority by marking a frame — plus
+/// accidental self-assertion, which was previously a one-line struct literal.
+pub trait ClassAuthority {
+    /// The highest class this name may reach. Returning more than the schema actually authorises is
+    /// the one way to break the invariant, so implementations should fail CLOSED.
+    fn ceiling_for(&self, prefix_hash: u64) -> Priority;
+}
+
+/// A class ceiling, which can only be **lowered** once held.
+///
+/// The type exists to make the invariant structural rather than a comment. Before this, `priority`
+/// was a public field and `NameContext { priority: Priority::Urgent, .. }` compiled anywhere —
+/// which is precisely the hole. Now the only route above `Normal` is [`ClassCeiling::authorised`],
+/// which requires a [`ClassAuthority`], and the only operations afterwards are caps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ClassCeiling(Priority);
+
+impl ClassCeiling {
+    /// What every name gets without an authority to say otherwise: [`Priority::Normal`].
+    ///
+    /// This is a correct answer, not a degraded one — it is the defined bottom of the lattice.
+    pub const fn unauthorised() -> Self {
+        Self(Priority::Normal)
+    }
+
+    /// Ask an authority. **The only constructor that can exceed [`Priority::Normal`].**
+    pub fn authorised(auth: &dyn ClassAuthority, prefix_hash: u64) -> Self {
+        Self(auth.ceiling_for(prefix_hash))
+    }
+
+    /// Give up privilege. Available without permission — but only **down to `Normal`**.
+    ///
+    /// ☠ **`Bulk` is not "less than `Normal`", it is DIFFERENT, and that distinction cost a real
+    /// hole.** The enum orders `Bulk < Normal < Urgent` as a *privilege* ladder, and the original
+    /// rule ("lower never needs permission") read that ordering as if every step down were a
+    /// renunciation. It is not: `Bulk` SELECTS behaviour rather than giving it up —
+    ///
+    /// * `phy::PhyDial` moves the link to the rate PHY on `wants_rate = matches!(p, Bulk)`;
+    /// * `RadioPolicy` widens LoRa to 250 kHz on `Bulk` + a strong measured link.
+    ///
+    /// Both are **rendezvous parameters**, where a mismatch is deafness rather than slowness — the
+    /// hazard the code comments at those two sites already name. So an unauthorised caller reaching
+    /// `Bulk` through a "cap" was choosing the shared modulation and bandwidth for the link, and on
+    /// the dial it was sticky for every later object because `PhyDial` holds shared state.
+    ///
+    /// The free direction is therefore toward `Normal` — the neutral point — not toward the bottom
+    /// of the enum. Reaching `Bulk` needs an authority exactly as `Urgent` does. A ceiling an
+    /// authority already placed at `Bulk` is preserved: this only refuses to *introduce* it.
+    pub fn capped_to(self, at_most: Priority) -> Self {
+        let floor = if at_most > Priority::Normal {
+            at_most
+        } else {
+            Priority::Normal
+        };
+        Self(if self.0 < floor { self.0 } else { floor })
+    }
+
+    /// The class itself.
+    pub const fn get(self) -> Priority {
+        self.0
+    }
+}
+
+/// Ordering **within** a class, measured rather than asserted.
+///
+/// Derived from what the network is actually asking for — PIT fan-out and the re-expression rate.
+///
+/// ⚠ **Abuse-resistant against a REMOTE peer, not against in-process code — an earlier version of
+/// this doc overclaimed it.** `DemandTracker::on_interest(prefix_hash, downstream, ..)` takes a
+/// caller-supplied downstream id that nothing checks, so ~200 fabricated ids drive the rank to 0.99
+/// with no network at all — measured end to end through the public `RadioControl::on_interest`,
+/// where the forged prefix then WON a contended radio. Making `with_demand` crate-private did not
+/// change that; the surviving route is the tracker itself. What a rank costs a PEER on the air is
+/// real; what it costs a linked crate is nothing — the same boundary [`ClassAuthority`] documents.
+///
+/// `0.0` = nobody is waiting; `1.0` = many downstreams, all still re-asking.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Default)]
+pub struct DemandRank(f32);
+
+impl DemandRank {
+    /// Nothing is waiting on this name.
+    pub const fn none() -> Self {
+        Self(0.0)
+    }
+
+    /// Rank from measured demand.
+    ///
+    /// Two signals, deliberately combined rather than one: **fan-out** says how many downstreams
+    /// want it, **re-expression** says they are not getting it. Fan-out alone would rank a
+    /// widely-wanted-and-satisfied prefix above an urgent unsatisfied one; re-expression alone would
+    /// rank one desperate downstream above fifty content ones. Fan-out saturates (`f/(1+f)`) because
+    /// the difference between 1 and 2 downstreams matters far more than between 50 and 51.
+    pub fn from_demand(d: &crate::sense::Demand) -> Self {
+        let f = d.fanout as f32;
+        let want = f / (1.0 + f);
+        let miss = d.reinterest_rate.get().unwrap_or(0.0).clamp(0.0, 1.0);
+        Self((0.5 * want + 0.5 * miss).clamp(0.0, 1.0))
+    }
+
+    /// The scalar, in `0.0..=1.0`.
+    pub const fn get(self) -> f32 {
+        self.0
+    }
+}
+
 /// Name-derived context for one transmission decision.
 #[derive(Clone, Copy, Debug)]
 pub struct NameContext {
     /// Hash of the object's name-prefix (keys demand + consistency).
     pub prefix_hash: u64,
-    pub priority: Priority,
+    /// PRIVATE on purpose: see [`Priority`]. Reachable only through [`NameContext::priority`],
+    /// settable only from a [`ClassCeiling`], and afterwards only ever lowered.
+    ceiling: ClassCeiling,
+    /// Measured ordering within [`Self::ceiling`]. Also private: it is a measurement, and a caller
+    /// that could write it could forge demand it never observed.
+    demand: DemandRank,
     /// Are we the producer/origin (always transmit) vs a relay (innovation-gated)?
     pub is_origin: bool,
     /// Coding generation this object belongs to, if any (enables Split allocation).
@@ -70,7 +213,8 @@ impl NameContext {
     pub fn new(prefix_hash: u64) -> Self {
         Self {
             prefix_hash,
-            priority: Priority::Normal,
+            ceiling: ClassCeiling::unauthorised(),
+            demand: DemandRank::none(),
             is_origin: true,
             generation: None,
         }
@@ -81,10 +225,74 @@ impl NameContext {
     pub fn relayed(prefix_hash: u64) -> Self {
         Self {
             prefix_hash,
-            priority: Priority::Normal,
+            ceiling: ClassCeiling::unauthorised(),
+            demand: DemandRank::none(),
             is_origin: false,
             generation: None,
         }
+    }
+
+    /// The class this name was GRANTED. `Normal` unless an authority said otherwise.
+    pub const fn priority(&self) -> Priority {
+        self.ceiling.get()
+    }
+
+    /// Measured ordering within the class.
+    pub const fn demand_rank(&self) -> DemandRank {
+        self.demand
+    }
+
+    /// Attach an authority's verdict. The only route above `Normal`.
+    pub fn with_ceiling(mut self, ceiling: ClassCeiling) -> Self {
+        self.ceiling = ceiling;
+        self
+    }
+
+    /// Attach measured demand. **Crate-private: only [`DemandTracker`](crate::DemandTracker) may
+    /// attach a rank**, because the tracker is where the measurement lives.
+    ///
+    /// The `demand` field has always been private with the right comment on it — "it is a
+    /// measurement, and a caller that could write it could forge demand it never observed" — and a
+    /// `pub` setter beside it contradicted that comment. `Demand` itself is publicly constructible
+    /// (it is the sense-bus record, `Copy`, all-public-fields, pushed across the face boundary in
+    /// both directions), so `DemandRank::from_demand(&Demand { fanout: u32::MAX, .. })` yields a
+    /// free `1.0`, and `decide_all` now SORTS competing objects by `(class, then rank)` before
+    /// last-writer-wins picks the radio.
+    ///
+    /// ⚠ **Billed as a CONSISTENCY fix, not a security fix**, and for a stricter reason than usual:
+    /// forged and measured ranks provably never coexist in one active set today.
+    /// `RadioControl::tick_now` is strictly either/or — the tracker's contexts if it has any, the
+    /// manually-set ones otherwise — so on a node with live PIT demand the manual path is dead
+    /// code, and on a node without it the whole active set belongs to one caller who is only
+    /// reordering their own objects. Three further bounds hold independently: class dominates the
+    /// sort, `from_demand` clamps to `0.0..=1.0` so a forgery can tie but never exceed a genuinely
+    /// maximal rank, and `demand_rank()` has exactly ONE consumer in the tree (that sort).
+    ///
+    /// What it buys is that the seam cannot BECOME one. The moment anyone writes a producer that
+    /// merges contexts from more than one origin — a FIB-backed source alongside PIT demand, a
+    /// second face's contexts — a forged rank would start beating a measured one silently, and the
+    /// merge point would not look like the place a rule was broken. Crate-private now means that
+    /// future producer has to route through `DemandTracker`.
+    ///
+    /// ⚠ It is also NOT the biggest forgeable surface here, and closing it does not claim to be:
+    /// `RadioControl::observe_demand` is `pub` and writes a caller's `Demand` straight into the
+    /// sense bus, from where it reaches `effective_receivers` (the broad-vs-unicast MCS split) and
+    /// the FEC parity budget — real decisions, not just ordering. That is the sense bus's stated
+    /// contract (push-fed by the trusted host) and is left alone deliberately.
+    pub(crate) fn with_demand(mut self, demand: DemandRank) -> Self {
+        self.demand = demand;
+        self
+    }
+
+    /// ★ **Lower, never raise** — the rule every cross-node input obeys.
+    ///
+    /// This is the invariant `ReceptionReport` already embodies and the reason it is safe: a
+    /// neighbour advertising `max_rx_mcs` can only make a sender back OFF. A neighbour able to
+    /// RAISE our class would be able to buy privilege by lying, and lying would be free. So
+    /// anything learned from a peer arrives here, and there is deliberately no inverse.
+    pub fn capped_by(mut self, at_most: Priority) -> Self {
+        self.ceiling = self.ceiling.capped_to(at_most);
+        self
     }
 }
 
@@ -277,7 +485,7 @@ impl RadioPolicy {
             // deafness, not slowness), so it moves only on a number both ends can see.
             view.weakest_rssi(radio, now_ms),
             self.phy_anchor_dbm(),
-            ctx.priority,
+            ctx,
             // Heard peers, not wanted receivers: the peer-silence escape hatch asks "did anyone
             // follow us", which only reception can answer.
             view.receiver_count(now_ms) > 0,
@@ -486,7 +694,7 @@ impl RadioPolicy {
         // of the descriptor, no special-casing.
         let reach = cap.range_rank() as f32 / 4.0;
         let rate = cap.rate_rank(); // bearer-agnostic peak-throughput rank
-        let (w_reach, w_rate) = match ctx.priority {
+        let (w_reach, w_rate) = match ctx.priority() {
             Priority::Bulk => (0.2, 1.0),
             Priority::Urgent => (1.0, 0.2),
             Priority::Normal if broad => (0.7, 0.5),
@@ -547,7 +755,7 @@ impl RadioPolicy {
             // Clamp the pick to the radio's advertised SF span (from the capability, not a hardcode).
             let sf = self.pick_sf(eff.round().clamp(-128.0, 0.0) as i8);
             let sf = cap.sf_range().map_or(sf, |(lo, hi)| sf.clamp(lo, hi));
-            let cr = if matches!(ctx.priority, Priority::Urgent) || broad {
+            let cr = if matches!(ctx.priority(), Priority::Urgent) || broad {
                 2
             } else {
                 1
@@ -559,7 +767,7 @@ impl RadioPolicy {
             // reach link: ~2× rate and half the airtime (duty relief) at ~3 dB less sensitivity, which
             // the margin affords. No measured peer ⇒ hold the 125 kHz reach default.
             let strong = !broad && view.weakest_rssi(radio, now_ms).is_some_and(|r| r >= -85);
-            let bandwidth_khz = if matches!(ctx.priority, Priority::Bulk) && strong {
+            let bandwidth_khz = if matches!(ctx.priority(), Priority::Bulk) && strong {
                 Some(250)
             } else {
                 Some(125)
@@ -636,7 +844,7 @@ impl RadioPolicy {
         let good_snr = rssi.unwrap_or(-90) >= -60;
         let nss = if neighbor_single_stream {
             1 // a 1-RX-chain neighbour cannot decode a 2-stream frame at any MCS
-        } else if ctx.priority == Priority::Bulk && good_snr {
+        } else if ctx.priority() == Priority::Bulk && good_snr {
             cap.max_nss()
         } else {
             1
@@ -646,7 +854,7 @@ impl RadioPolicy {
         //  - LDPC: better coding gain whenever robustness matters.
         //  - STBC: 2-chain transmit diversity for a 1-stream robust send.
         //  - CSD: 1-stream cyclic-shift diversity to both antennas on a weak link.
-        let robust = broad || ctx.priority == Priority::Urgent || deficit >= 1.0;
+        let robust = broad || ctx.priority() == Priority::Urgent || deficit >= 1.0;
         let ldpc = robust;
         let weak = rssi.unwrap_or(-90) < -70;
         let div = self.cfg.enable_tx_diversity;
@@ -664,7 +872,7 @@ impl RadioPolicy {
 
         // A-MSDU: aggregate only for bulk on a clean link (and it interleaves with
         // FEC at MSDU granularity downstream — not mutually exclusive).
-        let amsdu_msdus = if ctx.priority == Priority::Bulk && !robust {
+        let amsdu_msdus = if ctx.priority() == Priority::Bulk && !robust {
             Some(7)
         } else {
             None
@@ -696,7 +904,16 @@ impl RadioPolicy {
                 amsdu_msdus,
             }),
             link_fec_redundancy: self.fec_redundancy(radio, ctx, view, channel, receivers, deficit),
-            edcca_ignore: ctx.priority == Priority::Urgent && busy >= self.cfg.busy_high,
+            // Transmit into a busy channel. TWO independent conditions, and neither is optional:
+            // the MEDIUM condition is ours (is it actually busy?), the AUTHORITY condition belongs
+            // to `Contention::ignoring_edcca`, which grants only on a ceiling an authority raised
+            // to `Urgent`. Written this way round so the class gate is a value the type enforces
+            // rather than a `&&` any other construction site could forget.
+            contention: if busy >= self.cfg.busy_high {
+                Contention::deferring().ignoring_edcca(ctx)
+            } else {
+                Contention::deferring()
+            },
             tx_power: self.decide_power(cap, mcs, rssi),
             tx_power_dbm: self.decide_power_dbm(cap, mcs, rssi),
             rx_gain: self.decide_rx_gain(mcs, rssi),
@@ -901,7 +1118,7 @@ impl RadioPolicy {
         //   2. INDEPENDENT loss. A shared interferer (a busy/contended channel,
         //      `wifi-loss-is-contention`) correlates loss across receivers, so a pool of
         //      `n` behaves like fewer. Damp the effective count toward 1 as busy rises.
-        let all_of = matches!(ctx.priority, Priority::Urgent);
+        let all_of = matches!(ctx.priority(), Priority::Urgent);
         let n = receivers.max(1) as f64;
         let n_eff = if all_of {
             1.0
@@ -985,11 +1202,15 @@ impl RadioPolicy {
 /// against a receiver we have not met.
 ///
 /// Returns one of the `ADV_PHY_*` codes; the BLE bearer maps it to its own PHY type.
-pub fn decide_adv_phy(view: &dyn MediumView, priority: Priority, self_cap: u8, now_ms: u64) -> u8 {
+pub fn decide_adv_phy(view: &dyn MediumView, ctx: &NameContext, self_cap: u8, now_ms: u64) -> u8 {
     use crate::report::{ADV_PHY_1M, ADV_PHY_2M, ADV_PHY_CODED};
-    // The group floor: our own transmit capability AND the least capable listener.
+    // ⚠ Takes the CONTEXT, not a bare `Priority`, and that is the point: this used to accept an
+    // asserted class, so any caller could write `Priority::Urgent` and buy LE Coded S=8 — the
+    // longest-reach, ~8x-airtime-per-bit mode — through the branch below. That is precisely the
+    // purchase [`ClassCeiling`] exists to gate, and leaving the door open here would have made the
+    // type wall decorative. A class reaches this function only after an authority granted it.
     let floor = self_cap.min(view.worst_neighbor_adv_phy(now_ms).unwrap_or(ADV_PHY_1M));
-    match priority {
+    match ctx.priority() {
         Priority::Urgent if floor >= ADV_PHY_CODED => ADV_PHY_CODED,
         Priority::Bulk if floor >= ADV_PHY_2M => ADV_PHY_2M,
         _ => ADV_PHY_1M,
@@ -1018,9 +1239,9 @@ const POWER_SAFETY_MARGIN_DB: f32 = 6.0;
 /// The clear-channel (defer) threshold a radio sits at with no reuse claimed, in dBm — the vendor
 /// default the Realtek parts boot with. [`RadioPolicy::decide_edcca_threshold_dbm`] raises above
 /// this by exactly the dB of transmit power it gave back.
-const EDCCA_L2H_BASE_DBM: i8 = -75;
+const EDCCA_L2H_BASE_DBM: i8 = crate::plan::DEFER_THRESHOLD_DBM_BAND.0;
 /// Hysteresis between the busy (`l2h`) and idle (`h2l`) thresholds, in dB — the kernel default.
-const EDCCA_HYSTERESIS_DB: i8 = 8;
+const EDCCA_HYSTERESIS_DB: i8 = crate::plan::DEFER_HYSTERESIS_MAX_DB;
 /// Most we'll back TX power off, even with huge surplus margin (dB).
 const MAX_BACKOFF_DB: f32 = 18.0;
 // ☠ `DB_PER_POWER_IDX = 0.5` lived here. It was a single global "approx dB per TXAGC index step"
@@ -1295,10 +1516,7 @@ mod tests {
         use crate::sense::NeighborReport;
 
         // A strong single-receiver bulk link: uncapped, cognition provisions a high, 2-stream rate.
-        let ctx = NameContext {
-            priority: Priority::Bulk,
-            ..NameContext::new(0xAA)
-        };
+        let ctx = ctx_at(0xAA, Priority::Bulk);
         let decide_for = |max_rx: u8| {
             let mut m = wifi_only();
             m.observe_rx(W, 1, Some(-45), 1_000); // strong link ⇒ high uncapped MCS
@@ -1382,10 +1600,7 @@ mod tests {
         let parity = |pri: Priority, m: &MediumState| {
             RadioPolicy::default()
                 .decide(
-                    &NameContext {
-                        priority: pri,
-                        ..NameContext::new(0xAA)
-                    },
+                    &ctx_at(0xAA, pri),
                     m,
                     1_000,
                 )
@@ -1450,11 +1665,143 @@ mod tests {
         m
     }
 
-    fn bulk(hash: u64) -> NameContext {
-        NameContext {
-            priority: Priority::Bulk,
-            ..NameContext::new(hash)
+    /// A stub authority for the tests below.
+    ///
+    /// Deliberately the ONLY way anything here reaches a class above `Normal`: the tests go through
+    /// the same gate production does, rather than through a back door that would re-open the hole
+    /// this type exists to close. If a future test can set a class without one of these, the
+    /// invariant has regressed.
+    struct FixedAuthority(Priority);
+    impl ClassAuthority for FixedAuthority {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            self.0
         }
+    }
+
+    fn ctx_at(prefix_hash: u64, p: Priority) -> NameContext {
+        NameContext::new(prefix_hash)
+            .with_ceiling(ClassCeiling::authorised(&FixedAuthority(p), prefix_hash))
+    }
+
+    // ---- the class contract: derived, never asserted; lower, never raise -----------------------
+
+    #[test]
+    fn a_name_with_no_authority_is_normal_and_that_is_a_correct_answer() {
+        // The defined bottom of the lattice, not a degraded state. Both constructors agree, so a
+        // relay cannot acquire class merely by relaying.
+        assert_eq!(NameContext::new(0xAA).priority(), Priority::Normal);
+        assert_eq!(NameContext::relayed(0xAA).priority(), Priority::Normal);
+        assert_eq!(ClassCeiling::unauthorised().get(), Priority::Normal);
+    }
+
+    #[test]
+    fn only_an_authority_can_exceed_normal() {
+        // `ctx_at` is the ONLY route above Normal in these tests and it goes through the gate.
+        // There is deliberately no `NameContext::set_priority`; if one appears, this contract is
+        // gone and the DiffServ failure mode is back.
+        assert_eq!(ctx_at(0xAA, Priority::Urgent).priority(), Priority::Urgent);
+        // An authority that fails closed yields the bottom, not an error.
+        assert_eq!(ctx_at(0xAA, Priority::Normal).priority(), Priority::Normal);
+    }
+
+    #[test]
+    fn a_peer_may_lower_a_class_and_has_no_way_to_raise_one() {
+        // ★ The rule `ReceptionReport` already embodies: anything learned from a neighbour can only
+        // make us do LESS. A peer able to raise our class could buy privilege by lying, for free.
+        let urgent = ctx_at(0xAA, Priority::Urgent);
+        // A cap removes privilege down to the NEUTRAL point, not to the bottom of the enum:
+        // `Bulk` selects rendezvous parameters and must be earned. See `ClassCeiling::capped_to`.
+        assert_eq!(urgent.capped_by(Priority::Bulk).priority(), Priority::Normal);
+        assert_eq!(urgent.capped_by(Priority::Normal).priority(), Priority::Normal);
+        // Capping upward is a no-op — the cap is a minimum, never a promotion.
+        let bulk_ctx = ctx_at(0xAA, Priority::Bulk);
+        assert_eq!(bulk_ctx.capped_by(Priority::Urgent).priority(), Priority::Bulk);
+        // ...and it is idempotent, so repeated gossip cannot ratchet anything.
+        assert_eq!(
+            urgent
+                .capped_by(Priority::Bulk)
+                .capped_by(Priority::Bulk)
+                .priority(),
+            Priority::Normal
+        );
+    }
+
+    /// ☠ The hole an external probe found: `Bulk` sits below `Normal`, so a free "cap" reached it —
+    /// and `Bulk` is what MOVES the dial to the rate PHY and widens LoRa to 250 kHz, both rendezvous
+    /// parameters. A class that selects behaviour must be earned regardless of where it sits in the
+    /// privilege order.
+    #[test]
+    fn an_unauthorised_caller_cannot_reach_bulk_by_capping() {
+        let plain = NameContext::new(0xAA);
+        assert_eq!(plain.priority(), Priority::Normal);
+        assert_eq!(
+            plain.capped_by(Priority::Bulk).priority(),
+            Priority::Normal,
+            "self-demotion must not buy the rate PHY or 250 kHz"
+        );
+        // An authority may still grant Bulk, and a later cap does not erase it.
+        let granted = ctx_at(0xAA, Priority::Bulk);
+        assert_eq!(granted.priority(), Priority::Bulk);
+        assert_eq!(granted.capped_by(Priority::Bulk).priority(), Priority::Bulk);
+        assert_eq!(granted.capped_by(Priority::Normal).priority(), Priority::Bulk);
+    }
+
+    #[test]
+    fn demand_rank_is_monotone_in_both_signals_it_measures() {
+        let mk = |fanout: u32, reint: f32| {
+            let mut e = crate::sense::Ewma::new(1.0);
+            e.update(reint);
+            crate::sense::Demand {
+                fanout,
+                reinterest_rate: e,
+                rank_deficit: crate::sense::Ewma::new(0.3),
+                ts_ms: 0,
+            }
+        };
+        let quiet = DemandRank::from_demand(&mk(0, 0.0));
+        let wanted = DemandRank::from_demand(&mk(8, 0.0));
+        let missing = DemandRank::from_demand(&mk(0, 1.0));
+        let both = DemandRank::from_demand(&mk(8, 1.0));
+        assert!(quiet.get() < wanted.get(), "more downstreams ⇒ higher rank");
+        assert!(quiet.get() < missing.get(), "re-expression ⇒ higher rank");
+        assert!(both.get() > wanted.get() && both.get() > missing.get());
+        assert!((0.0..=1.0).contains(&both.get()));
+        // Fan-out saturates: 1 -> 2 downstreams matters more than 50 -> 51.
+        let d1 = DemandRank::from_demand(&mk(1, 0.0)).get();
+        let d2 = DemandRank::from_demand(&mk(2, 0.0)).get();
+        let d50 = DemandRank::from_demand(&mk(50, 0.0)).get();
+        let d51 = DemandRank::from_demand(&mk(51, 0.0)).get();
+        assert!(d2 - d1 > d51 - d50);
+    }
+
+    #[test]
+    fn the_ceiling_and_the_rank_are_independent_axes() {
+        // ★ The correction that shaped this design: they are NOT alternatives. Competing traffic
+        // exists at every level, so a schema-authorised deployment still needs the rank to order
+        // within a class, and an unauthorised one still gets useful ordering capped at Normal.
+        let quiet = {
+            let mut e = crate::sense::Ewma::new(1.0);
+            e.update(0.0);
+            crate::sense::Demand { fanout: 1, reinterest_rate: e, rank_deficit: crate::sense::Ewma::new(0.3), ts_ms: 0 }
+        };
+        let busy = {
+            let mut e = crate::sense::Ewma::new(1.0);
+            e.update(1.0);
+            crate::sense::Demand { fanout: 9, reinterest_rate: e, rank_deficit: crate::sense::Ewma::new(0.3), ts_ms: 0 }
+        };
+        // Two names at the SAME granted class are still ordered, by measurement.
+        let a = ctx_at(0xA, Priority::Urgent).with_demand(DemandRank::from_demand(&quiet));
+        let b = ctx_at(0xB, Priority::Urgent).with_demand(DemandRank::from_demand(&busy));
+        assert_eq!(a.priority(), b.priority());
+        assert!(b.demand_rank().get() > a.demand_rank().get());
+        // And high demand never promotes a class: measurement orders, authority gates.
+        let c = NameContext::new(0xC).with_demand(DemandRank::from_demand(&busy));
+        assert_eq!(c.priority(), Priority::Normal, "demand must not grant class");
+        assert!(c.demand_rank().get() > a.demand_rank().get());
+    }
+
+    fn bulk(hash: u64) -> NameContext {
+        ctx_at(hash, Priority::Bulk)
     }
 
     /// **The opt-in is total.** With no dial attached the plan names no modulation, so every
@@ -1561,20 +1908,14 @@ mod tests {
     fn heterogeneous_bulk_prefers_wifi_urgent_prefers_lora() {
         let m = hetero();
         let bulk = RadioPolicy::default().decide(
-            &NameContext {
-                priority: Priority::Bulk,
-                ..NameContext::new(0xAA)
-            },
+            &ctx_at(0xAA, Priority::Bulk),
             &m,
             1_000,
         );
         assert_eq!(bulk.allocations[0].radio, W, "bulk → high-rate Wi-Fi");
 
         let urgent = RadioPolicy::default().decide(
-            &NameContext {
-                priority: Priority::Urgent,
-                ..NameContext::new(0xAA)
-            },
+            &ctx_at(0xAA, Priority::Urgent),
             &m,
             1_000,
         );
@@ -1722,6 +2063,19 @@ mod tests {
 
 #[cfg(test)]
 mod adv_phy_tests {
+    use super::{ClassAuthority, ClassCeiling, NameContext, Priority};
+
+    /// The same gate the production caller uses — see `super::tests::FixedAuthority`. These tests
+    /// deliberately cannot assert a class directly, because `decide_adv_phy` no longer accepts one.
+    struct Granted(Priority);
+    impl ClassAuthority for Granted {
+        fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+            self.0
+        }
+    }
+    fn ctx_at(h: u64, p: Priority) -> NameContext {
+        NameContext::new(h).with_ceiling(ClassCeiling::authorised(&Granted(p), h))
+    }
     use ndn_radio_hal::RxGain;
 
     /// ★ The power ratchet: a back-off that could never be undone.
@@ -1845,6 +2199,40 @@ mod adv_phy_tests {
     /// it must also make this node less deferential by the same amount — otherwise it has only
     /// made itself smaller: still yielding the medium to every distant transmitter it hears, with
     /// none of the concurrency the trim was for.
+    /// ★ **The bound and the decision must not drift.** `DEFER_THRESHOLD_DBM_BAND` is what the
+    /// actuator will apply; this asserts it is exactly what `decide_edcca_threshold_dbm` can
+    /// produce, so tightening one without the other cannot silently start clamping real decisions
+    /// (or stop bounding a forged one).
+    ///
+    /// Falsified by changing either endpoint of the band, or `MAX_BACKOFF_DB`, on its own.
+    #[test]
+    fn the_actuator_band_is_exactly_what_the_policy_can_decide() {
+        let (lo, hi) = crate::plan::DEFER_THRESHOLD_DBM_BAND;
+        assert_eq!(lo, EDCCA_L2H_BASE_DBM, "the band's floor is the vendor default");
+        assert_eq!(
+            i16::from(hi) - i16::from(lo),
+            MAX_BACKOFF_DB as i16,
+            "the band's span is the most power the policy will ever give back"
+        );
+        // And the emitted values really do land inside it, at both extremes of the input range.
+        let policy = RadioPolicy::default();
+        for mcs in 0..=9u8 {
+            for rssi in -100..=-20i8 {
+                if let Some((l2h, h2l)) = policy.decide_edcca_threshold_dbm(mcs, Some(rssi)) {
+                    assert!(
+                        (lo..=hi).contains(&l2h),
+                        "mcs {mcs} rssi {rssi} emitted l2h {l2h} outside {lo}..={hi}"
+                    );
+                    assert_eq!(
+                        crate::plan::clamp_defer_threshold(l2h, h2l),
+                        ((l2h, h2l), false),
+                        "a real decision must pass the actuator bound untouched"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_two_halves_of_spatial_reuse_move_together() {
         let policy = RadioPolicy::default();
@@ -1928,7 +2316,7 @@ mod adv_phy_tests {
     fn one_legacy_only_neighbour_pins_the_group_to_1m() {
         let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_CODED, ADV_PHY_1M]);
         for p in [Priority::Bulk, Priority::Normal, Priority::Urgent] {
-            assert_eq!(decide_adv_phy(&m, p, ADV_PHY_CODED, 100), ADV_PHY_1M);
+            assert_eq!(decide_adv_phy(&m, &ctx_at(0, p), ADV_PHY_CODED, 100), ADV_PHY_1M);
         }
     }
 
@@ -1937,15 +2325,15 @@ mod adv_phy_tests {
     fn intent_picks_within_the_group_floor() {
         let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_CODED]);
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_CODED, 100),
             ADV_PHY_CODED
         );
         assert_eq!(
-            decide_adv_phy(&m, Priority::Bulk, ADV_PHY_CODED, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Bulk), ADV_PHY_CODED, 100),
             ADV_PHY_2M
         );
         assert_eq!(
-            decide_adv_phy(&m, Priority::Normal, ADV_PHY_CODED, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Normal), ADV_PHY_CODED, 100),
             ADV_PHY_1M
         );
     }
@@ -1955,11 +2343,11 @@ mod adv_phy_tests {
     fn own_capability_bounds_the_choice() {
         let m = medium_with(&[ADV_PHY_CODED]);
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_1M, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_1M, 100),
             ADV_PHY_1M
         );
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_2M, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_2M, 100),
             ADV_PHY_1M
         );
     }
@@ -1970,7 +2358,7 @@ mod adv_phy_tests {
     fn unknown_neighbourhood_falls_back_to_the_universal_phy() {
         let m = MediumState::default();
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_CODED, 100),
             ADV_PHY_1M
         );
     }
@@ -1982,11 +2370,11 @@ mod adv_phy_tests {
         let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_1M]);
         let long_after = 100 + 10_000_000;
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, 100),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_CODED, 100),
             ADV_PHY_1M
         );
         assert_eq!(
-            decide_adv_phy(&m, Priority::Urgent, ADV_PHY_CODED, long_after),
+            decide_adv_phy(&m, &ctx_at(0, Priority::Urgent), ADV_PHY_CODED, long_after),
             ADV_PHY_1M,
             "with every neighbour stale the fold is None, which must still mean the universal PHY"
         );

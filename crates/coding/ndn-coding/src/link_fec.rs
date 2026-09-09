@@ -249,11 +249,49 @@ impl LinkFecRx {
         }
         Ok(out)
     }
+
+    /// Current **rank deficit** across in-flight generations — the item-4 diversity signal
+    /// (`observe_rank_deficit`). For each generation not yet decodable, `K - rank` is the number of
+    /// independent packets still needed; this returns the MAX over incomplete generations (the worst
+    /// pending generation). `0.0` = every in-flight generation is already decodable/complete. This is
+    /// the "rank held vs generation size, per object" accessor the sense loop was missing.
+    pub fn rank_deficit(&self) -> f32 {
+        let mut worst = 0u16;
+        for st in self.gens.values() {
+            if !st.done {
+                let k = st.delivered.len() as u16;
+                let held = st.dec.rank();
+                let d = k.saturating_sub(held);
+                if d > worst {
+                    worst = d;
+                }
+            }
+        }
+        worst as f32
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_deficit_tracks_held_vs_generation_size() {
+        // K=3, R=2. Encode one generation, then feed the decoder only the first 2 of 3 sources:
+        // rank=2, K=3 -> deficit 1 until a 3rd independent packet (source or parity) completes it.
+        let mut tx = LinkFecTx::new(2);
+        let coded = tx
+            .encode((0..3u8).map(|i| Bytes::copy_from_slice(&[i; 8])).collect())
+            .unwrap();
+        assert!(coded.len() >= 5, "K=3 + R=2 systematic generation");
+        let mut rx = LinkFecRx::new();
+        assert_eq!(rx.rank_deficit(), 0.0, "no generation in flight");
+        rx.absorb(coded[0].clone()).unwrap();
+        rx.absorb(coded[1].clone()).unwrap();
+        assert_eq!(rx.rank_deficit(), 1.0, "2 of 3 held -> deficit 1");
+        rx.absorb(coded[3].clone()).unwrap(); // a parity frame completes the generation
+        assert_eq!(rx.rank_deficit(), 0.0, "generation decodable -> deficit 0");
+    }
 
     fn drain(rx: &mut LinkFecRx, frames: impl IntoIterator<Item = Bytes>) -> Vec<Bytes> {
         let mut got = Vec::new();
