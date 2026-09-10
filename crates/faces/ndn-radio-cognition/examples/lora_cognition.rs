@@ -7,7 +7,8 @@
 //!   - SENSE — each received frame's real per-frame RSSI feeds [`MediumState::observe_rx`]; each
 //!     Interest/Data event feeds a [`DemandTracker`] that shadows the PIT's in-record lifecycle.
 //!   - DECIDE — [`RadioPolicy::decide`] runs over that medium state and a [`NameContext`] whose
-//!     priority comes from **the name itself** (an `alarm` is urgent because of what it is), and
+//!     priority is GRANTED by a `ClassAuthority` (here a name-trusting one — see `NameTrusting`,
+//!     which documents why that is abusable outside a single-owner bench), and
 //!     whose fan-out / re-Interest rate come from the tracker.
 //!   - ACT — the plan's LoRa knobs (spreading factor, coding rate, FEC redundancy) are applied to
 //!     the dongle through the `RadioKnobs` seam, then the frame goes out.
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ndn_frame_io::{FrameIo, InjectFrame, TxIntent};
-use ndn_radio_cognition::{
+use ndn_radio_cognition::{ClassAuthority, ClassCeiling, 
     DemandTracker, MediumState, MediumView, NameContext, Priority, RadioId, RadioPolicy,
     STATIC_REQ_RSSI_SF, lora_airtime_ms, pick_sf_hysteretic, prefix_hash,
 };
@@ -103,6 +104,25 @@ const CLASSES: [(&str, Priority); 3] = [
     ("telemetry", Priority::Normal),
     ("bulk", Priority::Bulk),
 ];
+
+/// ⚠ **A NAME-TRUSTING authority — and the reason this type exists.**
+///
+/// This believes the class component because the bench is single-owner. In an open deployment it is
+/// exactly the abuse vector: the class is read off an unauthenticated name, so any node can call its
+/// traffic `/.../alarm/...` and take the urgent path, and marking costs nothing. That is the
+/// DiffServ failure mode, reproduced.
+///
+/// It is written as a [`ClassAuthority`] rather than as an `if` inside the parser so the assumption
+/// is a **named, replaceable object**. A deployment with a trust anchor swaps this for a schema/LVS
+/// evaluation — "may the key that signed this name claim this class?" — and nothing else changes.
+/// Grep for implementations of this trait to enumerate everything a deployment is choosing to trust.
+struct NameTrusting(Priority);
+
+impl ClassAuthority for NameTrusting {
+    fn ceiling_for(&self, _prefix_hash: u64) -> Priority {
+        self.0
+    }
+}
 
 fn class_priority(class: &str) -> Option<Priority> {
     CLASSES.iter().find(|(c, _)| *c == class).map(|(_, p)| *p)
@@ -268,8 +288,16 @@ impl Node {
             ready
         };
         for r in due {
-            let mut ctx = NameContext::new(r.prefix_hash); // we produce this name → origin
-            ctx.priority = r.priority;
+            // We produce this name → origin. ⚠ The class is granted by an authority which, HERE,
+            // believes the class token in the name a PEER sent us — `r.priority` came off the air
+            // (see `NameTrusting`). So on this bench a peer asking for `.../alarm/N` does make our
+            // reply Urgent. That is the abuse this example exists to make visible; a deployment with
+            // a trust anchor swaps `NameTrusting` for a schema evaluation and the path stops being
+            // a pass-through.
+            let ctx = NameContext::new(r.prefix_hash).with_ceiling(ClassCeiling::authorised(
+                &NameTrusting(r.priority),
+                r.prefix_hash,
+            ));
             self.transmit(&ctx, &r.wire, &format!("D {}", r.name)).await;
             self.tracker.on_data(r.prefix_hash, self.now());
         }
@@ -363,8 +391,10 @@ impl Node {
             if let Some(dbm) = power
                 && dbm != self.last_power_dbm
             {
-                match self.dev.set_tx_power(dbm.max(0) as u32) {
-                    Ok(()) => {
+                // ★ `Dbm`, not `Index`: this bearer's power axis really is absolute dBm, and the
+                // request now says so rather than smuggling a dBm value through an index.
+                match self.dev.set_tx_power(ndn_radio_hal::PowerRequest::Dbm(dbm)) {
+                    Ok(_applied) => {
                         self.last_power_dbm = dbm;
                         applied.push("pwr");
                     }
@@ -461,7 +491,7 @@ impl Node {
         };
         println!(
             "[{}] {secs:>3}s| {:<7?}| {rssi:>7} | fan={fanout} reI={reint:.2} PER={per:.2} | {sf_s} {cr_s} {bw_s} {pwr_s} FEC{fec} duty={duty:.2}% | {act}",
-            self.name, ctx.priority,
+            self.name, ctx.priority(),
         );
     }
 
@@ -633,8 +663,8 @@ impl Node {
             self.fold_demand();
             // We consume this name, we do not produce it → relayed: the innovation gate decides
             // whether our transmission adds rank for a downstream that still needs it.
-            let mut ctx = NameContext::relayed(ph);
-            ctx.priority = priority;
+            let ctx = NameContext::relayed(ph)
+                .with_ceiling(ClassCeiling::authorised(&NameTrusting(priority), ph));
             let tag = if reexpressed {
                 format!("I {name} (re)")
             } else {
@@ -931,7 +961,7 @@ mod tests {
 
         let policy = RadioPolicy::default();
         let mut urgent = NameContext::new(ph);
-        urgent.priority = Priority::Urgent;
+        let urgent = urgent.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Urgent), 0));
         let plan = policy.decide(&urgent, &m, 0);
         let alloc = plan.allocation_for(R).expect("origin serves its own name");
         // Strong link → fastest SF; urgent → the more robust coding rate.
@@ -939,7 +969,7 @@ mod tests {
         assert_eq!(alloc.params.coding_rate(), Some(2), "urgent → 4/6");
 
         let mut bulk = NameContext::new(ph);
-        bulk.priority = Priority::Bulk;
+        let bulk = bulk.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Bulk), 0));
         let bulk_cr = policy
             .decide(&bulk, &m, 0)
             .allocation_for(R)

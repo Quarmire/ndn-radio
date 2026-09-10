@@ -40,7 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One call: find the dongle, run the full monitor-mode bring-up (power,
     // firmware, MAC, BB/RF + calibration, and the BB transmit datapath), and
     // hand back a TX/RX-ready backend.
-    let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor(channel)?);
+    let backend = {
+        // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
+        // named at the call site — and keep the report instead of discarding it.
+        let d = Arc::new(LibUsbRtl88xxBackend::open()?);
+        d.bring_up_planned(channel, ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+        d
+    };
     // Self-maintaining link: the DM watchdog (thermal TX-power tracking + RX
     // DIG) ticks every 2 s on its own thread for the backend's lifetime.
     let _watchdog = backend.spawn_watchdog();
@@ -93,8 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(p) = std::env::var("RADIO_TXPWR")
         && let Ok(idx) = u32::from_str_radix(p.trim_start_matches("0x"), 16)
     {
-        backend.set_tx_power(idx)?;
-        println!("TX power index set to {idx:#x}");
+        let applied = backend.set_tx_power(ndn_radio_hal::PowerRequest::index(idx.min(255) as u8))?;
+        println!("TX power index {idx:#x}: {}", applied.render());
     }
     // RADIO_PERRATE=1: write the per-rate TXAGC table (0x3a00) the working
     // driver sets (OFDM/HT rates at index 0x7c) — our bb_tx_datapath_init never

@@ -54,26 +54,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(AfPacketBackend::new(iface, FrameFormat::Raw80211)?)
     } else {
         use ndn_phy_wifi::Rtl8812auBackend;
-        let b = Rtl8812auBackend::open()?;
+        let b = std::sync::Arc::new(Rtl8812auBackend::open()?);
         println!(
             "[{node}] radio: RTL8812AU pid={:#06x} — bringing up",
             b.pid()
         );
-        b.power_on()?;
-        b.mac_enable_dma()?;
-        b.init_llt()?;
-        let (ver, sub) = b.download_firmware()?;
-        b.mac_config()?;
-        b.mac_init_queues()?;
-        b.bb_config()?;
-        b.rf_config()?;
-        b.set_channel(6)?;
-        b.iq_calibrate()?;
-        b.lc_calibrate()?;
-        b.set_tx_power(0x3f)?;
-        b.start_rx_dma()?; // last: calibration re-pauses RX DMA
-        let b = Arc::new(b);
-        // Keep a bulk-IN read always in flight; without it we only read during a
+        // ★ **M8: the hand-rolled ladder is deleted.** It was a copy of the 8812au bring-up with no
+        // stated reason to differ, and it is now `PLAN_8812AU_MONITOR` — the same fourteen rungs in
+        // the same order, transcribed verbatim in M7, that the shipped node runs. The two cannot
+        // diverge again without `plan_digest` changing, which is the whole of this milestone: sixteen
+        // private copies of one sequence were how a ~20 dB power regime became invisible.
+        //
+        // ⚠ **The RAW regime is PRESERVED, deliberately.** This example has always run
+        // `set_tx_power` with no `load_tx_power_info` before it, i.e. on the raw chip TXAGC axis
+        // ~18-33 dB above the fused regulatory base the node transmits at (MEASURED 2026-09-03: raw 63
+        // = 2301 frames at a witness; the calibrated base = 0 on the same link). Changing it to
+        // `Ceiling` here would silently invalidate every number this file has ever produced by moving
+        // the transmitter instead of the measurement. `PowerRequest::Raw` needs
+        // `NDN_RF_UNRESTRICTED="<operator>:<reason>"` and prints those words in the run's own output.
+        let (report, _guards) = b.bring_up_planned(
+            6,
+            ndn_radio_drivers::Role::TransmitAndReceive,
+            ndn_radio_drivers::PowerRequest::raw_from_env(0x3f)?,
+            None,
+            ndn_radio_drivers::ProofRequirement::BestAvailable,
+        )?;
+        println!("{}", report.render());
+                // Keep a bulk-IN read always in flight; without it we only read during a
         // recv_frame call and lose whatever arrives in between (see
         // Rtl8812auBackend::spawn_rx_pump). Depth 1 — one reader, so ordered.
         b.spawn_rx_pump(1);

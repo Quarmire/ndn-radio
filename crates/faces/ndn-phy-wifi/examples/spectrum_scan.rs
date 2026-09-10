@@ -29,7 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Bring up on the first channel; we re-tune per channel below.
-    let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor(channels[0])?);
+    let backend = {
+        // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
+        // named at the call site — and keep the report instead of discarding it.
+        let d = Arc::new(LibUsbRtl88xxBackend::open()?);
+        d.bring_up_planned(channels[0], ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+        d
+    };
     let window_us = window_ms * 1000;
     // RADIO_FAST_HOP=1 uses set_channel_fast (RF-only retune) for same-BW hops.
     let fast = std::env::var("RADIO_FAST_HOP").is_ok();

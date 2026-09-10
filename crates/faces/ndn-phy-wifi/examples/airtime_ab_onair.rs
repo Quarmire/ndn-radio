@@ -66,9 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let want = |a: &str| only.as_deref().is_none_or(|o| o == a);
 
     let radio = RadioId(0);
-    let backend = Arc::new(LibUsbRtl88xxBackend::open_monitor(ch)?);
+    let backend = {
+        // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
+        // named at the call site — and keep the report instead of discarding it.
+        let d = Arc::new(LibUsbRtl88xxBackend::open()?);
+        d.bring_up_planned(ch, ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+        d
+    };
     backend.set_channel(ch, ChannelBw::Bw80)?; // 80 MHz VHT, matching the template
-    backend.set_tx_power(txpwr)?;
+    backend.set_tx_power(ndn_radio_hal::PowerRequest::index(txpwr as u8))?;
 
     // Build the control plane and bind its actuator to this backend.
     let mut control = match mode.as_str() {
@@ -93,6 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nss: p.nss().unwrap_or(1),
         stbc: p.stbc(),
         ldpc: p.ldpc(),
+        // 802.11ax fields, added after this instrument was written. These paths build an HT/VHT
+        // descriptor, so they are false — not a default, a statement.
+        he: false,
+        dcm: false,
+        er_su: false,
     };
     let template = |mcs: u8| {
         TxParams::wifi(WifiRate {

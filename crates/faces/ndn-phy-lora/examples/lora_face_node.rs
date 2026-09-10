@@ -3,7 +3,7 @@
 //!
 //! Every other LoRa example in this workspace drives `LoraSerialBackend` directly and hand-builds
 //! ASCII payloads (`"I|A|/ndn/…"`). That exercises the *dongle*, never the *face*: no NDNLPv2
-//! fragmentation, no PIT/FIB/CS, no link-FEC generation, no body-prefix GCS gate, and no
+//! fragmentation, no PIT/FIB/CS, no link-FEC generation, and no
 //! capability-derived MTU. This example runs the path the forwarder actually uses.
 //!
 //! Two modes, one binary:
@@ -28,7 +28,6 @@
 //! | `LORA_CHANNEL` | tune the radio through `RadioKnobs::set_channel` before the engine starts |
 //! | `LORA_SF` / `LORA_CR` / `LORA_BW` / `LORA_DBM` | seed the plan cell; the face actuates them on send |
 //! | `LORA_FEC` | link-FEC parity per generation (`R`); `LORA_FEC_K`, `LORA_FEC_WINDOW_MS` size it |
-//! | `LORA_GCS` | body-prefix GCS filter on, registered for the served prefix |
 //! | `LORA_SIM_MAX_PAYLOAD` | self-test only: the payload cap the sim radio DECLARES (drives the MTU) |
 //!
 //! The plan cell here is a static seed rather than a live policy — the point is to prove the
@@ -163,7 +162,7 @@ fn seed_plan() -> Option<PlanCell> {
 ///
 /// This is the shape the fix is about: `OpenRadio` in, every optional handle carried onto the
 /// face, and the face's MTU read back from what the radio declared rather than assumed.
-fn mount(id: FaceId, radio: OpenRadio, prefix: &Name) -> LoraPhy {
+fn mount(id: FaceId, radio: OpenRadio) -> LoraPhy {
     // Tune first: the channel is bearer state and must be right before the reader starts.
     if let Some(ch) = env_num::<u8>("LORA_CHANNEL")
         && let Some(k) = radio.knobs.as_ref()
@@ -184,11 +183,6 @@ fn mount(id: FaceId, radio: OpenRadio, prefix: &Name) -> LoraPhy {
             "  link-FEC on (R={r} from the plan, K={:?})",
             k.unwrap_or(2)
         );
-    }
-    if env_or("LORA_GCS", "0") != "0" {
-        // The #44 keyspace key is shared by every node on the medium; a demo constant here.
-        phy = phy.with_gcs(*b"ndn/lora-face-k1", vec![prefix.to_string().into_bytes()]);
-        println!("  body-prefix GCS on for {prefix}");
     }
 
     let cap = phy.capability();
@@ -288,15 +282,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The wiring site. `LoraSerialBackend` implements all four HAL traits, so the whole
             // radio travels to the face — NOT `let io: Arc<dyn FrameIo> = be;`, which is where
             // the knobs, clock and profile used to be thrown away.
-            let be = Arc::new(ndn_radio_drivers::LoraSerialBackend::open(&port)?);
-            let radio = OpenRadio {
-                io: be.clone() as Arc<dyn FrameIo>,
-                knobs: Some(be.clone() as Arc<dyn RadioKnobs>),
-                time: Some(be.clone() as Arc<dyn RadioTime>),
-                profile: Some(be as Arc<dyn RadioProfile>),
-            };
+            // ★ M6: the opener no longer lives in this example. `LoraSerialBackend::open_radio`
+            // is the LoRa arm of the bring-up contract — it runs `PLAN_LORA_NODE` and returns a
+            // REAL report (which profile the handle is running on, the clock reference, the
+            // decoded modulation and the absolute-dBm power) instead of the
+            // `BringUpReport::synthetic` placeholder this block used to fill in. The four handles
+            // are still one instance; that part was always right.
+            let radio = ndn_radio_drivers::LoraSerialBackend::open_radio(
+                &port,
+                ndn_radio_drivers::LoraParams::default(),
+                env_num("LORA_CHANNEL").unwrap_or(0),
+            )?;
             let id = FaceId(2);
-            let phy = mount(id, radio, &prefix);
+            let phy = mount(id, radio);
             tokio::time::sleep(Duration::from_millis(1500)).await; // reader spin-up / radio settle
             if role == "producer" {
                 run_producer(phy, prefix, env_num("LORA_SECS").unwrap_or(120), body).await?;
@@ -330,9 +328,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 knobs: Some(sim.clone() as Arc<dyn RadioKnobs>),
                 time: Some(sim.clone() as Arc<dyn RadioTime>),
                 profile: Some(sim.clone() as Arc<dyn RadioProfile>),
+                report: ndn_radio_hal::BringUpReport::synthetic("SimRadio"),
             };
-            let phy_p = mount(FaceId(101), open(1, &sim_p), &prefix);
-            let phy_c = mount(FaceId(201), open(2, &sim_c), &prefix);
+            let phy_p = mount(FaceId(101), open(1, &sim_p));
+            let phy_c = mount(FaceId(201), open(2, &sim_c));
 
             let p_prefix = prefix.clone();
             let p_body = body.clone();

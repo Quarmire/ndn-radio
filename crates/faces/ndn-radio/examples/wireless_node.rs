@@ -29,17 +29,22 @@
 //! Rust LoRa firmware (`waveshare-lora-rs` / `heltec-lora-rs`). Peers must share a channel/air params.
 //!
 //! **The LoRa phy's own features**, all defaulting OFF (see [`build_lora_face`]). They were reachable
-//! only by editing this file until now, which is why the link-FEC and body-prefix-GCS paths had never
-//! run on hardware:
+//! only by editing this file until now, which is why the link-FEC path had never run on hardware:
 //!
 //! ```sh
 //! # Tune, then dial the reach/rate knobs through RadioKnobs (the plan the face actuates on send):
 //! WL_LORA=/dev/ttyACM0 WL_LORA_CHANNEL=65 WL_LORA_SF=9 WL_LORA_CR=2 WL_LORA_BW=125 WL_LORA_DBM=17 …
 //! # Plan-driven link FEC: 2 parity frames per K=2 generation, 3 s tail-flush.
 //! WL_LORA=/dev/ttyACM0 WL_LORA_FEC=2 WL_LORA_FEC_K=2 WL_LORA_FEC_WINDOW_MS=3000 …
-//! # In-frame body-prefix GCS name filter, registered for the served prefix:
-//! WL_LORA=/dev/ttyACM0 WL_LORA_GCS=1 …
+//! # The MODULATION as a knob (7E-A5 v3 `CMD_SET_PHY`), and a name-keyed hop plan over the band:
+//! WL_LORA=/dev/ttyACM0 WL_LORA_PHY=flrc WL_LORA_HOP=12 …
 //! ```
+//!
+//! **The two v3 axes.** `WL_LORA_PHY` names a modulation (`lora`, `flrc`, `fsk`, `ble`, …) and is
+//! REFUSED unless the node's own `EVT_CAP` advertises it — the axis is the radio's, not this
+//! file's. `WL_LORA_HOP` arms a hop plan derived from the served prefix under the shared #44 key,
+//! over the band plan in `WL_LORA_HOP_BAND` (`min:max:step` Hz, default the US 902-928 MHz grid at
+//! 1 MHz). Both ends must set the same key and band plan; nothing is negotiated on air.
 use std::env;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -48,13 +53,15 @@ use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::builder::EngineConfig;
 use ndn_packet::Name;
 use ndn_packet::encode::DataBuilder;
-use ndn_phy_lora::{LoraPhy, LoraRate, RateParams, TxParams};
+use ndn_phy_lora::{LoraPhy, LoraRate, RateParams, TxParams, carrier_grid, parse_phy_mode};
 use ndn_phy_wifi::WifiPhy;
 use ndn_radio::{
     BroadcastAllPhys, NameReachClassifier, PhyKind, Radio, ReachClass, TransportPhy, WirelessPhy,
 };
-use ndn_radio_drivers::{FrameIo, LoraSerialBackend, MAX_LORA_PAYLOAD, SerialRadioBackend};
-use ndn_radio_hal::{Bandwidth, OpenRadio, RadioKnobs, RadioProfile, RadioTime};
+use ndn_radio_drivers::{
+    FrameIo, LoraParams, LoraSerialBackend, MAX_LORA_PAYLOAD, SerialRadioBackend,
+};
+use ndn_radio_hal::OpenRadio;
 use ndn_strategy_reach as _; // force-link the soft-prefix-reach strategies into the registry (linkme)
 use ndn_transport::{FaceId, Transport};
 use tokio_util::sync::CancellationToken;
@@ -71,9 +78,9 @@ fn env_num<T: std::str::FromStr>(k: &str) -> Option<T> {
 
 /// Build the LoRa face over `radio`, turning on the features it already had and nobody could reach.
 ///
-/// `LoraPhy` has carried plan-driven link FEC, a body-prefix GCS name filter and a `TxParams` cell
-/// since it was written, and this wiring site enabled **none** of them — so `Egress` stayed
-/// `Direct`, `gcs` stayed `None`, and those paths had never run on hardware. Every switch here
+/// `LoraPhy` has carried plan-driven link FEC and a `TxParams` cell since it was written, and this
+/// wiring site enabled **none** of them — so `Egress` stayed `Direct` and those paths had never run
+/// on hardware. Every switch here
 /// defaults OFF, so the un-configured node behaves exactly as before.
 ///
 /// * `WL_LORA_SF` / `WL_LORA_CR` / `WL_LORA_BW` / `WL_LORA_DBM` — seed the plan cell the face
@@ -81,7 +88,6 @@ fn env_num<T: std::str::FromStr>(k: &str) -> Option<T> {
 ///   `ndn-radio-cognition`'s `lora_cognition` writes the same cell from a live sense→decide loop).
 /// * `WL_LORA_FEC` — link-FEC parity per generation (R), with `WL_LORA_FEC_K` /
 ///   `WL_LORA_FEC_WINDOW_MS` sizing the generation.
-/// * `WL_LORA_GCS` — the in-frame body-prefix GCS filter, registered for the served prefix.
 fn build_lora_face(id: FaceId, radio: OpenRadio, prefix: &Name) -> LoraPhy {
     let mut phy = LoraPhy::from_open(id, radio);
 
@@ -92,14 +98,23 @@ fn build_lora_face(id: FaceId, radio: OpenRadio, prefix: &Name) -> LoraPhy {
     };
     let fec: Option<u16> = env_num("WL_LORA_FEC");
     let dbm: Option<i8> = env_num("WL_LORA_DBM");
-    if rate != LoraRate::default() || fec.is_some() || dbm.is_some() {
+    // The MODULATION axis. A name, not a number, and refused here if it is not a mode this build
+    // knows — the face refuses it again if the RADIO did not advertise it, which is the check that
+    // actually matters (see `LoraPhy::phy_switch_allowed`).
+    let phy_mode = env::var("WL_LORA_PHY").ok().map(|s| {
+        parse_phy_mode(&s).unwrap_or_else(|| {
+            panic!("WL_LORA_PHY={s:?} is not a modulation name (lora, flrc, fsk, ble, ook, …)")
+        })
+    });
+    if rate != LoraRate::default() || fec.is_some() || dbm.is_some() || phy_mode.is_some() {
         phy = phy.with_planned_params(Arc::new(RwLock::new(Some(TxParams {
             link_fec_redundancy: fec,
             tx_power_dbm: dbm,
             rate: RateParams::Lora(rate),
+            phy: phy_mode,
             ..Default::default()
         }))));
-        println!("  LoRa plan: {rate:?} fec_r={fec:?} dbm={dbm:?}");
+        println!("  LoRa plan: {rate:?} fec_r={fec:?} dbm={dbm:?} phy={phy_mode:?}");
     }
     if let Some(r) = fec {
         let k: Option<usize> = env_num("WL_LORA_FEC_K");
@@ -107,21 +122,51 @@ fn build_lora_face(id: FaceId, radio: OpenRadio, prefix: &Name) -> LoraPhy {
         phy = phy.with_link_fec(k, window);
         println!("  LoRa link-FEC on (R={r}, K={})", k.unwrap_or(2));
     }
-    if env::var("WL_LORA_GCS").is_ok_and(|v| v != "0") {
-        // The shared #44 keyspace key — every node on the medium must use the same one.
-        let key = env::var("WL_LORA_GCS_KEY")
-            .ok()
-            .map_or(*b"ndn/wl-lora-gcs1", |k| {
-                let mut key = [0u8; 16];
-                for (dst, src) in key.iter_mut().zip(k.bytes()) {
-                    *dst = src;
-                }
-                key
-            });
-        phy = phy.with_gcs(key, vec![prefix.to_string().into_bytes()]);
-        println!("  LoRa body-prefix GCS on for {prefix}");
+
+    // ── The name-keyed hop plan (#40) ────────────────────────────────────────────────────────
+    // `WL_LORA_HOP` is the hop PERIOD in the radio's own unit (LoRa symbols on a LoRa-modulation
+    // node, microseconds elsewhere) — not a duration, because a symbol's wall-clock length moves
+    // with SF and bandwidth. The carriers come from `WL_LORA_HOP_BAND` (`min:max:step` Hz) and
+    // default to the US 902-928 MHz grid at 1 MHz, which is the span this bench runs in — and
+    // the one HaLow co-bands with, where a fixed mid-band carrier was MEASURED to collapse.
+    // Hopping is how a name coexists with that interferer instead of ceding the band to it.
+    if let Some(period) = env_num::<u16>("WL_LORA_HOP") {
+        let band = env_or("WL_LORA_HOP_BAND", "902000000:928000000:1000000");
+        let n: Vec<u32> = band.split(':').filter_map(|x| x.parse().ok()).collect();
+        let carriers = match n[..] {
+            [min, max, step] => carrier_grid(min, max, step),
+            _ => Vec::new(),
+        };
+        // ONE #44 keyspace per group drives the hop plan, so a key rotation moves the whole group's
+        // hop sequence together.
+        let key = hop_key_from_env();
+        match phy.install_name_hop_plan(&key, prefix.to_string().as_bytes(), &carriers, period) {
+            Ok(plan) => println!(
+                "  LoRa name-keyed hop plan on for {prefix}: {} carriers, period {period} \
+                 (first {:?} Hz)",
+                plan.len(),
+                &plan.freqs_hz()[..plan.len().min(4)]
+            ),
+            // Loudly, and without stopping the node: a radio with no sequencer is a real
+            // configuration, and the honest response is to say the plan did not land rather than
+            // to pretend it did or to refuse to start.
+            Err(e) => eprintln!("  ! WL_LORA_HOP: no hop plan installed ({e})"),
+        }
     }
     phy
+}
+
+/// The shared #44 group key — one key per group drives the name-keyed hop plan.
+fn hop_key_from_env() -> [u8; 16] {
+    env::var("WL_LORA_KEY")
+        .ok()
+        .map_or(*b"ndn/wl-lora-key1", |k| {
+            let mut key = [0u8; 16];
+            for (dst, src) in key.iter_mut().zip(k.bytes()) {
+                *dst = src;
+            }
+            key
+        })
 }
 
 /// Assemble a [`Radio`] from whichever boards are wired up (env `WL_WIFI` / `WL_LORA`).
@@ -147,13 +192,23 @@ fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
     }
 
     // Wi-Fi phy over a libusb Realtek USB dongle (e.g. the 8812au) — `WL_WIFI_USB=8812` (hex PID).
-    // open_named_radio brings up monitor + inject and hands back an `Arc<dyn FrameIo>`, same contract as
-    // the serial board, so the USB radio is just another PHY. Lets a node produce/relay over a real USB
-    // Wi-Fi radio while the CYD consumes over its serial 802.11 PHY — a cross-radio roundtrip on one host.
+    // ★ M8: `open_radio(pid, &sel, &req)` — the one door. It brings the part up through that
+    // part's `Plan` and hands back the full `OpenRadio`, same contract as the serial board, so the
+    // USB radio is just another PHY. Lets a node produce/relay over a real USB Wi-Fi radio while
+    // the CYD consumes over its serial 802.11 PHY — a cross-radio roundtrip on one host.
     if let Ok(pid_s) = env::var("WL_WIFI_USB") {
         let pid = u16::from_str_radix(pid_s.trim_start_matches("0x"), 16).unwrap_or(0x8812);
         let ch: u8 = env_or("WL_CHANNEL", "6").parse().unwrap_or(6);
-        let radio = ndn_radio_drivers::open_named_radio(pid, ch)?;
+        let radio = ndn_radio_drivers::open_radio(
+            pid,
+            &ndn_radio_drivers::DeviceSelect::from_env(),
+            &ndn_radio_drivers::BringUpRequest::from_env(ch),
+        )?;
+        // ★ **The node binary now says which transmitter it is.** Until 2026-09-03 this line handed
+        // back a radio on the FUSED regulatory base (~TXAGC 27 on an 8812au) while every bench
+        // example ran on the raw axis at 63 — up to ~20 dB apart — and nothing in the code, the
+        // logs or the capability declaration distinguished them. The report is the distinction.
+        println!("{}", radio.report().render());
         let io = radio.io();
         let face = WifiPhy::new(FaceId(3), io);
         phys.push(Arc::new(
@@ -172,20 +227,19 @@ fn build_wireless(prefix: &Name) -> Result<Radio, Box<dyn std::error::Error>> {
         // became unreachable and the declared capability (and therefore the MTU) was a guess.
         // `LoraSerialBackend` implements all four HAL traits; `OpenRadio` is the aggregate built
         // for exactly this, and `LoraPhy::from_open` carries every handle onto the face.
-        let be = Arc::new(LoraSerialBackend::open(&port)?);
-        let radio = OpenRadio {
-            io: be.clone() as Arc<dyn FrameIo>,
-            knobs: Some(be.clone() as Arc<dyn RadioKnobs>),
-            time: Some(be.clone() as Arc<dyn RadioTime>),
-            profile: Some(be as Arc<dyn RadioProfile>),
-        };
-        if let Ok(ch) = env::var("WL_LORA_CHANNEL").map(|s| s.parse::<u8>())
-            && let Ok(ch) = ch
-            && let Some(k) = radio.knobs.as_ref()
-            && let Err(e) = k.set_channel(ch, Bandwidth::default())
-        {
-            eprintln!("  ! WL_LORA set_channel({ch}) failed: {e} (continuing on firmware default)");
-        }
+        //
+        // ★ M8: the four-clone block and `BringUpReport::synthetic("LoRa serial node")` are gone.
+        // `LoraSerialBackend::open_radio` (M6) is the constructor, and it carries a real report —
+        // the learned-vs-host-fallback capability profile, the clock reference, the decoded rate
+        // state and a genuinely absolute-dBm `AppliedPower`. The channel travels INTO it, so the
+        // tune is a reported rung and a redundant retune (82,810 us on the Waveshare) is refused
+        // rather than paid for.
+        let ch = env::var("WL_LORA_CHANNEL")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(0);
+        let radio = LoraSerialBackend::open_radio(&port, LoraParams::default(), ch)?;
+        println!("{}", radio.report().render());
         let face = build_lora_face(FaceId(2), radio, prefix);
         // The MTU is the radio's DECLARED payload cap (capped by the face's own ceiling and less any
         // filter headroom), not `MAX_LORA_PAYLOAD` — so a node whose firmware really carries less is
