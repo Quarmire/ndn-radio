@@ -365,7 +365,9 @@ fn build_esp32c5(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, 
         .profile
         .as_ref()
         .map(|p| p.capability())
-        .unwrap_or_else(|| RadioCapability::wifi_monitor_dual_1ss(spec.channel.into_iter().collect()));
+        .unwrap_or_else(|| {
+            RadioCapability::wifi_monitor_dual_1ss(spec.channel.into_iter().collect())
+        });
     let mut bearer = RadioBearer::wifi(rid, open.io, cap).with_knobs(knobs);
     if let Some(t) = open.time {
         bearer = bearer.with_time(t);
@@ -391,12 +393,16 @@ fn build_afpacket(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
     let channels: Vec<u8> = spec.channel.into_iter().collect();
     let (fmt, cap) = if spec.driver == "halow" {
         (
-            FrameFormat::RawNdnS1g { ethertype: crate::NDN_ETHERTYPE },
+            FrameFormat::RawNdnS1g {
+                ethertype: crate::NDN_ETHERTYPE,
+            },
             RadioCapability::wifi_halow_s1g(channels),
         )
     } else {
         (
-            FrameFormat::RawNdn { ethertype: crate::NDN_ETHERTYPE },
+            FrameFormat::RawNdn {
+                ethertype: crate::NDN_ETHERTYPE,
+            },
             RadioCapability::wifi_monitor_5ghz(channels),
         )
     };

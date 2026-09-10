@@ -77,6 +77,12 @@
 //!   40/80 MHz and narrowband bandwidths, and the 2.4 GHz band. See
 //!   the crate docs (`docs/named-radio.md`).
 
+// Clippy release-triage: deferred minor style lints in the radio-face code.
+#![allow(
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::doc_lazy_continuation
+)]
 // OS-I/O leaf crate: it owns the raw syscall / mmap / FFI boundary, so
 // unsafe is inherent here. Denied workspace-wide, allowed in this crate.
 #![allow(unsafe_code)]
@@ -121,12 +127,10 @@ pub use ndn_frame_io::{
 // `BringUpRequest::from_env` is the only thing in the workspace that reads `NDN_*` for a bring-up.
 #[cfg(feature = "libusb-backend")]
 pub use ndn_radio_drivers::{
-    Ath9kHtcBackend, CHIP_ID_8822E, ChannelBw, ChipInfo, DeviceSelect, FwVersion, IqkResult,
-    LegacyRate, LibUsbRtl88xxBackend, MT7612U_PIDS, Mt7612uBackend, REALTEK_VID, REG_SYS_CFG,
-    AR9271_PID, BringUpRequest, PartOpts, RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PID,
-    RTL8812AU_PIDS,
-    RTL8821CU_PIDS, RfPath, Rtl8733buBackend,
-    Rtl8812auBackend, Rtl8821cuBackend, open_radio,
+    AR9271_PID, Ath9kHtcBackend, BringUpRequest, CHIP_ID_8822E, ChannelBw, ChipInfo, DeviceSelect,
+    FwVersion, IqkResult, LegacyRate, LibUsbRtl88xxBackend, MT7612U_PIDS, Mt7612uBackend, PartOpts,
+    REALTEK_VID, REG_SYS_CFG, RTL88XX_PIDS, RTL8733B_PIDS, RTL8812AU_PID, RTL8812AU_PIDS,
+    RTL8821CU_PIDS, RfPath, Rtl8733buBackend, Rtl8812auBackend, Rtl8821cuBackend, open_radio,
 };
 
 // The serial-bridged 802.11 backend (BW16 / ESP32-C5) — a raw 802.11 node driven
@@ -176,9 +180,7 @@ pub use radio::{
 
 // The data-centric time-slice (#61) + FHSS (#40) transmit scheduler, actuated at the TX path.
 mod sched;
-pub use sched::{
-    FaceScheduler, GroupTable, SCHED_PARAMS_VERSION, TIME_BEACON_MAGIC, TimeStatus,
-};
+pub use sched::{FaceScheduler, GroupTable, SCHED_PARAMS_VERSION, TIME_BEACON_MAGIC, TimeStatus};
 
 pub mod measure;
 
@@ -549,9 +551,14 @@ impl WifiPhy {
         if let Some(r) = crate::dbm_power::Mac80211Knobs::discover(iface).tx_power_range() {
             cap = cap.with_tx_power_dbm(r);
         }
-        let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: NDN_ETHERTYPE })
-            .map_err(FaceError::Io)?
-            .with_capability(cap.clone());
+        let backend = AfPacketBackend::new(
+            iface,
+            FrameFormat::RawNdnS1g {
+                ethertype: NDN_ETHERTYPE,
+            },
+        )
+        .map_err(FaceError::Io)?
+        .with_capability(cap.clone());
         Ok(Self::over(id, Arc::new(backend), cap))
     }
 
@@ -1092,5 +1099,4 @@ mod tests {
             "with batching on, nothing may bypass the batch seam and inject individually"
         );
     }
-
 }

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use ndn_phy_ble::{BlePhy, Esp32BleBackend};
 use ndn_packet::{Data, Interest};
+use ndn_phy_ble::{BlePhy, Esp32BleBackend};
 use ndn_transport::{FaceId, Transport};
 
 /// Minimal TLV encoder — `[type][len][value]`, with the 3-byte length form for ≥253.

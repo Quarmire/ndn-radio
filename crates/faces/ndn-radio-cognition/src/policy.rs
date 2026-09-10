@@ -22,11 +22,11 @@
 //! a fast decision never reads a slow signal as fresh-per-frame.
 
 use crate::calibrate::{RateThresholds, STATIC_REQ_RSSI, STATIC_REQ_RSSI_SF, SfThresholds};
+use crate::phy::{PhyDial, PhyHold};
 use crate::plan::{
     AllocRole, Contention, DataPlaneConfig, LoraRate, RadioAllocation, RadioPlan, RateParams,
     TxParams, WifiRate,
 };
-use crate::phy::{PhyDial, PhyHold};
 use crate::sense::{MediumView, PhyMode, RadioCapability, RadioId, RadioKind};
 use crate::strategy::RadioStrategy;
 use std::sync::Arc;
@@ -1599,11 +1599,7 @@ mod tests {
         };
         let parity = |pri: Priority, m: &MediumState| {
             RadioPolicy::default()
-                .decide(
-                    &ctx_at(0xAA, pri),
-                    m,
-                    1_000,
-                )
+                .decide(&ctx_at(0xAA, pri), m, 1_000)
                 .allocations[0]
                 .params
                 .link_fec_redundancy
@@ -1711,11 +1707,20 @@ mod tests {
         let urgent = ctx_at(0xAA, Priority::Urgent);
         // A cap removes privilege down to the NEUTRAL point, not to the bottom of the enum:
         // `Bulk` selects rendezvous parameters and must be earned. See `ClassCeiling::capped_to`.
-        assert_eq!(urgent.capped_by(Priority::Bulk).priority(), Priority::Normal);
-        assert_eq!(urgent.capped_by(Priority::Normal).priority(), Priority::Normal);
+        assert_eq!(
+            urgent.capped_by(Priority::Bulk).priority(),
+            Priority::Normal
+        );
+        assert_eq!(
+            urgent.capped_by(Priority::Normal).priority(),
+            Priority::Normal
+        );
         // Capping upward is a no-op — the cap is a minimum, never a promotion.
         let bulk_ctx = ctx_at(0xAA, Priority::Bulk);
-        assert_eq!(bulk_ctx.capped_by(Priority::Urgent).priority(), Priority::Bulk);
+        assert_eq!(
+            bulk_ctx.capped_by(Priority::Urgent).priority(),
+            Priority::Bulk
+        );
         // ...and it is idempotent, so repeated gossip cannot ratchet anything.
         assert_eq!(
             urgent
@@ -1743,7 +1748,10 @@ mod tests {
         let granted = ctx_at(0xAA, Priority::Bulk);
         assert_eq!(granted.priority(), Priority::Bulk);
         assert_eq!(granted.capped_by(Priority::Bulk).priority(), Priority::Bulk);
-        assert_eq!(granted.capped_by(Priority::Normal).priority(), Priority::Bulk);
+        assert_eq!(
+            granted.capped_by(Priority::Normal).priority(),
+            Priority::Bulk
+        );
     }
 
     #[test]
@@ -1782,12 +1790,22 @@ mod tests {
         let quiet = {
             let mut e = crate::sense::Ewma::new(1.0);
             e.update(0.0);
-            crate::sense::Demand { fanout: 1, reinterest_rate: e, rank_deficit: crate::sense::Ewma::new(0.3), ts_ms: 0 }
+            crate::sense::Demand {
+                fanout: 1,
+                reinterest_rate: e,
+                rank_deficit: crate::sense::Ewma::new(0.3),
+                ts_ms: 0,
+            }
         };
         let busy = {
             let mut e = crate::sense::Ewma::new(1.0);
             e.update(1.0);
-            crate::sense::Demand { fanout: 9, reinterest_rate: e, rank_deficit: crate::sense::Ewma::new(0.3), ts_ms: 0 }
+            crate::sense::Demand {
+                fanout: 9,
+                reinterest_rate: e,
+                rank_deficit: crate::sense::Ewma::new(0.3),
+                ts_ms: 0,
+            }
         };
         // Two names at the SAME granted class are still ordered, by measurement.
         let a = ctx_at(0xA, Priority::Urgent).with_demand(DemandRank::from_demand(&quiet));
@@ -1796,7 +1814,11 @@ mod tests {
         assert!(b.demand_rank().get() > a.demand_rank().get());
         // And high demand never promotes a class: measurement orders, authority gates.
         let c = NameContext::new(0xC).with_demand(DemandRank::from_demand(&busy));
-        assert_eq!(c.priority(), Priority::Normal, "demand must not grant class");
+        assert_eq!(
+            c.priority(),
+            Priority::Normal,
+            "demand must not grant class"
+        );
         assert!(c.demand_rank().get() > a.demand_rank().get());
     }
 
@@ -1866,14 +1888,20 @@ mod tests {
     #[test]
     fn a_silent_radio_and_a_wifi_radio_are_never_given_a_mode() {
         let mut quiet = MediumState::new();
-        quiet.register_radio(L, RadioCapability::lora_with(
-            RadioKind::Lora,
-            vec![crate::Band::Sub1GHz],
-            vec![65],
-            crate::RateCapability::Lora { min_sf: 7, max_sf: 12 },
-            200,
-            1.0,
-        ));
+        quiet.register_radio(
+            L,
+            RadioCapability::lora_with(
+                RadioKind::Lora,
+                vec![crate::Band::Sub1GHz],
+                vec![65],
+                crate::RateCapability::Lora {
+                    min_sf: 7,
+                    max_sf: 12,
+                },
+                200,
+                1.0,
+            ),
+        );
         quiet.observe_rx(L, 0x1234, Some(-40), 1_000);
         let p = RadioPolicy::default().with_phy_dial(Arc::new(PhyDial::new(None)));
         for i in 0..20u64 {
@@ -1907,18 +1935,10 @@ mod tests {
     #[test]
     fn heterogeneous_bulk_prefers_wifi_urgent_prefers_lora() {
         let m = hetero();
-        let bulk = RadioPolicy::default().decide(
-            &ctx_at(0xAA, Priority::Bulk),
-            &m,
-            1_000,
-        );
+        let bulk = RadioPolicy::default().decide(&ctx_at(0xAA, Priority::Bulk), &m, 1_000);
         assert_eq!(bulk.allocations[0].radio, W, "bulk → high-rate Wi-Fi");
 
-        let urgent = RadioPolicy::default().decide(
-            &ctx_at(0xAA, Priority::Urgent),
-            &m,
-            1_000,
-        );
+        let urgent = RadioPolicy::default().decide(&ctx_at(0xAA, Priority::Urgent), &m, 1_000);
         assert_eq!(urgent.allocations[0].radio, L, "urgent → long-range LoRa");
     }
 
@@ -2105,7 +2125,11 @@ mod adv_phy_tests {
         // transmit at full power, not an absence of one.
         let far_dbm = policy.decide_power_dbm(&cap, 4, Some(-90));
         let far_idx = policy.decide_power(&cap, 4, Some(-90));
-        assert_eq!(far_dbm, Some(20), "must climb back to the ceiling, not return None");
+        assert_eq!(
+            far_dbm,
+            Some(20),
+            "must climb back to the ceiling, not return None"
+        );
         assert_eq!(far_idx, Some(cap.max_tx_power));
 
         // Genuinely no measurement is still, correctly, no opinion.
@@ -2125,7 +2149,9 @@ mod adv_phy_tests {
         // the CONVERSION property and does not re-encode the threshold table.
         // -70 dBm gives a modest surplus rather than the 18 dB cap, so neither scale saturates.
         let rssi = Some(-70i8);
-        let backoff = policy.power_backoff_db(mcs, rssi).expect("a mid peer has surplus");
+        let backoff = policy
+            .power_backoff_db(mcs, rssi)
+            .expect("a mid peer has surplus");
 
         let mk = |db_per_idx: f32| {
             let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]);
@@ -2137,9 +2163,8 @@ mod adv_phy_tests {
             cap.power_actuated = true;
             cap
         };
-        let steps = |cap: &RadioCapability| {
-            cap.max_tx_power - policy.decide_power(cap, mcs, rssi).unwrap()
-        };
+        let steps =
+            |cap: &RadioCapability| cap.max_tx_power - policy.decide_power(cap, mcs, rssi).unwrap();
         assert!(
             (backoff / 0.125).round() <= 127.0,
             "test must not saturate: {backoff} dB / 0.125 exceeds the scale"
@@ -2191,7 +2216,9 @@ mod adv_phy_tests {
         cap.db_per_power_idx = Some(0.22); // 18 dB max back-off => ~82 steps, well past the floor
         cap.min_tx_power = Some(20);
         cap.power_actuated = true;
-        let idx = policy.decide_power(&cap, 0, Some(-20)).expect("huge surplus");
+        let idx = policy
+            .decide_power(&cap, 0, Some(-20))
+            .expect("huge surplus");
         assert!(idx >= 20, "walked past the inversion floor to {idx}");
     }
 
@@ -2208,7 +2235,10 @@ mod adv_phy_tests {
     #[test]
     fn the_actuator_band_is_exactly_what_the_policy_can_decide() {
         let (lo, hi) = crate::plan::DEFER_THRESHOLD_DBM_BAND;
-        assert_eq!(lo, EDCCA_L2H_BASE_DBM, "the band's floor is the vendor default");
+        assert_eq!(
+            lo, EDCCA_L2H_BASE_DBM,
+            "the band's floor is the vendor default"
+        );
         assert_eq!(
             i16::from(hi) - i16::from(lo),
             MAX_BACKOFF_DB as i16,
@@ -2316,7 +2346,10 @@ mod adv_phy_tests {
     fn one_legacy_only_neighbour_pins_the_group_to_1m() {
         let m = medium_with(&[ADV_PHY_CODED, ADV_PHY_CODED, ADV_PHY_1M]);
         for p in [Priority::Bulk, Priority::Normal, Priority::Urgent] {
-            assert_eq!(decide_adv_phy(&m, &ctx_at(0, p), ADV_PHY_CODED, 100), ADV_PHY_1M);
+            assert_eq!(
+                decide_adv_phy(&m, &ctx_at(0, p), ADV_PHY_CODED, 100),
+                ADV_PHY_1M
+            );
         }
     }
 

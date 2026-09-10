@@ -22,8 +22,8 @@ use crate::report::ReceptionReport;
 /// them (`src/phy.rs`, `src/hop.rs`) rather than a second vocabulary.
 #[allow(unused_imports)]
 pub use ndn_radio_hal::{
-    Band, HopCapability, HopControl, HopPeriodUnit, PhyMode, PhyModeSet, RadioCapability, RadioKind,
-    RateCapability,
+    Band, HopCapability, HopControl, HopPeriodUnit, PhyMode, PhyModeSet, RadioCapability,
+    RadioKind, RateCapability,
 };
 
 /// Identifies one physical radio / face on this node. The degenerate single-radio
@@ -359,7 +359,6 @@ impl MediumState {
         self.residual.entry(id).or_default();
     }
 
-
     /// Record `airtime_ms` of on-air time for `radio` at `now_ms` — call once per transmission on a
     /// duty-cycled radio ([`lora_airtime_ms`] gives the value). Old records fall out of the window.
     pub fn record_airtime(&mut self, radio: RadioId, airtime_ms: f32, now_ms: u64) {
@@ -624,7 +623,6 @@ pub trait MediumView {
     fn worst_neighbor_adv_phy(&self, _now_ms: u64) -> Option<u8> {
         None
     }
-
 }
 
 impl MediumView for MediumState {

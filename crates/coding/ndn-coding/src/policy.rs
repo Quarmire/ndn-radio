@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use ndn_foundation_types::Name;
 use crate::prefix_table::NameTrie;
+use ndn_foundation_types::Name;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

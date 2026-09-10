@@ -410,7 +410,7 @@ pub(crate) fn apply_knobs(
     // Counted, not merely clamped: `ledger::tx_power_clamped` is what an operator compares the
     // `radio.N.tx_power` reading against. `cap = None` ⇒ no declared band ⇒ no bound and no count,
     // stated rather than faked.
-    let mut p = p.clone();
+    let mut p = *p;
     if let Some(c) = cap {
         if let (Some(dbm), Some(range)) = (p.tx_power_dbm, c.tx_power_dbm) {
             let bounded = range.clamp(dbm);
@@ -564,8 +564,7 @@ pub(crate) fn apply_knobs(
     // refused — a threshold outside it cannot have come from `decide_edcca_threshold_dbm` at all,
     // which makes `ledger::defer_threshold_clamped` the sharpest bypass signal we have.
     if let Some((want_l2h, want_h2l)) = p.edcca_threshold_dbm {
-        let ((l2h, h2l), moved) =
-            ndn_radio_cognition::clamp_defer_threshold(want_l2h, want_h2l);
+        let ((l2h, h2l), moved) = ndn_radio_cognition::clamp_defer_threshold(want_l2h, want_h2l);
         if moved {
             ndn_radio_cognition::ledger::note_defer_threshold_clamped();
             tracing::warn!(
@@ -2311,7 +2310,9 @@ mod power_actuation_tests {
     /// second tick then adds nothing), or by deleting it.
     #[test]
     fn an_authorised_medium_claim_reaches_the_chip_and_is_counted() {
-        use ndn_radio_cognition::{ClassAuthority, ClassCeiling, Contention, NameContext, Priority};
+        use ndn_radio_cognition::{
+            ClassAuthority, ClassCeiling, Contention, NameContext, Priority,
+        };
         struct Urgent;
         impl ClassAuthority for Urgent {
             fn ceiling_for(&self, _h: u64) -> Priority {
@@ -2399,7 +2400,10 @@ mod power_actuation_tests {
     #[test]
     fn a_policy_reachable_defer_threshold_passes_through_unchanged() {
         let (lo, _) = ndn_radio_cognition::DEFER_THRESHOLD_DBM_BAND;
-        let want = (lo + 10, lo + 10 - ndn_radio_cognition::DEFER_HYSTERESIS_MAX_DB);
+        let want = (
+            lo + 10,
+            lo + 10 - ndn_radio_cognition::DEFER_HYSTERESIS_MAX_DB,
+        );
         let k = actuate(
             Arc::new(SpyKnobs::default()),
             TxParams {
@@ -3069,7 +3073,10 @@ mod tests {
 
         // DATA, under the legacy gate. It rides the basic rate (that part is correct and tested
         // elsewhere) — but it must remain subject to the slot MAC.
-        medium.send_bytes(Bytes::from_static(b"data")).await.unwrap();
+        medium
+            .send_bytes(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
         assert_eq!(
             medium.gate_counts().bypassed(),
             0,
@@ -3332,7 +3339,11 @@ mod tests {
         }
 
         let guess = RadioCapability::wifi_monitor_5ghz(vec![36]);
-        assert_eq!(guess.max_nss(), 2, "the placeholder really does claim 2 streams");
+        assert_eq!(
+            guess.max_nss(),
+            2,
+            "the placeholder really does claim 2 streams"
+        );
 
         let b = RadioBearer::new(RadioId(0), Arc::new(Honest), guess.clone());
         assert_eq!(
@@ -3340,7 +3351,11 @@ mod tests {
             1,
             "the radio says 1 stream; a bearer that still advertises 2 is the one-way-link bug"
         );
-        assert_eq!(b.effective_cap().max_nss(), 1, "and effective_cap must agree");
+        assert_eq!(
+            b.effective_cap().max_nss(),
+            1,
+            "and effective_cap must agree"
+        );
 
         let b2 = RadioBearer::new(RadioId(0), Arc::new(Mute), guess.clone());
         assert_eq!(

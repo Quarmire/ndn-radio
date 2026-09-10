@@ -583,7 +583,10 @@ mod tests {
             rebuilt |= (bits as u32) << (3 * s as u32);
             covered |= 1 << s;
         }
-        assert_eq!(rebuilt, folded, "the round covers all {COMMITMENT_BITS} bits");
+        assert_eq!(
+            rebuilt, folded,
+            "the round covers all {COMMITMENT_BITS} bits"
+        );
         assert_eq!(covered, 0x7f, "all seven slices are emitted exactly once");
     }
 
@@ -650,10 +653,11 @@ mod tests {
             let v = w.observe(id, flags, ours, 1_000 + i as u64);
             assert!(!v.agreement.is_divergent(), "agreeing peer never diverges");
             assert!(!v.newly_divergent);
-            let want = Agreement::Agreeing {
-                bits: 3 * (i + 1),
-            };
-            assert_eq!(v.agreement, want, "partial rounds report bits, not a verdict");
+            let want = Agreement::Agreeing { bits: 3 * (i + 1) };
+            assert_eq!(
+                v.agreement, want,
+                "partial rounds report bits, not a verdict"
+            );
             assert_eq!(v.agreement.is_complete(), i + 1 == COMMITMENT_SLICES);
         }
     }
@@ -693,7 +697,10 @@ mod tests {
             let (id, flags) = d.tx_id(Some(a));
             w.observe(id, flags, a, 1_000 + i);
         }
-        assert!(matches!(w.agreement_for(d.current()), Agreement::Agreeing { .. }));
+        assert!(matches!(
+            w.agreement_for(d.current()),
+            Agreement::Agreeing { .. }
+        ));
         // Our map moves: everything we accumulated was agreement with a value we no longer hold.
         let b = fold_commitment(0xBBBB_BBBB_BBBB_BBBB);
         let (id, flags) = d.tx_id(Some(a));

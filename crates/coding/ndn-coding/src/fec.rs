@@ -467,7 +467,13 @@ mod tests {
                 enc.feed(s.clone()).unwrap();
             }
             let coded: Vec<Bytes> = (0..n)
-                .map(|i| if i < k { sources[i as usize].clone() } else { enc.parity(i).unwrap() })
+                .map(|i| {
+                    if i < k {
+                        sources[i as usize].clone()
+                    } else {
+                        enc.parity(i).unwrap()
+                    }
+                })
                 .collect();
             for mask in 0u32..(1u32 << n) {
                 if mask.count_ones() as u16 != k {
@@ -478,8 +484,15 @@ mod tests {
                 for &i in &combo {
                     dec.absorb(i, coded[i as usize].clone()).unwrap();
                 }
-                assert!(dec.is_complete(), "k={k} n={n} subset {combo:?}: not full rank (matrix not MDS)");
-                assert_eq!(dec.recover().unwrap(), sources, "k={k} n={n} subset {combo:?}: wrong recovery");
+                assert!(
+                    dec.is_complete(),
+                    "k={k} n={n} subset {combo:?}: not full rank (matrix not MDS)"
+                );
+                assert_eq!(
+                    dec.recover().unwrap(),
+                    sources,
+                    "k={k} n={n} subset {combo:?}: wrong recovery"
+                );
             }
         }
     }
@@ -496,7 +509,11 @@ mod tests {
         }
         let mut dec = Decoder::new(k, n).unwrap();
         for i in [2u16, 4, 5, 6] {
-            let seg = if i < k { sources[i as usize].clone() } else { enc.parity(i).unwrap() };
+            let seg = if i < k {
+                sources[i as usize].clone()
+            } else {
+                enc.parity(i).unwrap()
+            };
             dec.absorb(i, seg).unwrap();
         }
         assert!(dec.is_complete());

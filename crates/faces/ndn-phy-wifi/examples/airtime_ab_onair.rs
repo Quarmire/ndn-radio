@@ -70,7 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
         // named at the call site — and keep the report instead of discarding it.
         let d = Arc::new(LibUsbRtl88xxBackend::open()?);
-        d.bring_up_planned(ch, ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+        d.bring_up_planned(
+            ch,
+            ndn_radio_drivers::Role::TransmitAndReceive,
+            ndn_radio_drivers::a81a_env_deviation(),
+            ndn_radio_drivers::ProofRequirement::BestAvailable,
+        )?;
         d
     };
     backend.set_channel(ch, ChannelBw::Bw80)?; // 80 MHz VHT, matching the template

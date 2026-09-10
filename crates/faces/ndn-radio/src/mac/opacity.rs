@@ -27,8 +27,8 @@
 //! the wire**; a node without the policy is route-only (LPM the clear prefix; cannot interpret the
 //! middle). This module is the pure tokenisation; the policy fetch + key grant are L3 (NAC).
 
-use ndn_frame_io::siphash24;
 use crate::mac::tlv::{put_tlv, read_var};
+use ndn_frame_io::siphash24;
 
 /// Width of a name token (`T_k`) on the wire, bytes — a fixed-width one-way SipHash digest.
 pub const TOKEN_LEN: usize = 8;
@@ -55,7 +55,10 @@ impl NamespacePolicy {
 
     /// The all-clear policy (no opaque middle) — public content, no grant, no anchor needed.
     pub fn clear() -> Self {
-        Self { clear_prefix_len: 0, opaque_end: 0 }
+        Self {
+            clear_prefix_len: 0,
+            opaque_end: 0,
+        }
     }
 
     /// Is component index `i` (in a name of `depth` components) in the opaque middle `[B, M)`?
@@ -74,7 +77,11 @@ pub fn token(key: &[u8; 16], component: &[u8]) -> [u8; TOKEN_LEN] {
 /// components pass through verbatim; opaque-middle components become their `T_k`. The result is the
 /// **wire** component values (all `GenericNameComponent`s). A consumer and a producer that hold the same
 /// `(policy, key)` produce byte-identical wire names ⇒ their PIT/CS exact-match.
-pub fn tokenize<C: AsRef<[u8]>>(policy: &NamespacePolicy, key: &[u8; 16], components: &[C]) -> Vec<Vec<u8>> {
+pub fn tokenize<C: AsRef<[u8]>>(
+    policy: &NamespacePolicy,
+    key: &[u8; 16],
+    components: &[C],
+) -> Vec<Vec<u8>> {
     let depth = components.len();
     components
         .iter()
@@ -106,15 +113,22 @@ pub const TLV_NAC_GRANT: u64 = 0x0398;
 pub const TLV_NAC_NAME_TOKEN_KEY: u64 = 0x0399;
 pub const TLV_NAC_CONTENT_KEY: u64 = 0x039A;
 
-
 impl NamespacePolicy {
     /// Encode the policy object's **payload** — `(B, M)`. Carried in a named signed Data
     /// (`/<ns>/NAC/policy`, verified to the anchor); a node holding it derives the zones, and a node
     /// without it is route-only (LPM the clear prefix). No boundary metadata ever rides a data frame.
     pub fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
-        put_tlv(&mut inner, TLV_NS_CLEAR_PREFIX_LEN, &(self.clear_prefix_len as u32).to_be_bytes());
-        put_tlv(&mut inner, TLV_NS_OPAQUE_END, &(self.opaque_end as u32).to_be_bytes());
+        put_tlv(
+            &mut inner,
+            TLV_NS_CLEAR_PREFIX_LEN,
+            &(self.clear_prefix_len as u32).to_be_bytes(),
+        );
+        put_tlv(
+            &mut inner,
+            TLV_NS_OPAQUE_END,
+            &(self.opaque_end as u32).to_be_bytes(),
+        );
         let mut out = Vec::new();
         put_tlv(&mut out, TLV_NS_POLICY, &inner);
         out
@@ -135,8 +149,12 @@ impl NamespacePolicy {
             let l = read_var(body, &mut q)? as usize;
             let v = body.get(q..q + l)?;
             match t {
-                TLV_NS_CLEAR_PREFIX_LEN if l >= 4 => b = u32::from_be_bytes(v[..4].try_into().ok()?) as usize,
-                TLV_NS_OPAQUE_END if l >= 4 => m = u32::from_be_bytes(v[..4].try_into().ok()?) as usize,
+                TLV_NS_CLEAR_PREFIX_LEN if l >= 4 => {
+                    b = u32::from_be_bytes(v[..4].try_into().ok()?) as usize
+                }
+                TLV_NS_OPAQUE_END if l >= 4 => {
+                    m = u32::from_be_bytes(v[..4].try_into().ok()?) as usize
+                }
                 _ => {}
             }
             q += l;
@@ -195,7 +213,10 @@ impl NacGrant {
             }
             q += l;
         }
-        Some(NacGrant { name_token_key: ntk?, content_key: ck? })
+        Some(NacGrant {
+            name_token_key: ntk?,
+            content_key: ck?,
+        })
     }
 }
 
@@ -215,7 +236,10 @@ mod tests {
         let name = comps(&["ndn", "health", "alice", "bp", "v3"]);
         let consumer = tokenize(&p, &key, &name);
         let producer = tokenize(&p, &key, &name); // same key + policy at both ends
-        assert_eq!(consumer, producer, "both endpoints tokenise forward to the same bytes");
+        assert_eq!(
+            consumer, producer,
+            "both endpoints tokenise forward to the same bytes"
+        );
         // clear prefix + tail survive verbatim; middle is opaque + fixed-width.
         assert_eq!(&consumer[0], b"ndn");
         assert_eq!(&consumer[1], b"health");
@@ -230,8 +254,14 @@ mod tests {
         let name = comps(&["ndn", "health", "alice", "bp"]);
         let a = tokenize(&p, b"ns-name-token-k1", &name);
         let b = tokenize(&p, b"OTHER-namespace!", &name);
-        assert_ne!(a[2], b[2], "an eavesdropper without the key cannot reproduce the token");
-        assert_eq!(a[0], b[0], "the clear routable prefix is unaffected by the key");
+        assert_ne!(
+            a[2], b[2],
+            "an eavesdropper without the key cannot reproduce the token"
+        );
+        assert_eq!(
+            a[0], b[0],
+            "the clear routable prefix is unaffected by the key"
+        );
     }
 
     #[test]
@@ -240,7 +270,6 @@ mod tests {
         let name = comps(&["ndn", "public", "doc"]);
         assert_eq!(tokenize(&p, b"anykeyanykeyany!", &name), name);
     }
-
 
     #[test]
     fn namespace_policy_payload_round_trips() {
@@ -251,15 +280,24 @@ mod tests {
 
     #[test]
     fn nac_grant_carries_both_keys_and_round_trips() {
-        let g = NacGrant { name_token_key: *b"ns-name-token-k1", content_key: vec![9u8; 32] };
+        let g = NacGrant {
+            name_token_key: *b"ns-name-token-k1",
+            content_key: vec![9u8; 32],
+        };
         let w = g.encode();
         let back = NacGrant::decode(&w).unwrap();
-        assert_eq!(back.name_token_key, g.name_token_key, "name-token key survives");
+        assert_eq!(
+            back.name_token_key, g.name_token_key,
+            "name-token key survives"
+        );
         assert_eq!(back.content_key, g.content_key, "content key survives");
         // The same grant drives the tokenizer: a node that opens it can form the opaque names.
         let p = NamespacePolicy::new(2, 4);
         let name = comps(&["ndn", "health", "alice", "bp"]);
-        assert_eq!(tokenize(&p, &back.name_token_key, &name), tokenize(&p, &g.name_token_key, &name));
+        assert_eq!(
+            tokenize(&p, &back.name_token_key, &name),
+            tokenize(&p, &g.name_token_key, &name)
+        );
     }
 
     #[test]

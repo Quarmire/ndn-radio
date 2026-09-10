@@ -61,14 +61,14 @@ use ndn_transport::{
     Transport,
 };
 
+/// The name-keyed hop plan (#40). Re-exported so a wiring site can build and read one without
+/// naming the cognition crate — see [`LoraPhy::install_name_hop_plan`].
+pub use ndn_radio_cognition::{HopPlan, carrier_grid, name_hop_plan};
 /// The plan types this face's public API speaks. Re-exported so a wiring site can build a
 /// [`TxParams`] cell for [`with_planned_params`](LoraPhy::with_planned_params) without taking a
 /// direct dependency on the cognition crate (which depends, in turn, on `ndn-radio` — the wiring
 /// site is usually inside it).
 pub use ndn_radio_cognition::{LoraRate, RateParams};
-/// The name-keyed hop plan (#40). Re-exported so a wiring site can build and read one without
-/// naming the cognition crate — see [`LoraPhy::install_name_hop_plan`].
-pub use ndn_radio_cognition::{HopPlan, carrier_grid, name_hop_plan};
 /// The modulation axis a plan can name: the HAL's [`PhyMode`] vocabulary plus cognition's
 /// name↔mode mapping, re-exported for the same reason — a wiring site sets `TxParams::phy`
 /// without depending on either crate directly.
@@ -983,7 +983,6 @@ impl LoraPhy {
             }
         }
     }
-
 }
 
 impl Transport for LoraPhy {
@@ -1340,7 +1339,6 @@ mod tests {
             Some(LORA_MTU),
             "an over-declared 256 is capped to the face's measured ceiling, not believed"
         );
-
     }
 
     /// **A knob the radio refuses is asked once, not once per frame.**
@@ -1609,7 +1607,11 @@ mod tests {
 
     /// A capability for an **agile** node: it advertises `modes`, runs `current`, and (when
     /// `hop` is set) has a sequencer of its own.
-    fn agile_cap(modes: PhyModeSet, current: PhyMode, hop: Option<HopCapability>) -> RadioCapability {
+    fn agile_cap(
+        modes: PhyModeSet,
+        current: PhyMode,
+        hop: Option<HopCapability>,
+    ) -> RadioCapability {
         let mut c = lora_cap(200);
         c.phy_modes = modes;
         c.phy_current = Some(current);
@@ -1793,10 +1795,18 @@ mod tests {
         let installed = spy.hops.lock().unwrap().clone();
         assert_eq!(installed.len(), 1);
         let (ctrl, period, freqs) = &installed[0];
-        assert_eq!(*ctrl, HopControl::On, "the plan must be armed, not just loaded");
+        assert_eq!(
+            *ctrl,
+            HopControl::On,
+            "the plan must be armed, not just loaded"
+        );
         assert_eq!(*period, 12);
         assert_eq!(freqs, plan.freqs_hz());
-        assert_eq!(freqs.len(), 27, "the whole declared band plan fits in 40 slots");
+        assert_eq!(
+            freqs.len(),
+            27,
+            "the whole declared band plan fits in 40 slots"
+        );
         for f in freqs {
             assert!(carriers.contains(f), "invented carrier {f}");
         }
@@ -1942,10 +1952,7 @@ mod tests {
                 .collect()
         }
         fn read_clock(&self, domain: ClockDomainId) -> Result<Option<u64>, FaceError> {
-            Ok(self
-                .clock
-                .filter(|(d, _)| *d == domain)
-                .map(|(_, now)| now))
+            Ok(self.clock.filter(|(d, _)| *d == domain).map(|(_, now)| now))
         }
     }
 

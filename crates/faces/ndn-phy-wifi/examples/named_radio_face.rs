@@ -44,7 +44,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // M8: `open_monitor*` is deleted. Claim, then run the ONE plan with the role
         // named at the call site — and keep the report instead of discarding it.
         let d = Arc::new(LibUsbRtl88xxBackend::open()?);
-        d.bring_up_planned(channel, ndn_radio_drivers::Role::TransmitAndReceive, ndn_radio_drivers::a81a_env_deviation(), ndn_radio_drivers::ProofRequirement::BestAvailable)?;
+        d.bring_up_planned(
+            channel,
+            ndn_radio_drivers::Role::TransmitAndReceive,
+            ndn_radio_drivers::a81a_env_deviation(),
+            ndn_radio_drivers::ProofRequirement::BestAvailable,
+        )?;
         d
     };
     // Self-maintaining link: the DM watchdog (thermal TX-power tracking + RX
@@ -99,7 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(p) = std::env::var("RADIO_TXPWR")
         && let Ok(idx) = u32::from_str_radix(p.trim_start_matches("0x"), 16)
     {
-        let applied = backend.set_tx_power(ndn_radio_hal::PowerRequest::index(idx.min(255) as u8))?;
+        let applied =
+            backend.set_tx_power(ndn_radio_hal::PowerRequest::index(idx.min(255) as u8))?;
         println!("TX power index {idx:#x}: {}", applied.render());
     }
     // RADIO_PERRATE=1: write the per-rate TXAGC table (0x3a00) the working

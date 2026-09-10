@@ -338,7 +338,10 @@ mod tests {
     fn absent_power_is_not_faked() {
         let mut r = sample();
         r.tx_power_dbm = None;
-        assert_eq!(decode_report(&encode_report(&r)).unwrap().tx_power_dbm, None);
+        assert_eq!(
+            decode_report(&encode_report(&r)).unwrap().tx_power_dbm,
+            None
+        );
         // The sentinel is not mistakable for a real power.
         assert!(TX_POWER_UNKNOWN < -100);
     }
@@ -351,7 +354,11 @@ mod tests {
             heard_neighbors: vec![(42, -60)],
             ..Default::default()
         };
-        assert_eq!(r.path_loss_db(42), None, "no power => no path loss, not a guess");
+        assert_eq!(
+            r.path_loss_db(42),
+            None,
+            "no power => no path loss, not a guess"
+        );
         r.tx_power_dbm = Some(20);
         assert_eq!(r.path_loss_db(42), Some(80));
         assert_eq!(r.path_loss_db(43), None, "not heard => none");

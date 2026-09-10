@@ -539,10 +539,21 @@ async fn face_rx_teaches_the_learning_policy() {
 async fn ndr_capability_rides_interests_and_is_stored() {
     use crate::mac::capability::NdrCapability;
     let wifi = LoopbackBus::new();
-    let cap = NdrCapability { max_rate: Some(6), hop: true, phys: 0b0000_0101, ..Default::default() };
-    let a = Radio::broadcast(FaceId(1), vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)])
-        .with_capability(cap);
-    let b = Radio::broadcast(FaceId(2), vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)]);
+    let cap = NdrCapability {
+        max_rate: Some(6),
+        hop: true,
+        phys: 0b0000_0101,
+        ..Default::default()
+    };
+    let a = Radio::broadcast(
+        FaceId(1),
+        vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)],
+    )
+    .with_capability(cap);
+    let b = Radio::broadcast(
+        FaceId(2),
+        vec![LoopbackBearer::new(&wifi, 2000, PhyKind::Wifi, 1)],
+    );
     // LP-wrapped Interest: 0x64 { 0x50 { 0x05 len { 0x07 { /w/1 } } } }
     let name = [0x07u8, 0x06, 0x08, 0x01, b'w', 0x08, 0x01, b'1'];
     let mut interest = vec![0x05u8, name.len() as u8];
@@ -574,12 +585,24 @@ struct CapPhy {
 }
 #[async_trait]
 impl super::WirelessPhy for CapPhy {
-    fn kind(&self) -> PhyKind { PhyKind::Wifi }
-    fn mtu(&self) -> usize { 2000 }
-    fn range_rank(&self) -> u8 { 1 }
-    async fn send(&self, _wire: Bytes) -> Result<(), FaceError> { Ok(()) }
-    async fn recv(&self) -> Result<Bytes, FaceError> { std::future::pending().await }
-    fn max_rx_mcs(&self) -> Option<u8> { self.mcs }
+    fn kind(&self) -> PhyKind {
+        PhyKind::Wifi
+    }
+    fn mtu(&self) -> usize {
+        2000
+    }
+    fn range_rank(&self) -> u8 {
+        1
+    }
+    async fn send(&self, _wire: Bytes) -> Result<(), FaceError> {
+        Ok(())
+    }
+    async fn recv(&self) -> Result<Bytes, FaceError> {
+        std::future::pending().await
+    }
+    fn max_rx_mcs(&self) -> Option<u8> {
+        self.mcs
+    }
     fn set_relevance_prefixes(&self, p: &[Vec<u8>]) -> Result<(), FaceError> {
         *self.prefixes.lock().unwrap() = p.to_vec();
         Ok(())
@@ -588,15 +611,29 @@ impl super::WirelessPhy for CapPhy {
 
 #[tokio::test]
 async fn capability_is_auto_derived_and_prefixes_actuate_the_gate() {
-    let phy = Arc::new(CapPhy { mcs: Some(7), prefixes: Mutex::new(vec![]) });
+    let phy = Arc::new(CapPhy {
+        mcs: Some(7),
+        prefixes: Mutex::new(vec![]),
+    });
     let face = Radio::broadcast(FaceId(1), vec![phy.clone() as Arc<dyn super::WirelessPhy>]);
     // Advertised capability is derived from the phys with NO configuration.
     let cap = face.capability();
-    assert_eq!(cap.max_rate, Some(7), "MaxRate auto-derived from the radio's max RX MCS");
-    assert_eq!(cap.phys, 0b0000_0001, "Wi-Fi bearer bit set from the phy kind");
-    assert!(!cap.is_floor(), "a real radio advertises a real capability by default");
+    assert_eq!(
+        cap.max_rate,
+        Some(7),
+        "MaxRate auto-derived from the radio's max RX MCS"
+    );
+    assert_eq!(
+        cap.phys, 0b0000_0001,
+        "Wi-Fi bearer bit set from the phy kind"
+    );
+    assert!(
+        !cap.is_floor(),
+        "a real radio advertises a real capability by default"
+    );
     // Registering served prefixes actuates the off-host parse gate on every gate-capable phy.
-    face.register_prefixes(&[b"/ndn/svc".to_vec(), b"/ndn/alarm".to_vec()]).unwrap();
+    face.register_prefixes(&[b"/ndn/svc".to_vec(), b"/ndn/alarm".to_vec()])
+        .unwrap();
     assert_eq!(
         phy.prefixes.lock().unwrap().as_slice(),
         &[b"/ndn/svc".to_vec(), b"/ndn/alarm".to_vec()],

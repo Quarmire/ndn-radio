@@ -65,12 +65,7 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         // …and capture the pin from the schedule actually in force rather than defaulting it, so
         // `map_digest()` in the lab means what it means on air (the default said reserved = 0 while
         // the lab ran a reserved-lane stride).
-        sched_params: crate::sched::SchedParams::capture(
-            1,
-            ClockSource::Wall,
-            Some(&slot),
-            None,
-        ),
+        sched_params: crate::sched::SchedParams::capture(1, ClockSource::Wall, Some(&slot), None),
         clock_source: ClockSource::Wall,
         knobs: None,
         bw: crate::Bandwidth::default(),
@@ -135,11 +130,10 @@ fn prop_p1_map_agreement() {
     let table = || {
         Arc::new(
             GroupTable::new(&[
-                    b"/alarm".as_slice(),
-                    b"/bulk".as_slice(),
-                    b"/ndn".as_slice(),
-                ],
-            )
+                b"/alarm".as_slice(),
+                b"/bulk".as_slice(),
+                b"/ndn".as_slice(),
+            ])
             .with_latency_unauthorised(&[b"/alarm".as_slice()]),
         )
     };
@@ -209,9 +203,8 @@ fn prop_p1b_class_divergence_is_detected_on_ordinary_data_from_a_non_master() {
     ];
     let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
     // The fleet's lane policy: /alarm, and only /alarm.
-    let honest = || {
-        Arc::new(GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]))
-    };
+    let honest =
+        || Arc::new(GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]));
     // The defector runs that policy AND helps itself to a lane for its own bulk traffic. Identical
     // registration set, identical schedule inputs — the class assignment is the only difference.
     let defecting = Arc::new(
@@ -226,7 +219,10 @@ fn prop_p1b_class_divergence_is_detected_on_ordinary_data_from_a_non_master() {
     let wire = data_wire(&[b"bulk".as_slice(), b"x".as_slice()]);
     let (hh, hc) = nodes[0].name_group(&wire).expect("keyed");
     let (dh, dc) = defector.name_group(&wire).expect("keyed");
-    assert_eq!(hh, dh, "premise: the slot KEY is unchanged; only the class moved");
+    assert_eq!(
+        hh, dh,
+        "premise: the slot KEY is unchanged; only the class moved"
+    );
     assert!(
         !slot.is_reserved(slot.owner_slot_in(nodes[0].medium_keyed(hh), hc))
             && slot.is_reserved(slot.owner_slot_in(defector.medium_keyed(dh), dc)),
@@ -295,7 +291,10 @@ fn prop_p1b_class_divergence_is_detected_on_ordinary_data_from_a_non_master() {
             .observe(id, flags, defector.class_commitment(), 2_000 + f)
             .newly_divergent;
     }
-    assert!(saw, "detection is symmetric — the defector sees the split too");
+    assert!(
+        saw,
+        "detection is symmetric — the defector sees the split too"
+    );
 
     // And the beacon check still works where a master DOES run: retracting the claim did not delete
     // the mechanism, it narrowed what it covers (and it keeps the full 64 bits).
@@ -318,9 +317,8 @@ fn prop_p1b_class_divergence_is_detected_on_ordinary_data_from_a_non_master() {
 fn prop_p1c_a_half_collected_commitment_never_reports_a_partition() {
     let regs = [b"/alarm".as_slice(), b"/bulk".as_slice()];
     let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
-    let honest = Arc::new(
-        GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]),
-    );
+    let honest =
+        Arc::new(GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]));
     let node = lab_sched(slot, Some(honest.clone()));
     let peer = lab_sched(slot, Some(honest));
     assert_eq!(node.class_commitment(), peer.class_commitment());
@@ -336,7 +334,11 @@ fn prop_p1c_a_half_collected_commitment_never_reports_a_partition() {
     // partition us against the whole installed base.
     for t in 0..32 {
         let v = w.observe(7, 0, node.class_commitment(), 1_000 + t);
-        assert_eq!(v.agreement, Agreement::Unknown, "index 0 is absent, not data");
+        assert_eq!(
+            v.agreement,
+            Agreement::Unknown,
+            "index 0 is absent, not data"
+        );
         assert!(!v.newly_divergent);
     }
 

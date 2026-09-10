@@ -149,7 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("SCHED OFF (NDN_SCHED_SLOT unset) — free-running, the contention baseline");
     }
 
-    let open = ndn_radio_drivers::open_radio(pid, &ndn_radio_drivers::DeviceSelect::from_env(), &ndn_radio_drivers::BringUpRequest::from_env(channel))?;
+    let open = ndn_radio_drivers::open_radio(
+        pid,
+        &ndn_radio_drivers::DeviceSelect::from_env(),
+        &ndn_radio_drivers::BringUpRequest::from_env(channel),
+    )?;
     let cap = RadioCapability::wifi_monitor_5ghz(vec![channel]);
     let medium = Arc::new(
         RadioMediumFace::new(

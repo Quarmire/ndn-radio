@@ -173,7 +173,8 @@ fn seed_full_rank(recode: RecodePolicy) -> (Name, u64, u16, Arc<Mutex<Generation
 async fn compute_recode_honours_the_kill_switch() {
     let (object, gen_id, k, buffer) = seed_full_rank(RecodePolicy::Open);
     let sw = Arc::new(AtomicBool::new(true));
-    let handler = NcComputeHandler::with_kill_switch(object.clone(), gen_id, buffer, Arc::clone(&sw));
+    let handler =
+        NcComputeHandler::with_kill_switch(object.clone(), gen_id, buffer, Arc::clone(&sw));
     let name = naming::vector_request_name(&object, gen_id, &CodingVector::unit(k, 0));
     let interest = Interest::new(name);
 

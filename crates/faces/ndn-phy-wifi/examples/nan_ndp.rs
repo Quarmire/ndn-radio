@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ndn_radio_drivers::ProofRequirement::BestAvailable,
         )?;
         println!("{}", report.render());
-                // Keep a bulk-IN read always in flight; without it we only read during a
+        // Keep a bulk-IN read always in flight; without it we only read during a
         // recv_frame call and lose whatever arrives in between (see
         // Rtl8812auBackend::spawn_rx_pump). Depth 1 — one reader, so ordered.
         b.spawn_rx_pump(1);

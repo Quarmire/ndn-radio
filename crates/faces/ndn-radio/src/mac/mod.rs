@@ -3,7 +3,6 @@
 //! This is the coherent home for the MAC primitives that used to be scattered across the Wi-Fi PHY and
 //! the cognition crate: ephemeral per-frame identity, the named airtime-lease scheduler's cooperation
 //! model, and DoS/abuse gating, plus the canonical name-derivation (parse) path.
-pub(crate) mod tlv;
 pub mod capability;
 pub mod coop;
 pub mod dos;
@@ -12,6 +11,7 @@ pub mod name;
 pub mod opacity;
 pub mod rendezvous;
 pub mod schedule;
+pub(crate) mod tlv;
 /// Canonical prefix-hash (FNV-1a over the name components, with a separator) — the
 /// opaque key that ties demand, the sense bus, `NameContext`, and the consistency
 /// digest together. The forwarder uses this to turn a `Name` prefix into the key

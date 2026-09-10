@@ -53,6 +53,9 @@
 //! sense its own channel. It is gated behind the default `occupancy-sampler` feature; take
 //! `default-features = false` for the pure, runtime-free core.
 
+// Clippy release-triage: deferred minor style lints in the radio-face code.
+#![allow(clippy::unnecessary_sort_by)]
+
 pub use ndn_radio::mac::{coop, dos, ephemeral_id, name, prefix_hash, schedule};
 mod calibrate;
 mod contextual;
@@ -96,9 +99,8 @@ pub use plan::{
     WifiRate, clamp_defer_threshold, ledger, mcs_base_rate_mbps,
 };
 pub use policy::{
-    ClassAuthority, ClassCeiling, DemandRank,
-    DecisionRationale, NameContext, PolicyConfig, Priority, RadioPolicy, RadioRationale,
-    SuppressReason, decide_adv_phy,
+    ClassAuthority, ClassCeiling, DecisionRationale, DemandRank, NameContext, PolicyConfig,
+    Priority, RadioPolicy, RadioRationale, SuppressReason, decide_adv_phy,
 };
 pub use report::{
     ADV_PHY_1M, ADV_PHY_2M, ADV_PHY_CODED, FULL_RX_MCS, LEGACY_ONLY_RX, MAX_ENTRIES, REPORT_MAGIC,

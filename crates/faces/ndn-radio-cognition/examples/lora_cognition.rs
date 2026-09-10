@@ -34,9 +34,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ndn_frame_io::{FrameIo, InjectFrame, TxIntent};
-use ndn_radio_cognition::{ClassAuthority, ClassCeiling, 
-    DemandTracker, MediumState, MediumView, NameContext, Priority, RadioId, RadioPolicy,
-    STATIC_REQ_RSSI_SF, lora_airtime_ms, pick_sf_hysteretic, prefix_hash,
+use ndn_radio_cognition::{
+    ClassAuthority, ClassCeiling, DemandTracker, MediumState, MediumView, NameContext, Priority,
+    RadioId, RadioPolicy, STATIC_REQ_RSSI_SF, lora_airtime_ms, pick_sf_hysteretic, prefix_hash,
 };
 use ndn_radio_drivers::LoraSerialBackend;
 use ndn_radio_hal::{Bandwidth, RadioKnobs, RadioProfile};
@@ -491,7 +491,8 @@ impl Node {
         };
         println!(
             "[{}] {secs:>3}s| {:<7?}| {rssi:>7} | fan={fanout} reI={reint:.2} PER={per:.2} | {sf_s} {cr_s} {bw_s} {pwr_s} FEC{fec} duty={duty:.2}% | {act}",
-            self.name, ctx.priority(),
+            self.name,
+            ctx.priority(),
         );
     }
 
@@ -961,7 +962,8 @@ mod tests {
 
         let policy = RadioPolicy::default();
         let mut urgent = NameContext::new(ph);
-        let urgent = urgent.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Urgent), 0));
+        let urgent =
+            urgent.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Urgent), 0));
         let plan = policy.decide(&urgent, &m, 0);
         let alloc = plan.allocation_for(R).expect("origin serves its own name");
         // Strong link → fastest SF; urgent → the more robust coding rate.

@@ -299,7 +299,10 @@ impl PhyPolicy for NameReachClassifier {
 fn wraps_interest(wire: &[u8]) -> bool {
     let raw = Bytes::copy_from_slice(wire);
     let inner = if ndn_packet::lp::is_lp_packet(wire) {
-        match ndn_packet::lp::LpPacket::decode(raw).ok().and_then(|p| p.fragment) {
+        match ndn_packet::lp::LpPacket::decode(raw)
+            .ok()
+            .and_then(|p| p.fragment)
+        {
             Some(f) => f,
             None => return false,
         }
@@ -462,10 +465,10 @@ impl Dedup {
             return true;
         }
         self.order.push_back(key);
-        if self.order.len() > self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
+        if self.order.len() > self.cap
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
         }
         false
     }
@@ -555,7 +558,8 @@ impl Radio {
     /// reads on a Data return.
     pub fn link_rate_hint(&self, link: u64) -> Option<u8> {
         let our = self.self_cap.max_rate?;
-        self.peer_capability(link).map(|c| c.worst_receiver_mcs(our))
+        self.peer_capability(link)
+            .map(|c| c.worst_receiver_mcs(our))
     }
 
     /// The fresh capability last heard from `link` (a phy index), or `None` (⇒ floor) — what a rate
@@ -622,10 +626,10 @@ impl Transport for Radio {
         // Each selected phy fragments `wire` to its own MTU internally (phy-native).
         let mut last_err = None;
         for i in sel {
-            if let Some(phy) = self.phys.get(i) {
-                if let Err(e) = phy.send(wire.clone()).await {
-                    last_err = Some(e);
-                }
+            if let Some(phy) = self.phys.get(i)
+                && let Err(e) = phy.send(wire.clone()).await
+            {
+                last_err = Some(e);
             }
         }
         match last_err {

@@ -178,7 +178,13 @@ fn report_json(r: &ndn_radio_drivers::BringUpReport) -> String {
     let warns: Vec<String> = r
         .warnings
         .iter()
-        .map(|w| format!("{{\"at\":\"{}\",\"degrades\":\"{}\"}}", w.at, esc(&w.degrades)))
+        .map(|w| {
+            format!(
+                "{{\"at\":\"{}\",\"degrades\":\"{}\"}}",
+                w.at,
+                esc(&w.degrades)
+            )
+        })
         .collect();
     format!(
         "{{\"part\":\"{}\",\"device\":\"{}\",\"plan\":\"{}\",\"plan_digest\":\"{:#018x}\",\

@@ -64,7 +64,10 @@ impl NdrCapability {
         }
         match self.sleep {
             Some(SleepMode::PerPrefixPhase) => put_tlv(&mut inner, TLV_NDR_SLEEP, &[]),
-            Some(SleepMode::Window { window_us, period_us }) => {
+            Some(SleepMode::Window {
+                window_us,
+                period_us,
+            }) => {
                 let mut v = Vec::with_capacity(8);
                 v.extend_from_slice(&window_us.to_be_bytes());
                 v.extend_from_slice(&period_us.to_be_bytes());
@@ -146,7 +149,9 @@ pub fn splice_into_lp_wire(lp_wire: bytes::Bytes, cap: &NdrCapability) -> bytes:
         return lp_wire;
     }
     let mut outer = TlvReader::new(lp_wire.clone());
-    let Ok((typ, value)) = outer.read_tlv() else { return lp_wire };
+    let Ok((typ, value)) = outer.read_tlv() else {
+        return lp_wire;
+    };
     if typ != LP_PACKET {
         return lp_wire;
     }
@@ -154,7 +159,9 @@ pub fn splice_into_lp_wire(lp_wire: bytes::Bytes, cap: &NdrCapability) -> bytes:
     let mut headers: Vec<(u64, bytes::Bytes)> = Vec::new();
     let mut fragment: Option<(u64, bytes::Bytes)> = None;
     while !inner.is_empty() {
-        let Ok((t, v)) = inner.read_tlv() else { return lp_wire };
+        let Ok((t, v)) = inner.read_tlv() else {
+            return lp_wire;
+        };
         if t == LP_FRAGMENT {
             fragment = Some((t, v));
             continue;
@@ -236,15 +243,15 @@ impl CapabilityStore {
 
     /// Record `cap` heard from `link` (an Interest's reverse path) at `now_ms`. Re-stamps freshness.
     pub fn observe(&mut self, link: u64, cap: NdrCapability, now_ms: u64) {
-        if self.seen.len() >= self.cap && !self.seen.contains_key(&link) {
-            if let Some(&oldest) = self
+        if self.seen.len() >= self.cap
+            && !self.seen.contains_key(&link)
+            && let Some(&oldest) = self
                 .seen
                 .iter()
                 .min_by_key(|(_, (_, ts))| *ts)
                 .map(|(k, _)| k)
-            {
-                self.seen.remove(&oldest);
-            }
+        {
+            self.seen.remove(&oldest);
         }
         self.seen.insert(link, (cap, now_ms));
     }
@@ -260,7 +267,8 @@ impl CapabilityStore {
     /// Drop stale entries (call on a timer; not required for correctness — `get` already gates).
     pub fn prune(&mut self, now_ms: u64) {
         let stale = self.stale_ms;
-        self.seen.retain(|_, (_, ts)| now_ms.saturating_sub(*ts) <= stale);
+        self.seen
+            .retain(|_, (_, ts)| now_ms.saturating_sub(*ts) <= stale);
     }
 }
 
@@ -273,7 +281,10 @@ mod tests {
         let c = NdrCapability {
             max_rate: Some(7),
             hop: true,
-            sleep: Some(SleepMode::Window { window_us: 62_500, period_us: 1_000_000 }),
+            sleep: Some(SleepMode::Window {
+                window_us: 62_500,
+                period_us: 1_000_000,
+            }),
             phys: 0b0000_0101,
         };
         assert_eq!(NdrCapability::decode(&c.encode()), Some(c));
@@ -288,7 +299,10 @@ mod tests {
 
     #[test]
     fn per_prefix_sleep_is_the_empty_value() {
-        let c = NdrCapability { sleep: Some(SleepMode::PerPrefixPhase), ..Default::default() };
+        let c = NdrCapability {
+            sleep: Some(SleepMode::PerPrefixPhase),
+            ..Default::default()
+        };
         let w = c.encode();
         assert_eq!(NdrCapability::decode(&w), Some(c));
     }
@@ -298,15 +312,23 @@ mod tests {
         assert_eq!(NdrCapability::decode(&[0x07, 0x01, 0x00]), None);
     }
 
-
-
     #[test]
     fn worst_receiver_takes_the_min() {
-        let hi = NdrCapability { max_rate: Some(7), ..Default::default() };
+        let hi = NdrCapability {
+            max_rate: Some(7),
+            ..Default::default()
+        };
         assert_eq!(hi.worst_receiver_mcs(4), 4, "clamp to our own cap");
-        let lo = NdrCapability { max_rate: Some(2), ..Default::default() };
+        let lo = NdrCapability {
+            max_rate: Some(2),
+            ..Default::default()
+        };
         assert_eq!(lo.worst_receiver_mcs(7), 2, "clamp to the weak receiver");
-        assert_eq!(NdrCapability::default().worst_receiver_mcs(6), 6, "floor: our cap unchanged");
+        assert_eq!(
+            NdrCapability::default().worst_receiver_mcs(6),
+            6,
+            "floor: our cap unchanged"
+        );
     }
 
     #[test]
@@ -316,17 +338,31 @@ mod tests {
         // Minimal LP packet: 0x64 { 0x50 <interest> }.
         let mut w = TlvWriter::new();
         w.write_nested(ndn_packet::tlv_type::LP_PACKET, |w| {
-            w.write_tlv(ndn_packet::tlv_type::LP_FRAGMENT, &[0x05u8, 0x02, 0x07, 0x00]);
+            w.write_tlv(
+                ndn_packet::tlv_type::LP_FRAGMENT,
+                &[0x05u8, 0x02, 0x07, 0x00],
+            );
         });
         let lp = w.finish();
-        let cap = NdrCapability { max_rate: Some(5), hop: true, phys: 0b101, ..Default::default() };
+        let cap = NdrCapability {
+            max_rate: Some(5),
+            hop: true,
+            phys: 0b101,
+            ..Default::default()
+        };
         let spliced = splice_into_lp_wire(lp.clone(), &cap);
         assert_ne!(spliced, lp, "the field was added");
         assert_eq!(extract_from_lp_wire(&spliced), Some(cap));
         // A floor capability is a no-op (a sender may omit it).
-        assert_eq!(splice_into_lp_wire(lp.clone(), &NdrCapability::default()), lp);
+        assert_eq!(
+            splice_into_lp_wire(lp.clone(), &NdrCapability::default()),
+            lp
+        );
         // Re-splice overwrites (hop-local), still one field.
-        let cap2 = NdrCapability { max_rate: Some(2), ..Default::default() };
+        let cap2 = NdrCapability {
+            max_rate: Some(2),
+            ..Default::default()
+        };
         let re = splice_into_lp_wire(spliced, &cap2);
         assert_eq!(extract_from_lp_wire(&re), Some(cap2));
     }
@@ -334,7 +370,10 @@ mod tests {
     #[test]
     fn store_is_soft_state_floor_on_stale_or_absent() {
         let mut s = CapabilityStore::new(1_000, 8);
-        let c = NdrCapability { max_rate: Some(5), ..Default::default() };
+        let c = NdrCapability {
+            max_rate: Some(5),
+            ..Default::default()
+        };
         assert_eq!(s.get(42, 0), None, "absent -> floor");
         s.observe(42, c, 1_000);
         assert_eq!(s.get(42, 1_500), Some(c), "fresh within stale_ms");

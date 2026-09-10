@@ -48,6 +48,11 @@ jobs:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
           ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896 # pinned sibling; bump deliberately
           path: ndn-radio-drivers
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-ext
+          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
       - uses: Swatinem/rust-cache@v2
@@ -74,6 +79,11 @@ jobs:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
           ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896 # pinned sibling; bump deliberately
           path: ndn-radio-drivers
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-ext
+          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
       - uses: Swatinem/rust-cache@v2

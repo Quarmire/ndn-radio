@@ -253,8 +253,12 @@ impl RadioControl {
     ) -> Arc<std::sync::RwLock<Option<ndn_radio_cognition::TxParams>>> {
         let cell = Arc::new(std::sync::RwLock::new(None));
         let cap = self.medium.lock().unwrap().capability(radio);
-        self.actuators
-            .push(Arc::new(LibUsbActuator::new(radio, knobs, cell.clone(), cap)));
+        self.actuators.push(Arc::new(LibUsbActuator::new(
+            radio,
+            knobs,
+            cell.clone(),
+            cap,
+        )));
         cell
     }
 
@@ -1362,7 +1366,10 @@ mod tests {
         c.set_active(vec![ctx]);
         c.tick_now(1_000);
         let applied = mock.last.read().unwrap().unwrap();
-        assert!(applied.params.edcca_ignore(), "urgent + busy ⇒ ignore EDCCA");
+        assert!(
+            applied.params.edcca_ignore(),
+            "urgent + busy ⇒ ignore EDCCA"
+        );
     }
 
     /// ★ The class axes must DECIDE something, not merely be stored.
@@ -1474,7 +1481,11 @@ mod tests {
         let ctxs = t.active_contexts(1_100);
         let hi = *ctxs.iter().find(|c| c.prefix_hash == 0xAA).unwrap();
         let lo = *ctxs.iter().find(|c| c.prefix_hash == 0xBB).unwrap();
-        assert_eq!(hi.priority(), lo.priority(), "same class: the tracker grants none");
+        assert_eq!(
+            hi.priority(),
+            lo.priority(),
+            "same class: the tracker grants none"
+        );
         assert!(
             hi.demand_rank().get() > lo.demand_rank().get(),
             "the rank is MEASURED: {} vs {}",

@@ -98,12 +98,16 @@ pub fn ranked_phys(set: PhyModeSet) -> impl Iterator<Item = (PhyMode, PhyRole)> 
 /// The advertised [`PhyRole::Reach`] mode — the **rendezvous PHY**: where a node goes when it is
 /// unsure, and the only mode it will sit in while hearing nothing.
 pub fn rendezvous_phy(set: PhyModeSet) -> Option<PhyMode> {
-    ranked_phys(set).find(|(_, r)| *r == PhyRole::Reach).map(|(m, _)| m)
+    ranked_phys(set)
+        .find(|(_, r)| *r == PhyRole::Reach)
+        .map(|(m, _)| m)
 }
 
 /// The advertised [`PhyRole::Rate`] mode.
 pub fn fastest_phy(set: PhyModeSet) -> Option<PhyMode> {
-    ranked_phys(set).find(|(_, r)| *r == PhyRole::Rate).map(|(m, _)| m)
+    ranked_phys(set)
+        .find(|(_, r)| *r == PhyRole::Rate)
+        .map(|(m, _)| m)
 }
 
 /// A short stable name for a mode — for a rationale/trace field and for env-var wiring.
@@ -460,7 +464,8 @@ impl PhyDial {
         if st.confirmations < self.cfg.min_confirmations {
             return (st.current, PhyHold::Confirming);
         }
-        if st.last_switch_ms != 0 && now_ms.saturating_sub(st.last_switch_ms) < self.cfg.min_dwell_ms
+        if st.last_switch_ms != 0
+            && now_ms.saturating_sub(st.last_switch_ms) < self.cfg.min_dwell_ms
         {
             return (st.current, PhyHold::CoolDown);
         }
@@ -511,7 +516,15 @@ mod tests {
         peer: bool,
         t: u64,
     ) -> (Option<PhyMode>, PhyHold) {
-        d.evaluate(offer(), Some(PhyMode::Lora), rssi, ANCHOR, &granted(prio), peer, t)
+        d.evaluate(
+            offer(),
+            Some(PhyMode::Lora),
+            rssi,
+            ANCHOR,
+            &granted(prio),
+            peer,
+            t,
+        )
     }
 
     /// Drive `d` onto the rate PHY with a decisive link, returning the instant the switch
@@ -535,7 +548,11 @@ mod tests {
         assert_eq!(phy_role(PhyMode::Flrc), Some(PhyRole::Rate));
         for m in (0u8..32).map(PhyMode::from_code) {
             if m != PhyMode::Lora && m != PhyMode::Flrc {
-                assert_eq!(phy_role(m), None, "{m:?} must not be ranked without evidence");
+                assert_eq!(
+                    phy_role(m),
+                    None,
+                    "{m:?} must not be ranked without evidence"
+                );
                 assert_eq!(phy_peak_bps(m), None);
             }
         }
@@ -713,10 +730,22 @@ mod tests {
         assert_eq!(d.penalty_db(), 0.0);
 
         // Nobody is heard any more. Just before the timeout, we are still out there.
-        let (m, _) = eval(&d, Some(-40), Priority::Bulk, false, t0 + cfg.peer_silence_ms - 1);
+        let (m, _) = eval(
+            &d,
+            Some(-40),
+            Priority::Bulk,
+            false,
+            t0 + cfg.peer_silence_ms - 1,
+        );
         assert_eq!(m, Some(PhyMode::Flrc));
         // At the timeout: retreat, immediately, without waiting for confirmations.
-        let (m, why) = eval(&d, Some(-40), Priority::Bulk, false, t0 + cfg.peer_silence_ms);
+        let (m, why) = eval(
+            &d,
+            Some(-40),
+            Priority::Bulk,
+            false,
+            t0 + cfg.peer_silence_ms,
+        );
         assert_eq!(m, Some(PhyMode::Lora));
         assert_eq!(why, PhyHold::PeerSilence);
         assert_eq!(d.penalty_db(), cfg.silence_penalty_db, "the excursion cost");
@@ -746,7 +775,10 @@ mod tests {
         let t0 = engage(&d);
         // Two failed excursions: retreat, re-engage after the cool-down, retreat again.
         let t1 = t0 + cfg.peer_silence_ms;
-        assert_eq!(eval(&d, Some(-40), Priority::Bulk, false, t1).1, PhyHold::PeerSilence);
+        assert_eq!(
+            eval(&d, Some(-40), Priority::Bulk, false, t1).1,
+            PhyHold::PeerSilence
+        );
         assert_eq!(d.penalty_db(), cfg.silence_penalty_db);
 
         // Peers come back and are heard constantly — but the penalty may only shed one
@@ -761,7 +793,13 @@ mod tests {
         );
         // A full cool-down later, one excursion's worth is forgiven — and only one.
         for i in 0..50u64 {
-            eval(&d, Some(-95), Priority::Bulk, true, t1 + cfg.min_dwell_ms + i);
+            eval(
+                &d,
+                Some(-95),
+                Priority::Bulk,
+                true,
+                t1 + cfg.min_dwell_ms + i,
+            );
         }
         assert_eq!(d.penalty_db(), 0.0);
     }

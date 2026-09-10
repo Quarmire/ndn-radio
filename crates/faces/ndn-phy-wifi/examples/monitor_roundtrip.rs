@@ -35,11 +35,11 @@ mod imp {
 
     use bytes::Bytes;
     use ndn_coding::{FecPolicy, segment_payload};
-    use ndn_phy_wifi::{AfPacketBackend, FrameFormat, McsDescriptor, WifiPhy};
     use ndn_packet::encode::{DataBuilder, encode_interest, ensure_nonce};
     use ndn_packet::fragment::ReassemblyBuffer;
     use ndn_packet::lp::extract_fragment;
     use ndn_packet::{Data, Interest, Name};
+    use ndn_phy_wifi::{AfPacketBackend, FrameFormat, McsDescriptor, WifiPhy};
     use ndn_transport::FaceId;
 
     /// Recover a network-layer packet (Interest/Data) from a wire the

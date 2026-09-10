@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ndn_phy_ble::{AdvBackend, BlePhy, EXTENDED_ADV_MTU, LoopbackAdvBus};
 use ndn_packet::encode::DataBuilder;
+use ndn_phy_ble::{AdvBackend, BlePhy, EXTENDED_ADV_MTU, LoopbackAdvBus};
 use ndn_transport::{Face, FaceId};
 
 #[tokio::test]

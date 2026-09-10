@@ -460,7 +460,10 @@ mod tests {
         let b = SoftPrefixReachStrategy::new(Mode::Defer);
         let sa: Vec<u64> = (0..8).map(|_| a.draw().to_bits()).collect();
         let sb: Vec<u64> = (0..8).map(|_| b.draw().to_bits()).collect();
-        assert_ne!(sa, sb, "two instances must not share an identical draw stream");
+        assert_ne!(
+            sa, sb,
+            "two instances must not share an identical draw stream"
+        );
     }
 
     /// …but the stream stays reproducible given an explicit identity, so a scenario is repeatable.

@@ -207,6 +207,9 @@ mod tests {
             inner_name(&mk(0)).map(ndn_name_to_slash).as_deref(),
             Some(&b"/a/b"[..])
         );
-        assert!(inner_name(&mk(1)).is_none(), "a continuation fragment carries no Name");
+        assert!(
+            inner_name(&mk(1)).is_none(),
+            "a continuation fragment carries no Name"
+        );
     }
 }

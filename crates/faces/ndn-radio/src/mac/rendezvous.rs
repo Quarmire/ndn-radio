@@ -93,8 +93,12 @@ impl Rendezvous {
     /// widened by the guard each side. A sleeper wakes for this; a sender aims TX at it.
     pub fn phase_window_us(&self, clear_prefix_hash: u64, now_us: u64) -> (u64, u64) {
         let slot_us = self.epoch_us / self.slots;
-        let base = self.epoch(now_us) * self.epoch_us + self.phase_slot(clear_prefix_hash, now_us) * slot_us;
-        (base.saturating_sub(self.guard_us), base + slot_us + self.guard_us)
+        let base = self.epoch(now_us) * self.epoch_us
+            + self.phase_slot(clear_prefix_hash, now_us) * slot_us;
+        (
+            base.saturating_sub(self.guard_us),
+            base + slot_us + self.guard_us,
+        )
     }
 
     /// Is `now_us` inside this name's (guard-widened) listen window?
@@ -112,8 +116,8 @@ impl Rendezvous {
         let slot_us = self.epoch_us / self.slots;
         // Search this epoch's window then the next epoch's (the slot may already be past this epoch).
         for e in [self.epoch(now_us), self.epoch(now_us) + 1] {
-            let start = e * self.epoch_us
-                + self.phase_slot(clear_prefix_hash, e * self.epoch_us) * slot_us;
+            let start =
+                e * self.epoch_us + self.phase_slot(clear_prefix_hash, e * self.epoch_us) * slot_us;
             let win_start = start.saturating_sub(self.guard_us);
             if win_start >= now_us {
                 return win_start - now_us;
@@ -151,10 +155,15 @@ mod tests {
         let a = prefix_hash(&[b"ndn", b"bulk"]);
         let e0 = 5 * RENDEZVOUS_EPOCH_US + 100;
         let e0b = 5 * RENDEZVOUS_EPOCH_US + RENDEZVOUS_EPOCH_US - 1;
-        assert_eq!(r.channel(a, e0), r.channel(a, e0b), "channel holds across one epoch");
+        assert_eq!(
+            r.channel(a, e0),
+            r.channel(a, e0b),
+            "channel holds across one epoch"
+        );
         // Over many epochs it visits more than one channel (spectral reuse).
-        let seen: std::collections::BTreeSet<u8> =
-            (0..300).map(|e| r.channel(a, e * RENDEZVOUS_EPOCH_US)).collect();
+        let seen: std::collections::BTreeSet<u8> = (0..300)
+            .map(|e| r.channel(a, e * RENDEZVOUS_EPOCH_US))
+            .collect();
         assert!(seen.len() > 1, "channel rotates across epochs");
     }
 
@@ -170,6 +179,9 @@ mod tests {
         let a = prefix_hash(&[b"ndn", b"sleepy"]);
         let now = 7_000_003u64;
         let wait = r.next_window_us(a, now);
-        assert!(r.in_listen_window(a, now + wait), "next_window_us lands inside the window");
+        assert!(
+            r.in_listen_window(a, now + wait),
+            "next_window_us lands inside the window"
+        );
     }
 }

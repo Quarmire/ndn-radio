@@ -21,11 +21,11 @@ use std::time::Duration;
 
 use ndn_app::{EngineAppExt, EngineBuilder};
 use ndn_engine::builder::EngineConfig;
+use ndn_packet::Name;
+use ndn_packet::encode::DataBuilder;
 use ndn_phy_ble::{BlePhy, SharedBleBackend};
 use ndn_phy_wifi::WifiPhy;
 use ndn_radio::{PhyKind, Radio, TransportPhy, WirelessPhy};
-use ndn_packet::Name;
-use ndn_packet::encode::DataBuilder;
 use ndn_radio_drivers::{Esp32SerialBackend, FrameIo};
 use ndn_strategy_reach as _; // force-link so `soft-prefix-reach-defer` is in the registry (linkme)
 use ndn_transport::FaceId;

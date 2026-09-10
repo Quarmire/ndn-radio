@@ -535,10 +535,7 @@ impl SchedParams {
             .to_le_bytes()
             .iter()
             .for_each(|b| mix(*b));
-        self.class_digest
-            .to_le_bytes()
-            .iter()
-            .for_each(|b| mix(*b));
+        self.class_digest.to_le_bytes().iter().for_each(|b| mix(*b));
         h
     }
 }
@@ -585,7 +582,6 @@ fn nonce_u64(n: &[u8; 6]) -> u64 {
 fn id_nonce(id: u8) -> u64 {
     (1u64 << 63) | id as u64
 }
-
 
 /// The 3-byte tag that marks a [`FaceScheduler`] time-beacon on the wire, chosen to not collide with
 /// an NDN packet's first byte (Interest `0x05` / Data `0x06` / LP `0x64`). Followed by the master's
@@ -2015,7 +2011,7 @@ impl FaceScheduler {
         if comps.is_empty() {
             return None;
         }
-        let refs: Vec<&[u8]> = comps.iter().copied().collect();
+        let refs: Vec<&[u8]> = comps.to_vec();
         Some((prefix_hash(&refs), LeaseClass::Bulk))
     }
 
@@ -3006,7 +3002,11 @@ mod tests {
         );
 
         // A wire with no parseable Name is ambient — nothing to attribute.
-        assert_eq!(s.name_group(b"\xff not parseable"), None, "unparseable is ambient");
+        assert_eq!(
+            s.name_group(b"\xff not parseable"),
+            None,
+            "unparseable is ambient"
+        );
     }
 
     /// **D3 regression — the slot key is shared across heterogeneous registration tables.** The roles
@@ -3220,11 +3220,10 @@ mod tests {
         );
         let mut caught = 0usize;
         for idx in 1..=ndn_radio_cognition::ephemeral_id::COMMITMENT_SLICES {
-            let flags =
-                ndn_radio_cognition::ephemeral_id::encode_commitment_slice(
-                    defector.class_commitment(),
-                    idx,
-                );
+            let flags = ndn_radio_cognition::ephemeral_id::encode_commitment_slice(
+                defector.class_commitment(),
+                idx,
+            );
             if honest.slice_indicates_divergence(flags) {
                 caught += 1;
             }
@@ -3252,12 +3251,10 @@ mod tests {
     /// ordering — a false positive is how a detector's information content goes to zero.
     #[test]
     fn the_class_commitment_is_order_independent() {
-        let a = GroupTable::new(&[b"/aa".as_slice(), b"/bb".as_slice(), b"/cc".as_slice()],
-        )
-        .with_latency_unauthorised(&[b"/aa".as_slice(), b"/cc".as_slice()]);
-        let b = GroupTable::new(&[b"/cc".as_slice(), b"/bb".as_slice(), b"/aa".as_slice()],
-        )
-        .with_latency_unauthorised(&[b"/cc".as_slice(), b"/aa".as_slice()]);
+        let a = GroupTable::new(&[b"/aa".as_slice(), b"/bb".as_slice(), b"/cc".as_slice()])
+            .with_latency_unauthorised(&[b"/aa".as_slice(), b"/cc".as_slice()]);
+        let b = GroupTable::new(&[b"/cc".as_slice(), b"/bb".as_slice(), b"/aa".as_slice()])
+            .with_latency_unauthorised(&[b"/cc".as_slice(), b"/aa".as_slice()]);
 
         // Premise: the entry sequences really do differ (equal lengths ⇒ insertion order survives).
         let seq = |t: &GroupTable| -> Vec<Vec<u8>> {
@@ -3327,8 +3324,7 @@ mod tests {
     #[test]
     fn with_no_reserved_lanes_the_class_is_not_committed() {
         let prefixes = [b"/alarm".as_slice(), b"/bulk".as_slice()];
-        let promoted =
-            GroupTable::new(&prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]);
+        let promoted = GroupTable::new(&prefixes).with_latency_unauthorised(&[b"/bulk".as_slice()]);
         assert_eq!(
             promoted.class_digest(false),
             0,
@@ -3362,12 +3358,8 @@ mod tests {
     /// latent rather than impossible, and a latent silent divergence is worth making loud.
     #[test]
     fn a_shallower_than_depth_registration_is_committed() {
-        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn".as_slice()],
-            2,
-        ));
-        let exact = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn/x".as_slice()],
-            2,
-        ));
+        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn".as_slice()], 2));
+        let exact = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn/x".as_slice()], 2));
         let a = mk_lane_sched(shallow);
         let b = mk_lane_sched(exact);
 
@@ -3733,11 +3725,21 @@ mod tests {
 
         // Hardware TSF clock (10 us guard) with a 1 ms-bounded transmitter: actuation is 100x the
         // clock term, so the clock upgrade is invisible in the schedule.
-        let (g_hw_prompt, _, lat_hw_prompt) = geom(ClockSource::Hardware, T::PromptBounded { max_delay_ns: 1_000_000 });
+        let (g_hw_prompt, _, lat_hw_prompt) = geom(
+            ClockSource::Hardware,
+            T::PromptBounded {
+                max_delay_ns: 1_000_000,
+            },
+        );
         assert_eq!(g_hw_prompt, 10 + 1_000);
 
         // Same clock, but a bearer that places TX in hardware to 10 us (the C5 class).
-        let (g_hw_sched, _, lat_hw_sched) = geom(ClockSource::Hardware, T::ScheduledAt { granularity_ns: 10_000 });
+        let (g_hw_sched, _, lat_hw_sched) = geom(
+            ClockSource::Hardware,
+            T::ScheduledAt {
+                granularity_ns: 10_000,
+            },
+        );
         assert_eq!(g_hw_sched, 10 + 10);
 
         // The scheduled bearer must give strictly lower access latency on the same clock.
@@ -3748,7 +3750,12 @@ mod tests {
 
         // And upgrading ONLY the clock, while keeping the 1 ms transmitter, barely moves it —
         // the measurement that says where to spend effort.
-        let (_, _, lat_wall_prompt) = geom(ClockSource::Wall, T::PromptBounded { max_delay_ns: 1_000_000 });
+        let (_, _, lat_wall_prompt) = geom(
+            ClockSource::Wall,
+            T::PromptBounded {
+                max_delay_ns: 1_000_000,
+            },
+        );
         assert!(
             lat_wall_prompt - lat_hw_prompt <= 8,
             "clock upgrade under a 1 ms transmitter is marginal: {lat_wall_prompt} ms -> {lat_hw_prompt} ms"
@@ -3758,7 +3765,6 @@ mod tests {
             "airtime {air} us | wall+prompt {lat_wall_prompt} ms | hw+prompt {lat_hw_prompt} ms | hw+scheduled {lat_hw_sched} ms"
         );
     }
-
 
     /// **Can we hit <10 ms access, and where?** Pins the geometry that answers it, so the tradeoff
     /// is a fact in the test suite rather than a claim in a commit message.
@@ -3771,17 +3777,34 @@ mod tests {
         use ndn_radio_hal::TxDiscipline as T;
         let geom = |mtu: usize, clock: ClockSource, d: T, n: u64, stride: u64| {
             let g = clock.guard_us() + actuation_guard_us(d);
-            let s = SlotSchedule::from_airtime(mtu_airtime_us(mtu), g, n)
-                .with_reserved_stride(stride);
-            (s.slot_us(), s.bulk_access_period_us() / 1000, s.urgent_access_bound_us().map(|u| u / 1000))
+            let s =
+                SlotSchedule::from_airtime(mtu_airtime_us(mtu), g, n).with_reserved_stride(stride);
+            (
+                s.slot_us(),
+                s.bulk_access_period_us() / 1000,
+                s.urgent_access_bound_us().map(|u| u / 1000),
+            )
         };
 
         // The RTL8733BU as measured: PromptBounded{4 ms}. Actuation dominates, so the slot floor is
         // ~5 ms and even stride-2 lanes cannot get urgent traffic under 10 ms.
-        let (slot_wifi, bulk_wifi, urgent_wifi) =
-            geom(1500, ClockSource::Hardware, T::PromptBounded { max_delay_ns: 4_000_000 }, 8, 2);
-        assert!(slot_wifi >= 4_900, "8733b slot is actuation-bound: {slot_wifi} us");
-        assert!(urgent_wifi.unwrap() >= 9, "stride-2 on this bearer is ~10 ms: {urgent_wifi:?}");
+        let (slot_wifi, bulk_wifi, urgent_wifi) = geom(
+            1500,
+            ClockSource::Hardware,
+            T::PromptBounded {
+                max_delay_ns: 4_000_000,
+            },
+            8,
+            2,
+        );
+        assert!(
+            slot_wifi >= 4_900,
+            "8733b slot is actuation-bound: {slot_wifi} us"
+        );
+        assert!(
+            urgent_wifi.unwrap() >= 9,
+            "stride-2 on this bearer is ~10 ms: {urgent_wifi:?}"
+        );
 
         // The REAL hardware-scheduled bearers, at their own DECLARED granularities — both measured
         // and conservatively rounded up in their backends, so these are numbers a deployment can
@@ -3790,24 +3813,61 @@ mod tests {
         // comfortably under it.)
         //   Esp32SerialBackend  ScheduledAt{200 µs}  — measured <=190 µs, esp_wifi_80211_tx latency
         //   Bw16SerialBackend   ScheduledAt{ 20 µs}  — measured 10 µs submit error over 15 frames
-        let (_, bulk_sched, urgent_sched) =
-            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 2);
-        assert!(bulk_sched < 10, "C5 at full MTU squeaks under 10 ms: {bulk_sched} ms");
-        assert!(urgent_sched.unwrap() <= 3, "and urgent to ~2.4 ms: {urgent_sched:?} ms");
+        let (_, bulk_sched, urgent_sched) = geom(
+            1500,
+            ClockSource::Hardware,
+            T::ScheduledAt {
+                granularity_ns: 200_000,
+            },
+            8,
+            2,
+        );
+        assert!(
+            bulk_sched < 10,
+            "C5 at full MTU squeaks under 10 ms: {bulk_sched} ms"
+        );
+        assert!(
+            urgent_sched.unwrap() <= 3,
+            "and urgent to ~2.4 ms: {urgent_sched:?} ms"
+        );
         // The BW16's tighter 20 µs buys ~1.5 ms of superframe back at the same MTU.
-        let (_, bulk_bw16, _) =
-            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 20_000 }, 8, 2);
-        assert!(bulk_bw16 < bulk_sched, "20 µs beats 200 µs: {bulk_bw16} vs {bulk_sched} ms");
+        let (_, bulk_bw16, _) = geom(
+            1500,
+            ClockSource::Hardware,
+            T::ScheduledAt {
+                granularity_ns: 20_000,
+            },
+            8,
+            2,
+        );
+        assert!(
+            bulk_bw16 < bulk_sched,
+            "20 µs beats 200 µs: {bulk_bw16} vs {bulk_sched} ms"
+        );
 
         // Shrinking the frame the slot is sized for compounds it — the airtime term is the only
         // other lever once actuation is gone.
-        let (_, bulk_small, urgent_small) =
-            geom(300, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 2);
+        let (_, bulk_small, urgent_small) = geom(
+            300,
+            ClockSource::Hardware,
+            T::ScheduledAt {
+                granularity_ns: 200_000,
+            },
+            8,
+            2,
+        );
         assert!(bulk_small <= 4, "small-MTU C5: bulk {bulk_small} ms");
 
         // No lanes reserved => no guarantee to report, only a load-dependent period.
-        let (_, _, none) =
-            geom(1500, ClockSource::Hardware, T::ScheduledAt { granularity_ns: 200_000 }, 8, 0);
+        let (_, _, none) = geom(
+            1500,
+            ClockSource::Hardware,
+            T::ScheduledAt {
+                granularity_ns: 200_000,
+            },
+            8,
+            0,
+        );
         assert!(none.is_none(), "stride 0 must report no guarantee");
 
         println!(
@@ -3816,5 +3876,4 @@ mod tests {
              BW16(20us): bulk {bulk_bw16}ms | C5+300B: bulk {bulk_small}ms urgent {urgent_small:?}ms"
         );
     }
-
 }
