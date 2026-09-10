@@ -31,7 +31,7 @@ const RATE_BUCKETS: usize = 4096;
 /// source nonce** (`[u8;6]`, §2) to throttle one source, and keyed on the **routable prefix** (`u64`)
 /// to bound the aggregate across all sources — the two limits doctrine §3.2 pairs. Per-nonce catches
 /// a single flooder; per-prefix catches a distributed one that mints fresh nonces. Buckets live in a
-/// fixed hash-indexed array (see [`RATE_BUCKETS`]) so the limiter's memory is O(1) regardless of how
+/// fixed hash-indexed array (see `RATE_BUCKETS`) so the limiter's memory is O(1) regardless of how
 /// many distinct keys an attacker manufactures.
 pub struct RateLimiter<K: Hash + Eq + Copy> {
     capacity: f64,
@@ -95,7 +95,7 @@ impl<K: Hash + Eq + Copy> RateLimiter<K> {
     }
 
     /// Number of occupied buckets (for the source limiter, the attacker's nonce cost — saturating at
-    /// [`RATE_BUCKETS`] once the fixed table fills, which is the whole point of the bound).
+    /// `RATE_BUCKETS` once the fixed table fills, which is the whole point of the bound).
     pub fn keys(&self) -> usize {
         self.buckets.iter().filter(|b| b.is_some()).count()
     }

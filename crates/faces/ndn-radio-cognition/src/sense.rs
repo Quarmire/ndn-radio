@@ -430,7 +430,7 @@ impl MediumState {
     }
 
     /// Fold a per-radio ambient inbound RSSI reading (no neighbour identity). Unlike
-    /// [`observe_rx`] this creates no neighbour entry — it feeds only the cold-start
+    /// [`Self::observe_rx`] this creates no neighbour entry — it feeds only the cold-start
     /// `weakest_rssi` fallback, never `receiver_count`.
     pub fn observe_radio_rssi(&mut self, radio: RadioId, rssi_dbm: Option<i8>, _now_ms: u64) {
         if let Some(r) = rssi_dbm {

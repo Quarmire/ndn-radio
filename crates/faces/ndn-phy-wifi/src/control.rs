@@ -143,7 +143,7 @@ impl RadioControl {
     }
 
     /// Install the host's name→demand-key mapper (typically FIB longest-prefix match).
-    /// Call once at mount, before wrapping in an `Arc`. See [`PrefixKeyFn`].
+    /// Call once at mount, before wrapping in an `Arc`. See `PrefixKeyFn`.
     pub fn set_prefix_key(&mut self, f: PrefixKeyFn) {
         self.prefix_key = Some(f);
     }
@@ -392,8 +392,8 @@ impl RadioControl {
     /// A due reception report, wrapped as a DigestSha256 Data on
     /// `/localhop/radio/report/<node>` and LP-framed, ready to hand to the medium's
     /// `send_bytes`. `None` when no report is due (interval not elapsed / reports off).
-    /// The name here is the same prefix [`is_report_name`] matches on ingress, so a
-    /// neighbour routes it to [`ingest_report`] rather than the demand path. Reports
+    /// The name here is the same prefix `is_report_name` matches on ingress, so a
+    /// neighbour routes it to [`Self::ingest_report`] rather than the demand path. Reports
     /// are bounded, so this is always a single LP fragment.
     pub fn broadcast_report_frame(&self) -> Option<Bytes> {
         let content = self.outgoing_report(self.now_ms())?;
@@ -495,7 +495,7 @@ impl RadioControl {
     }
 
     /// Declare this node's own RX capability (highest HT/VHT MCS the best local radio
-    /// decodes, or [`ndn_radio_cognition::report::LEGACY_ONLY_RX`]). Stamped into
+    /// decodes, or [`ndn_radio_cognition::LEGACY_ONLY_RX`]). Stamped into
     /// outgoing reception reports so peers cap the data rate they reach us at.
     pub fn set_self_rx_mcs(&self, max_rx_mcs: u8) {
         self.medium.lock().unwrap().set_self_rx_mcs(max_rx_mcs);
@@ -569,7 +569,7 @@ impl RadioControl {
     /// background sampler ([`spawn_occupancy_sampler`]) over the actuator's own
     /// `knobs` handle, so the same radio that ACTs also SENSEs its medium. Call
     /// once the control plane is shared (`Arc`), typically right after
-    /// [`libusb_actuator`](Self::libusb_actuator). Timestamps come from the
+    /// `libusb_actuator`. Timestamps come from the
     /// control's own start clock. Returns the task handle (drop to detach).
     pub fn start_occupancy_sampling(
         self: &Arc<Self>,

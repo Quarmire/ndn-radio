@@ -109,7 +109,7 @@ impl DemandTracker {
     /// traffic class gets attached, and it is attached from what was actually observed — PIT
     /// fan-out and re-expression — rather than from anything a sender said. The *ceiling* half
     /// stays `Normal` here: this tracker has no authority and is not entitled to grant one, so a
-    /// caller with a [`ClassAuthority`] applies [`NameContext::with_ceiling`] on top. Without one,
+    /// caller with a [`crate::ClassAuthority`] applies [`NameContext::with_ceiling`] on top. Without one,
     /// `Normal` with a real rank is the correct answer.
     pub fn active_contexts(&self, now_ms: u64) -> Vec<NameContext> {
         self.prefixes

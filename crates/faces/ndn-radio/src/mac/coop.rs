@@ -29,7 +29,7 @@
 //! These are a spectrum of *how much state you spend to avoid flooding*. This module
 //! prototypes **(b)** as the baseline, because it always works (no convergence, no
 //! bootstrap), it is what (a) and (c) refine, and it composes directly with the CCLF
-//! suppression already in [`RadioPolicy`](crate::RadioPolicy) and the name-group
+//! suppression already in `RadioPolicy` and the name-group
 //! receive filter. The **scope** a node volunteers is the cooperation-vs-power dial:
 //! empty = pure leaf that relays nothing; broad = backbone.
 //!

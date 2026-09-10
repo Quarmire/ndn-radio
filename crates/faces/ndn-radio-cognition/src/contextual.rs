@@ -84,8 +84,8 @@ pub const ARMS: [Arm; 5] = [
 /// Apply an arm to a baseline [`TxParams`], clamped to the radio's capability.
 ///
 /// ★ `db_per_power_idx` is the radio's own MEASURED dB-per-index step
-/// ([`RadioCapability::db_per_power_idx`]) and `power_floor` its monotone floor
-/// ([`RadioCapability::min_tx_power`]). Both must come from the part, not from a constant: a single
+/// (`RadioCapability::db_per_power_idx`) and `power_floor` its monotone floor
+/// (`RadioCapability::min_tx_power`). Both must come from the part, not from a constant: a single
 /// global 0.5 dB/step was MEASURED wrong on every radio it was applied to (2x on the a81a, 4x on
 /// the RTL8733BU, non-linear on the RTL8812AU). **A radio with no measured scale gets no power
 /// arm** — the bandit must not be allowed to "explore" an axis whose units it does not know, since

@@ -327,8 +327,8 @@ fn wire_name(wire: &[u8]) -> Option<ndn_packet::Name> {
 }
 
 /// A **learning** [`PhyPolicy`] — the soft-prefix-reach prior applied to *phy selection*. It holds a
-/// decaying per-`(prefix, phy)` reach weight, reinforced from RX ([`observe_delivery`](PhyPolicy::
-/// observe_delivery)) — "Data for this prefix came back on that phy" — and on TX it sends the name out the
+/// decaying per-`(prefix, phy)` reach weight, reinforced from RX ([`PhyPolicy::observe_delivery`]) —
+/// "Data for this prefix came back on that phy" — and on TX it sends the name out the
 /// **highest-reach phy** once one is trusted, or **all** phys while the prefix is cold (exploration).
 /// Decay lets a producer that moves to another phy be re-discovered (the warm phy fades → re-explore).
 /// This is the culmination: in a *single* medium the prior's accuracy was delivery-neutral (defer+cancel did

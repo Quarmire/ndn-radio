@@ -9,7 +9,7 @@
 //! Nothing here is specific to one driver or one PHY. Two mechanisms are probed,
 //! in order:
 //!
-//! 1. **A driver debugfs knob** taking a plain decimal dBm value ([`DRIVER_KNOBS`]).
+//! 1. **A driver debugfs knob** taking a plain decimal dBm value (`DRIVER_KNOBS`).
 //!    This exists because the standards path frequently does *not* work on the
 //!    interfaces named-radio actually transmits on: on a monitor vif the driver's
 //!    `get_txpower` has no chanctx and nl80211 reports a stale regulatory number,
@@ -86,7 +86,7 @@ enum Mechanism {
 }
 
 /// The generic mac80211 control seam: channel + absolute dBm power over an
-/// interface name, with no driver-specific code above the [`DRIVER_KNOBS`] table.
+/// interface name, with no driver-specific code above the `DRIVER_KNOBS` table.
 ///
 /// Built by [`discover`](Self::discover), which never fails — a radio where
 /// nothing is found simply reports [`tx_power_range`](Self::tx_power_range) as
@@ -195,7 +195,7 @@ fn phy_name(iface: &str) -> Option<String> {
     Some(fs::read_to_string(p).ok()?.trim().to_string())
 }
 
-/// Search a phy's debugfs for any knob in [`DRIVER_KNOBS`].
+/// Search a phy's debugfs for any knob in `DRIVER_KNOBS`.
 ///
 /// Drivers place their knobs inconsistently — some directly under the phy dir,
 /// some in a subdirectory named after the driver — so both are checked rather

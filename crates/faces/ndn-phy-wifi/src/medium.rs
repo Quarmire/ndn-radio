@@ -226,7 +226,7 @@ impl RadioBearer {
     /// visible instead of letting a hand-written `RadioCapability` quietly outrank the hardware".
     /// Nothing read it, so that contract was itself unactuated: every consumer saw the asserted
     /// `cap` and the radio's self-description sat unused on the struct. The hardware wins here, and
-    /// [`RunningMedium::spawn`] logs the disagreement rather than resolving it silently.
+    /// `RunningMedium::spawn` logs the disagreement rather than resolving it silently.
     pub fn effective_cap(&self) -> RadioCapability {
         match &self.profile {
             Some(p) => p.capability(),
@@ -246,7 +246,7 @@ impl RadioBearer {
         self
     }
 
-    /// A **Wi-Fi** bearer — the same thing, upcasting the (now marker) [`WifiRadio`]
+    /// A **Wi-Fi** bearer — the same thing, upcasting the (now marker) `WifiRadio`
     /// handle to the bearer-agnostic data-plane view. Kept as a convenience for
     /// callers holding an `Arc<dyn FrameIo>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
@@ -613,7 +613,7 @@ pub(crate) fn apply_knobs(
     Ok(())
 }
 
-/// The medium's **actuator**: applies one radio's slice of a [`RadioPlan`] each tick.
+/// The medium's **actuator**: applies one radio's slice of a [`ndn_radio_cognition::RadioPlan`] each tick.
 ///
 /// The transmit **rate is set as driver state** via [`FrameIo::set_rate`] — the
 /// decided MCS reaches the air because the driver holds it and every `inject` uses it
@@ -1043,7 +1043,7 @@ impl RadioMediumFace {
     }
 
     /// Choose each data frame's **exact rate** rather than leaving it as bearer state: the
-    /// cognitive control plane's decided [`TxParams`] when `planned` carries one, else `policy`
+    /// cognitive control plane's decided [`ndn_radio_cognition::TxParams`] when `planned` carries one, else `policy`
     /// (adaptive from observed RSSI, or fixed).
     ///
     /// This closes #82's last one-sided feature. `WifiPhy` could act on a decided MCS and

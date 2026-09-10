@@ -181,7 +181,7 @@ impl GroupTable {
     /// registered `/x` now agree on the slot for a frame under `/x/y/z`, where the old
     /// longest-registered-prefix key silently disagreed. Distinct prefixes that truncate to the same
     /// slot group are deduplicated — they share one slot, the coarsening the shared granularity
-    /// intends. `slot_depth` MUST equal the scheduler's [`SchedParams::slot_depth`], or TX and RX key
+    /// intends. `slot_depth` MUST equal the scheduler's `SchedParams::slot_depth`, or TX and RX key
     /// slots at different depths; that coupling is exactly what `SchedParams` exists to pin.
     pub fn new_with_depth(prefixes: &[impl AsRef<[u8]>], slot_depth: usize) -> Self {
         let depth = slot_depth.max(1);
@@ -219,7 +219,7 @@ impl GroupTable {
     ///
     /// **Neither route enforces anything, and neither is meant to.** What makes the class safe is
     /// that the resulting assignment is pinned by [`class_digest`](Self::class_digest) into
-    /// [`SchedParams`], so a node classifying differently from its neighbours is *detectable* on the
+    /// `SchedParams`, so a node classifying differently from its neighbours is *detectable* on the
     /// beacon instead of silent.
     #[must_use]
     pub fn with_latency_unauthorised(mut self, prefixes: &[impl AsRef<[u8]>]) -> Self {
@@ -279,7 +279,7 @@ impl GroupTable {
     /// **The class commitment** (D2) — an order-independent digest of everything in this table that
     /// makes its slot map differ from the shared, table-free one, and of nothing else.
     ///
-    /// [`SchedParams`] pinned the lane *count* (`reserved`) and nothing about the *assignment*, so a
+    /// `SchedParams` pinned the lane *count* (`reserved`) and nothing about the *assignment*, so a
     /// node that unilaterally promoted its own prefixes to [`LeaseClass::Latency`] emitted a beacon
     /// digest **identical** to an honest neighbour's and `beacon_indicates_partition` never fired —
     /// while its frames were placed in, and its co-owner witnesses filed against, different slots
@@ -448,10 +448,10 @@ pub struct SchedParams {
     pub class_digest: u64,
 }
 
-/// Current [`SchedParams`] wire version. Bump when the pinned set changes.
+/// Current `SchedParams` wire version. Bump when the pinned set changes.
 ///
-/// **2** — adds [`class_digest`](SchedParams::class_digest), the #93 lease-class assignment.
-/// `version` is the first thing [`digest`](SchedParams::digest) mixes, so every v1 digest differs
+/// **2** — adds `class_digest`, the #93 lease-class assignment.
+/// `version` is the first thing `digest` mixes, so every v1 digest differs
 /// from every v2 digest: a v1 and a v2 node read each other as partitioned even where their maps in
 /// fact agree. That is the correct semantics and must not be softened by a "mix it only when
 /// non-empty" shim — a v1 node has **no field** for the assignment, so its digest cannot distinguish
@@ -875,7 +875,7 @@ impl FaceScheduler {
     /// regardless. Now the capability carries the measured retune cost and this refuses the
     /// configuration, loudly, rather than producing plausible garbage.
     ///
-    /// An *unmeasured* radio ([`RadioCapability::retune_us`] = `None`) is also refused. That is the
+    /// An *unmeasured* radio ([`ndn_radio_hal::RadioCapability::retune_us`] = `None`) is also refused. That is the
     /// conservative reading and the one consistent with the rest of this layer: we do not know what
     /// hopping costs here, so we do not silently pay it.
     #[must_use]
@@ -955,7 +955,7 @@ impl FaceScheduler {
         }
     }
 
-    /// The [`SchedParams`] map digest a time-beacon carries, if present. Legacy 11-byte beacons return
+    /// The `SchedParams` map digest a time-beacon carries, if present. Legacy 11-byte beacons return
     /// `None` (no signal — not a false match).
     pub fn parse_beacon_map_digest(payload: &[u8]) -> Option<u64> {
         if payload.len() >= TIME_BEACON_MAGIC.len() + 16 && payload[..3] == TIME_BEACON_MAGIC {
@@ -967,7 +967,7 @@ impl FaceScheduler {
         }
     }
 
-    /// The [`SchedParams`] version a time-beacon carries in the clear, if present. `None` for a
+    /// The `SchedParams` version a time-beacon carries in the clear, if present. `None` for a
     /// pre-v2 (<= 19-byte) beacon — which is itself the answer "older than the version field", not a
     /// missing signal.
     pub fn parse_beacon_params_version(payload: &[u8]) -> Option<u16> {
@@ -990,11 +990,11 @@ impl FaceScheduler {
     /// partitioned, so its presence / busy / ownership evidence lands in different slots than ours.
     ///
     /// Since v2 that includes a neighbour who **classifies names differently** — the #93 lease class
-    /// is part of the pin ([`SchedParams::class_digest`]). Use
+    /// is part of the pin (`SchedParams::class_digest`). Use
     /// [`parse_beacon_params_version`](Self::parse_beacon_params_version) to separate "older pinned
     /// set" from "different lane policy"; the flag itself does not distinguish them.
     /// Detection only — the design corrects nothing here; it is the honest signal that a deployment
-    /// mixed incompatible [`SchedParams`]. An absent digest (legacy beacon) is no signal, not a match.
+    /// mixed incompatible `SchedParams`. An absent digest (legacy beacon) is no signal, not a match.
     ///
     /// ⚠ **Scope: the clock MASTER only.** The beacon task is spawned behind
     /// [`is_master`](Self::is_master), so this catches a defecting master, and misconfiguration on
@@ -1017,7 +1017,7 @@ impl FaceScheduler {
     ///
     /// ⚠ **21 bits, not 64 — this must never be published as catching a deliberate defector.** See
     /// [`ephemeral_id::fold_commitment`](ndn_radio_cognition::ephemeral_id::fold_commitment): the
-    /// 32 -> 64 widening of [`SchedParams::class_digest`] was bought because a 32-bit collision was
+    /// 32 -> 64 widening of `SchedParams::class_digest` was bought because a 32-bit collision was
     /// forged offline in ~10 s, and a 21-bit fold is forgeable instantly. It catches a neighbour
     /// whose configuration HONESTLY differs, which is the #93 scenario.
     ///
@@ -1798,7 +1798,7 @@ impl FaceScheduler {
     /// non-NDN frame) is passed straight through. `robust` control frames should bypass entirely
     /// (the caller decides) — reports/discovery must not wait on a data slot.
     /// The **delay** (µs from now) until `wire`'s next owned slot opens — the domain-independent form of
-    /// the gate for a radio that schedules TX in hardware ([`TxDiscipline::ScheduledAt`]). Returns `0` when
+    /// the gate for a radio that schedules TX in hardware ([`ndn_radio_hal::TxDiscipline::ScheduledAt`]). Returns `0` when
     /// the frame owns the slot now (transmit immediately), or `None` when it is not slot-schedulable (no
     /// name-group / no slot schedule) so the caller transmits now. A *delay* rather than an absolute instant
     /// is what makes this reconcile-free: the device applies it against its own clock, so the offset between
@@ -1812,8 +1812,8 @@ impl FaceScheduler {
     }
 
     /// The hardware-scheduled-TX decision, all in one place: `Some(delay_us)` — hand this frame to
-    /// [`FrameIo::inject_after`] instead of software-gating — only when the bearer can place TX in hardware
-    /// ([`TxDiscipline::ScheduledAt`], e.g. the ESP32-C5) AND the operator opted in with `NDN_SCHED_HW_TX=1`.
+    /// [`ndn_radio_hal::FrameIo::inject_after`] instead of software-gating — only when the bearer can place TX in hardware
+    /// ([`ndn_radio_hal::TxDiscipline::ScheduledAt`], e.g. the ESP32-C5) AND the operator opted in with `NDN_SCHED_HW_TX=1`.
     /// `None` ⇒ fall back to the software [`gate`](Self::gate), so every existing (BestEffort / Wall-clock)
     /// deployment is byte-for-byte unaffected — this is a pure opt-in fast path.
     pub fn hw_slot_wait(&self, wire: &[u8]) -> Option<u64> {

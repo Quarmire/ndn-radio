@@ -390,8 +390,8 @@ impl RatePolicy {
 /// This is now a *builder*, not a second data plane. Every frame it sends and receives goes through
 /// the medium's `TxBearer` / reader task; nothing about addressing, filtering, coding, batching or
 /// rate lives here any more. What remains is the ergonomics that made this type worth keeping: the
-/// one-call constructors for a single radio ([`espnow`](Self::espnow), [`halow`](Self::halow),
-/// [`open_libusb`](Self::open_libusb)) and a builder chain that reads in single-radio terms.
+/// one-call constructors for a single radio ([`espnow`](Self::espnow), `halow`,
+/// `open_libusb`) and a builder chain that reads in single-radio terms.
 ///
 /// #82 called for collapsing the two faces because "the right model has the fewer features", and
 /// that is what happened — but only after the features were reconciled one at a time, because each

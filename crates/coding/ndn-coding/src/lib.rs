@@ -19,7 +19,7 @@
 //!            GF(2^8) + systematic K-of-N codec
 //! ```
 //!
-//! The [`endpoint`] layer (default feature `endpoint`) is the ergonomic
+//! The `endpoint` layer (feature `endpoint`, off by default) is the ergonomic
 //! producer/consumer API built on `ndn-app`. The core (codec + field +
 //! encoder/decoder + assembler) carries no async runtime and is what an
 //! embedded or in-browser build pulls with `--no-default-features`.
@@ -51,8 +51,8 @@
 //! - [`fec`] — systematic K-of-N encoder/decoder over `bytes::Bytes`.
 //! - [`segmenter`] — `segment_payload`: payload → K source + (N−K) parity.
 //! - [`assembler`] — `CodedAssembler`: absorb any K of N, recover payload.
-//! - [`endpoint`] — `CodedProducer` / `CodedFetcher` (feature `endpoint`).
-//! - [`mgmt`] — `/localhost/nfd/coding/{set,unset,list}` policy backend.
+//! - `endpoint` — `CodedProducer` / `CodedFetcher` (feature `endpoint`).
+//! - `mgmt` — `/localhost/nfd/coding/{set,unset,list}` policy backend.
 //! - [`config`] — `serde` shapes for TOML `[[coding.policy]]` blocks.
 //! - `recode` — F2 core: descriptor/vector codec, `GenerationBuffer`,
 //!   verify-on-decode, fingerprint/token (feature `f2-recode`).

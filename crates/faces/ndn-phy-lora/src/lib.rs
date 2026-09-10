@@ -6,7 +6,7 @@
 //! airtime measured in the hundreds of milliseconds per frame, so a lost frame is
 //! expensive to notice and expensive to re-request. Its rate knobs are *bearer
 //! state*, not per-frame arguments — spreading factor / coding rate / bandwidth are
-//! set out-of-band through [`RadioKnobs`](ndn_radio_hal::RadioKnobs) — which makes
+//! set out-of-band through [`RadioKnobs`] — which makes
 //! it the textbook case for the bearer-agnostic
 //! [`LinkFecBridge`](ndn_coding::link_fec_bridge): the face mounts the bridge with a
 //! plain-inject sink (no per-generation pin) and the cognitive plane's
@@ -541,9 +541,9 @@ impl LoraPhy {
     }
 
     /// Enable **plan-driven link FEC**: source frames batch into generations of `k`
-    /// (or [`LORA_FEC_K`]), transmitted as `k + R` coded frames where `R` is the
+    /// (or `LORA_FEC_K`), transmitted as `k + R` coded frames where `R` is the
     /// plan's [`link_fec_redundancy`], recoverable from any `k` of the `n`. `window`
-    /// bounds a partial generation's tail-flush (default [`LORA_FEC_WINDOW`]).
+    /// bounds a partial generation's tail-flush (default `LORA_FEC_WINDOW`).
     ///
     /// The initial `R` is 0 — the real value comes from the plan per frame, so a
     /// face with no plan cell transmits plain (no parity) until one is attached.
@@ -652,7 +652,7 @@ impl LoraPhy {
     ///
     /// Both ends compute the SAME list from the same name + key + band plan and nothing is
     /// negotiated, which is what makes this work on a broadcast bearer — see
-    /// [`name_hop_plan`](ndn_radio_cognition::name_hop_plan) for the inputs that may and may not
+    /// [`name_hop_plan`] for the inputs that may and may not
     /// enter that derivation (local occupancy may not).
     ///
     /// `period` is in the radio's own unit
