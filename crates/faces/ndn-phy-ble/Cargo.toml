@@ -49,35 +49,9 @@ ndn-strategy-reach = { path = "../../strategies/ndn-strategy-reach" }
 
 [lints]
 workspace = true
-
-[[example]]
-name = "ble_c5"
-required-features = ["serial"]
-
 [[example]]
 name = "ble_roundtrip"
 required-features = ["serial"]
-
-[[example]]
-name = "shared_mux"
-required-features = ["shared-mux"]
-
-[[example]]
-name = "ble_engine"
-required-features = ["shared-mux"]
-
-[[example]]
-name = "wireless_c5"
-required-features = ["shared-mux"]
-
 [[example]]
 name = "wireless_c5_engine"
 required-features = ["shared-mux"]
-
-[[example]]
-name = "wireless_c5_relay"
-required-features = ["shared-mux"]
-
-[[example]]
-name = "ble_c6_mac"
-required-features = ["shared-mux", "mac"]

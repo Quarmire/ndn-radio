@@ -23,8 +23,6 @@ occupancy-sampler = ["dep:tokio", "dep:tracing"]
 [dependencies]
 ndn-radio = { path = "../ndn-radio" }
 ndn-frame-io = { workspace = true }
-ndn-packet   = { workspace = true }
-ndn-tlv      = { workspace = true }
 ndn-signals-core = { workspace = true }
 # The shared radio HAL contract — home of the `RadioCapability` descriptor +
 # `Band`/`RadioKind`/`TimingModel` (re-exported through `src/sense.rs`).

@@ -84,11 +84,6 @@ ndn-coding = { path = "../../coding/ndn-coding", default-features = false, featu
 ndn-nan = { workspace = true }
 ndn-nan-core = { workspace = true }
 ndn-face-wifi-aware = { workspace = true }
-
-[[example]]
-name = "c5_slot"
-required-features = ["serial-radio"]
-
 [[example]]
 name = "airtime_ab_onair"
 required-features = ["dev-examples"]
@@ -96,143 +91,9 @@ required-features = ["dev-examples"]
 [[example]]
 name = "airtime_ab"
 required-features = ["dev-examples"]
-
-[[example]]
-name = "ampdu_flood"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "bisect_bringup"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "burst_fork"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "bw16_ndn"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "c2h_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "cal_dump"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "cal_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "campaign_p5"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "cr_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "dbm_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "efuse_rfe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "espnow_libusb"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "espnow_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "face_batch"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "fec_fork"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "force_golden_flood"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "freq_agile"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "halow_ndn"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "id_deconflict"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "inject_mcs"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "inject8812au"
-required-features = ["dev-examples"]
-
 [[example]]
 name = "monitor_roundtrip"
 required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_bench"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_cognition"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_frameio"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_fwload"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_qosdiag"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_rx"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_sizetest"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_throughput"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_tx"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_txdiag"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_txring"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "mt7612_usbagg"
-required-features = ["dev-examples"]
-
 [[example]]
 name = "named_radio_face"
 required-features = ["dev-examples"]
@@ -240,119 +101,12 @@ required-features = ["dev-examples"]
 [[example]]
 name = "nan_ndp"
 required-features = ["dev-examples"]
-
-[[example]]
-name = "nan_s23"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "nav_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "ndn8733b"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "occupancy_onair"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "pa_heat"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "pinmux_check"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "pwr_sweep8812au"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "reach_fork"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "reception_rx"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "replay_full"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "report_listen"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rfe_dump"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rtl_modeswitch"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rx_ambient"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rx_igi"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rx_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "rx_pump_test"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "sched_cv_airtest"
-required-features = ["libusb-backend", "dev-examples"]
-
-[[example]]
-name = "size_fork"
-required-features = ["dev-examples"]
-
 [[example]]
 name = "slot_ab_onair"
 required-features = ["dev-examples"]
-
-[[example]]
-name = "slot_airtest"
-required-features = ["libusb-backend", "dev-examples"]
-
 [[example]]
 name = "spectrum_scan"
 required-features = ["dev-examples"]
-
-[[example]]
-name = "thermal_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "tone_hold"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "tx_flood"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "tx_liveness"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "tx_onair"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "usb_list"
-required-features = ["dev-examples"]
-
 [[example]]
 # ★ M8 split `usb_probe` (1084 lines, ~27 flags, doc comment "List USB devices") in two:
 # `bringup_probe` runs any part's canonical PLAN with `--skip` / `--stop-after` / `--poke`, and
@@ -360,29 +114,8 @@ required-features = ["dev-examples"]
 # refutation written into the plan step it was testing.
 name = "bringup_probe"
 required-features = ["dev-examples"]
-
 [[example]]
 name = "regs"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "usb_reset"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "watchdog_probe"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "whoami"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "whoami8812au"
-required-features = ["dev-examples"]
-
-[[example]]
-name = "whoami8821c"
 required-features = ["dev-examples"]
 
 [lints]
