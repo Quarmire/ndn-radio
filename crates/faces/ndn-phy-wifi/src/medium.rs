@@ -1215,6 +1215,33 @@ impl GateCounts {
 static TXD_DONE_OK: AtomicU64 = AtomicU64::new(0);
 static TXD_DONE_ERR: AtomicU64 = AtomicU64::new(0);
 static TXD_LOGGER: std::sync::Once = std::sync::Once::new();
+
+/// A snapshot of the radio TX-egress pipeline counters (actual injected frames), for observability.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TxEgressSnapshot {
+    /// Frames that entered the egress path.
+    pub enter: u64,
+    /// Frames injected successfully.
+    pub done_ok: u64,
+    /// Frames whose inject returned an error.
+    pub done_err: u64,
+    /// `MostRobust` frames that bypassed the stored rate (sent at the basic rate).
+    pub bypassed: u64,
+}
+
+/// Read the radio TX-egress counters. These are the ACTUAL injected-frame accounting, distinct from
+/// the forwarder's per-face `out` — which counts only FORWARDED traffic, not the cognition
+/// self-reports the control loop injects directly. Surfaced in the `[named-radio]` `ext/list`
+/// telemetry so an operator sees real radio TX instead of an `out=0` that looks like silence
+/// (field 2026-09-10, when a drone's face `out=0` masked 61 injected reports).
+pub fn tx_egress_snapshot() -> TxEgressSnapshot {
+    TxEgressSnapshot {
+        enter: TXD_ENTER.load(Ordering::Relaxed),
+        done_ok: TXD_DONE_OK.load(Ordering::Relaxed),
+        done_err: TXD_DONE_ERR.load(Ordering::Relaxed),
+        bypassed: TXD_BYPASS.load(Ordering::Relaxed),
+    }
+}
 fn txd_start_logger() {
     TXD_LOGGER.call_once(|| {
         tokio::spawn(async move {

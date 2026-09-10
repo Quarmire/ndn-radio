@@ -64,6 +64,14 @@ impl ControlSurface for RadioCognitionSurface {
         let t = self.control.telemetry();
         let mut e: Vec<(String, String)> = Vec::new();
 
+        // --- Actual radio TX egress (distinct from the forwarder's per-face `out`, which counts
+        //     only FORWARDED traffic; cognition self-reports are injected directly). Surfaced so
+        //     `out=0` is never misread as a silent radio (field 2026-09-10). ---
+        let tx = crate::medium::tx_egress_snapshot();
+        e.push(("radio_tx_injected_ok".into(), tx.done_ok.to_string()));
+        e.push(("radio_tx_injected_err".into(), tx.done_err.to_string()));
+        e.push(("radio_tx_robust_bypassed".into(), tx.bypassed.to_string()));
+
         // --- Aggregate cognition state ---
         e.push(("strategy".into(), t.strategy.into()));
         e.push(("managed_objects".into(), t.managed_objects.to_string()));
