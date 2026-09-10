@@ -391,12 +391,12 @@ fn build_afpacket(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>,
     let channels: Vec<u8> = spec.channel.into_iter().collect();
     let (fmt, cap) = if spec.driver == "halow" {
         (
-            FrameFormat::RawNdnS1g { ethertype: 0x8624 },
+            FrameFormat::RawNdnS1g { ethertype: crate::NDN_ETHERTYPE },
             RadioCapability::wifi_halow_s1g(channels),
         )
     } else {
         (
-            FrameFormat::RawNdn { ethertype: 0x8624 },
+            FrameFormat::RawNdn { ethertype: crate::NDN_ETHERTYPE },
             RadioCapability::wifi_monitor_5ghz(channels),
         )
     };

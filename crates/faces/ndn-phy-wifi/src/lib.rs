@@ -195,6 +195,13 @@ pub use channel_manager::ChannelManager;
 /// peer (e.g. an ESP32-C5) can parse. Built by [`WifiPhy::espnow`].
 pub const ESPNOW_MTU: usize = ESPNOW_MAX_BODY;
 
+/// The NDN-over-Ethernet ethertype used across the stack. Both ends must agree on
+/// it — the RX parse validates this value in the LLC/SNAP header. Single source of
+/// truth for every `FrameFormat::RawNdn*` this crate constructs (Linux AF_PACKET
+/// bearers: monitor 5 GHz + HaLow S1G).
+#[cfg(target_os = "linux")]
+pub(crate) const NDN_ETHERTYPE: u16 = 0x8624;
+
 /// **What a coded generation pins to the frame that opened it: its whole on-air identity.**
 ///
 /// One sink serves both faces (#82). Before this, each had its own: `WifiPhy` pinned
@@ -534,8 +541,7 @@ impl WifiPhy {
     /// frequency for interop).
     #[cfg(target_os = "linux")]
     pub fn halow(id: FaceId, iface: &str, channels: Vec<u8>) -> Result<Self, FaceError> {
-        // 0x8624 = the NDN-over-Ethernet ethertype used across the stack; both ends must agree on it
-        // (the RX parse validates the LLC/SNAP ethertype). Advertise absolute dBm power control when
+        // Advertise absolute dBm power control when
         // this interface actually has it (Morse and Newracom S1G parts both expose a dBm knob), so a
         // control plane registering this capability decides power in link budget rather than in chip
         // index units. Absent on a radio where nothing was found.
@@ -543,7 +549,7 @@ impl WifiPhy {
         if let Some(r) = crate::dbm_power::Mac80211Knobs::discover(iface).tx_power_range() {
             cap = cap.with_tx_power_dbm(r);
         }
-        let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: 0x8624 })
+        let backend = AfPacketBackend::new(iface, FrameFormat::RawNdnS1g { ethertype: NDN_ETHERTYPE })
             .map_err(FaceError::Io)?
             .with_capability(cap.clone());
         Ok(Self::over(id, Arc::new(backend), cap))
