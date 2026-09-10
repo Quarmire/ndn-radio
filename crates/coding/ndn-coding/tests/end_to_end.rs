@@ -4,6 +4,10 @@
 //! real `Producer` and `Consumer` against an embedded
 //! `ForwarderEngine`. Mirrors the pattern in
 //! `crates/ndn-app/tests/embedded.rs`.
+//!
+//! Gated by `endpoint`: this round-trip needs the native forwarder (`ndn-app`/`ndn-engine`),
+//! which the codec core does not depend on by default (see ndn-radio-hal/PORTING.md).
+#![cfg(feature = "endpoint")]
 
 use std::collections::HashMap;
 use std::sync::Arc;

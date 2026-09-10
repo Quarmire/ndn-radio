@@ -95,6 +95,7 @@ pub mod link_fec_feature;
 pub mod metadata;
 #[cfg(feature = "mgmt")]
 pub mod mgmt;
+mod prefix_table;
 pub mod policy;
 #[cfg(feature = "f2-recode")]
 pub mod recode;
