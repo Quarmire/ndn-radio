@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
-          ref: 469e45532a7e296d283c58c7c27ca827f4d95515 # pinned sibling; bump deliberately
+          ref: 33e4aa38cb5a90d3108823a8109dfd9f00e08931 # pinned sibling; bump deliberately
           path: ndn-radio-drivers
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
-          ref: 469e45532a7e296d283c58c7c27ca827f4d95515 # pinned sibling; bump deliberately
+          ref: 33e4aa38cb5a90d3108823a8109dfd9f00e08931 # pinned sibling; bump deliberately
           path: ndn-radio-drivers
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
