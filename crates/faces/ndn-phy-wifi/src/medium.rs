@@ -172,6 +172,39 @@ pub struct RadioBearer {
     pub channel: Option<u8>,
 }
 
+/// Merge a caller-asserted [`RadioCapability`] with the radio's own self-description.
+///
+/// The radio's answer outranks the caller's for **hardware facts** (MCS/NSS/BW/bands/payload/power)
+/// — those were guesses (the 2026-08-31 one-way-link fix). But `channels` is a **deployment policy**,
+/// not a fact the silicon can refute: a chip that CAN tune several channels (e.g. the MT7612U's
+/// `[6, 36]`) yet is pinned by config to one (`channel = 36`) must present just that channel to
+/// cognition. Otherwise `pick_channel` free-selects across the chip's whole tunable set — cross-band,
+/// off a pinned point-to-point link (field 2026-09-10: the GCS MT7612U oscillated ch6<->ch36 and the
+/// link never stabilised). So hardware facts come from the radio; the channel set comes from the
+/// caller (the config pin) intersected with the hardware's tunable set.
+fn effective_hw_cap(radio: &Arc<dyn FrameIo>, asserted: RadioCapability) -> RadioCapability {
+    match radio.radio_capability() {
+        Some(mut hw) => {
+            // Channels = the deployment pin (caller) INTERSECTED with what the hardware can tune.
+            // A config pin that is a subset (MT7612U pinned to ch36 of its `[6, 36]`) is honoured;
+            // a wrong-band guess (caller says ch149, an S1G radio really does ch1/2 — disjoint)
+            // falls back to the hardware's set. Empty intersection ⇒ the hardware wins, which also
+            // surfaces a pin the radio cannot satisfy instead of silently free-selecting.
+            let pinned: Vec<u8> = asserted
+                .channels
+                .iter()
+                .copied()
+                .filter(|c| hw.channels.contains(c))
+                .collect();
+            if !pinned.is_empty() {
+                hw.channels = pinned;
+            }
+            hw
+        }
+        None => asserted,
+    }
+}
+
 impl RadioBearer {
     /// A bearer over **any** [`FrameIo`] radio (LoRa, BLE, …).
     pub fn new(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
@@ -189,7 +222,7 @@ impl RadioBearer {
         // the common path is now correct by construction rather than by remembering to use the
         // other constructor. The caller's `cap` survives only where the radio cannot say — which,
         // among the shipping backends, is nowhere: all 14 implement `RadioProfile`.
-        let cap = radio.radio_capability().unwrap_or(cap);
+        let cap = effective_hw_cap(&radio, cap);
         Self {
             id,
             radio,
@@ -251,7 +284,7 @@ impl RadioBearer {
     /// callers holding an `Arc<dyn FrameIo>` from a driver.
     pub fn wifi(id: RadioId, radio: Arc<dyn FrameIo>, cap: RadioCapability) -> Self {
         // Same discovery as [`new`](Self::new): the radio's own answer outranks the caller's.
-        let cap = radio.radio_capability().unwrap_or(cap);
+        let cap = effective_hw_cap(&radio, cap);
         Self {
             id,
             radio,
@@ -3415,6 +3448,58 @@ mod tests {
             medium.capabilities(),
             vec![(RadioId(0), real)],
             "capabilities() is what a control plane registers — it must carry the radio's truth"
+        );
+    }
+
+    #[test]
+    fn a_config_pinned_channel_survives_the_radios_full_tunable_set() {
+        // Field 2026-09-10: the GCS MT7612U CAN tune [6, 36] but was deployed on ch36. Because the
+        // radio's self-description outranked the caller, cognition saw [6, 36] and `pick_channel`
+        // oscillated cross-band (ch6 is 2.4 GHz) off a pinned point-to-point link. The config pin
+        // must survive as a SUBSET of the hardware's tunable set; a disjoint (wrong-band) pin falls
+        // back to the hardware so an unsatisfiable pin is surfaced, not silently free-selected.
+        struct TwoChannel;
+        #[async_trait::async_trait]
+        impl FrameIo for TwoChannel {
+            async fn inject(&self, _f: InjectFrame) -> Result<(), FaceError> {
+                Ok(())
+            }
+            async fn recv_frame(&self) -> Result<crate::CapturedFrame, FaceError> {
+                std::future::pending().await
+            }
+            fn radio_capability(&self) -> Option<RadioCapability> {
+                Some(
+                    RadioCapability::wifi_monitor_5ghz(vec![6, 36])
+                        .with_wifi_caps(Some(9), Some(2)),
+                )
+            }
+        }
+
+        let pinned = RadioBearer::wifi(
+            RadioId(0),
+            Arc::new(TwoChannel),
+            RadioCapability::wifi_monitor_5ghz(vec![36]),
+        );
+        assert_eq!(
+            pinned.effective_cap().channels,
+            vec![36],
+            "the config pin (a subset of the tunable set) must win over the radio's full channel list"
+        );
+        assert_eq!(
+            pinned.effective_cap().max_mcs(),
+            9,
+            "hardware FACTS (mcs) still come from the radio — only the channel POLICY is the caller's"
+        );
+
+        let disjoint = RadioBearer::wifi(
+            RadioId(0),
+            Arc::new(TwoChannel),
+            RadioCapability::wifi_monitor_5ghz(vec![149]),
+        );
+        assert_eq!(
+            disjoint.effective_cap().channels,
+            vec![6, 36],
+            "a pin the radio cannot tune falls back to the hardware set (unsatisfiable pin surfaced)"
         );
     }
 }
