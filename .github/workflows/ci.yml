@@ -1,0 +1,88 @@
+name: CI — ndn-radio
+
+# CI for the named-radio MAC + PHY faces (P1): clippy + host unit/integration tests.
+#
+# ndn-radio path-deps ndn-rs (packet/tlv/transport/time) and ndn-radio-drivers
+# (HAL / frame-io) as `../` siblings, so every job checks those out next to
+# ndn-radio/. Siblings are pinned to known-good SHAs (bump deliberately) so a
+# sibling push cannot redden this gate. ⚠ These SHAs must be PUSHED to the
+# Quarmire remotes; on release, switch the path deps to { git, tag } and drop
+# the checkouts.
+#
+# Deliberately NOT run: the feature-gated on-air examples (dev-examples /
+# shared-mux / libusb-backend / serial-radio) need a radio on the bus — `--lib
+# --tests` excludes examples so CI stays host-only and fast.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    working-directory: ndn-radio
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: clippy (lib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-radio }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-rs
+          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          path: ndn-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-radio-drivers
+          ref: 469e45532a7e296d283c58c7c27ca827f4d95515 # pinned sibling; bump deliberately
+          path: ndn-radio-drivers
+      - name: Install system dependencies (libusb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-radio
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: clippy (workspace lib)
+        run: cargo clippy --workspace --lib
+
+  test:
+    name: host tests (workspace lib + integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ndn-radio }
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-rs
+          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          path: ndn-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ndn-radio-drivers
+          ref: 469e45532a7e296d283c58c7c27ca827f4d95515 # pinned sibling; bump deliberately
+          path: ndn-radio-drivers
+      - name: Install system dependencies (libusb)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ndn-radio
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # --lib --tests runs the unit + integration suites (incl. ndn-coding's
+      # policy/lpm + the mac facet/e2e-software tests) without building the
+      # hardware examples. ndn-coding's endpoint gate is exercised via its deps.
+      - name: unit + integration tests
+        run: cargo test --workspace --lib --tests
