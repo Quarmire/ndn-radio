@@ -93,9 +93,82 @@ impl ControlSurface for RadioCognitionSurface {
                 e.push((k("he"), a.params.he().to_string()));
                 e.push((k("tx_power"), opt(a.params.tx_power)));
                 e.push((k("link_fec"), opt(a.params.link_fec_redundancy)));
+                // ★ The two shared-medium claims, surfaced beside the decision so the ledger
+                // counters below have something to be compared AGAINST. They were absent: an
+                // operator could see the power back-off and the parity budget but not whether this
+                // node had stopped deferring to a busy channel — the loudest thing it can do.
+                e.push((k("edcca_ignore"), a.params.edcca_ignore().to_string()));
+                e.push((
+                    k("defer_threshold_dbm"),
+                    a.params
+                        .edcca_threshold_dbm
+                        .map(|(l2h, h2l)| format!("{l2h}/{h2l}"))
+                        .unwrap_or_else(|| "-".to_string()),
+                ));
                 e.push((k("suppress"), plan.suppress.to_string()));
                 e.push((k("relay"), plan.relay.to_string()));
                 e.push((k("objective"), format!("{:.4}", plan.objective)));
+                // Occupancy is keyed by the operating channel, which the plan holds.
+                if let Some(ch) = a.channel
+                    && let Some(busy) = self.control.busy_pct(a.radio, ch)
+                {
+                    e.push((k("occupancy_pct"), busy.to_string()));
+                }
+            }
+        }
+
+        // --- ACTUATOR-SIDE LEDGER (what actually reached silicon) ---
+        //
+        // The half the decision trace cannot supply. `contention.edcca_ignored` rising while every
+        // `radio.N.edcca_ignore` above reads `false` is a medium claim that did not come from this
+        // node's policy; `defer_threshold_clamped` is sharper still, because a threshold outside the
+        // decidable band cannot have been produced by `decide_edcca_threshold_dbm` at all. Not an
+        // equation — one decision fans out per radio and knobs are re-pushed only on change — so
+        // read them as "did this move at all". NOT MEASURED on air.
+        let led = ndn_radio_cognition::ledger::counts();
+        e.push((
+            "contention.edcca_ignored".into(),
+            led.edcca_ignored.to_string(),
+        ));
+        e.push((
+            "contention.defer_threshold_clamped".into(),
+            led.defer_threshold_clamped.to_string(),
+        ));
+        e.push((
+            "contention.fec_parity_over_generation".into(),
+            led.fec_parity_over_generation.to_string(),
+        ));
+
+        // --- Per-radio HARDWARE SUBSTRATE (what cognition acts on) ---
+        // The device capability + weakest recently-heard RSSI, distinct from the
+        // decided plan above. Keys the operator dashboard's Hardware view reads;
+        // chip name / driver / USB address / link-state / frame counters are not
+        // yet reachable from the control plane, so they are simply not emitted
+        // (the consumer renders them as "not reported").
+        for (id, cap, rssi) in self.control.radio_hardware() {
+            let id = id.0;
+            let k = |field: &str| format!("radio.{id}.{field}");
+            // `kind` is a radio *class* (WifiMonitor/Lora/…), the best chip label available.
+            e.push((k("chip"), format!("{:?}", cap.kind)));
+            e.push((
+                k("band"),
+                cap.bands
+                    .iter()
+                    .map(|b| format!("{b:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+            e.push((k("max_mcs"), cap.max_mcs().to_string()));
+            // No spatial-stream count on the capability; max_nss is the proxy.
+            e.push((k("rx_chains"), cap.max_nss().to_string()));
+            e.push((k("he_cap"), cap.he_cap.to_string()));
+            if let Some(dbm) = cap.tx_power_dbm {
+                e.push((k("dbm_max"), dbm.max.to_string()));
+            }
+            e.push((k("duty_max"), format!("{:.2}", cap.duty_cycle_max)));
+            e.push((k("rx_only"), cap.rx_only.to_string()));
+            if let Some(r) = rssi {
+                e.push((k("rssi_dbm"), r.to_string()));
             }
         }
 

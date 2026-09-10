@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use crate::plan::TxParams;
+use crate::policy::NameContext;
 
 /// dB per chip TXAGC index (mirrors the policy's power model).
 // See the note where this constant used to live in `policy.rs`: a single global dB-per-index step
@@ -153,7 +154,23 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(rssi_dbm: i8, busy_pct: u8, receivers: usize, priority: u8) -> Self {
+    /// Bin one situation for the bandit.
+    ///
+    /// ★ **Takes the [`NameContext`], not a bare `u8`.** The class arrived here as
+    /// `name_ctx.priority().rank()` — a private-field-protected enum flattened into an integer at
+    /// the crate boundary, so an external caller could hand the bandit any priority bucket it
+    /// liked. Converting it makes this consistent with `decide_adv_phy` and `PhyDial::evaluate`,
+    /// which take the context for the same reason.
+    ///
+    /// ⚠ **Billed as a CONSISTENCY fix, not a security fix.** The selected arm does reach live
+    /// `TxParams` (measured: a 2-MCS-step difference between arms), but ALL FIVE arms are reachable
+    /// from every priority bucket and the arm's effect is bounded by radio capability
+    /// (`apply_arm` clamps the MCS to `max_mcs` and the power to the part's own floor/ceiling), so
+    /// a forged bucket unlocked nothing — it could only mis-key the learning table and make the
+    /// bandit converge more slowly against itself. What the conversion buys is that the class has
+    /// ONE representation on the way in, so a future arm that *is* class-sensitive cannot be
+    /// reached by an unauthorised caller through a seam nobody remembered was open.
+    pub fn new(rssi_dbm: i8, busy_pct: u8, receivers: usize, name_ctx: &NameContext) -> Self {
         Self {
             rssi_bin: ((rssi_dbm as i32 + 95).clamp(0, 75) / 5) as u8, // 5 dB SNR bins
             occ_bin: (busy_pct / 25).min(3),
@@ -162,7 +179,7 @@ impl Context {
                 2 | 3 => 1,
                 _ => 2,
             },
-            priority: priority.min(2),
+            priority: name_ctx.priority().rank().min(2),
         }
     }
     fn key(&self) -> u32 {
@@ -292,6 +309,49 @@ mod tests {
         })
     }
 
+    /// **Surface C, and it is a CONSISTENCY fix, not a security fix.**
+    ///
+    /// The class used to arrive here as a bare `u8` (`name_ctx.priority().rank()` at the call site,
+    /// but any integer from anywhere else), which flattened a private-field-protected enum into a
+    /// forgeable integer at the crate boundary. It now arrives as the context, so the bucket is
+    /// always the GRANTED ceiling — including after a `capped_by`, which lowers with no inverse.
+    ///
+    /// It unlocks nothing: all five arms are reachable from every bucket and `apply_arm` bounds
+    /// each by radio capability. What it buys is one representation of the class on the way in.
+    ///
+    /// Falsified by binning anything other than `name_ctx.priority().rank()` — a constant, or a
+    /// re-introduced caller-supplied integer: the capped context then stops binning with the plain
+    /// one.
+    #[test]
+    fn the_bandit_bins_the_granted_class_not_an_asserted_one() {
+        use crate::policy::{ClassAuthority, ClassCeiling, Priority};
+        struct Urgent;
+        impl ClassAuthority for Urgent {
+            fn ceiling_for(&self, _h: u64) -> Priority {
+                Priority::Urgent
+            }
+        }
+        let h = 0xABu64;
+        let urgent = NameContext::new(h).with_ceiling(ClassCeiling::authorised(&Urgent, h));
+        let capped = urgent.capped_by(Priority::Normal);
+        let plain = NameContext::new(h);
+
+        let mut b = ContextualBandit::new(1.0);
+        b.update(&Context::new(-60, 0, 1, &urgent), 0, 1.0);
+
+        assert_eq!(b.pulls(&Context::new(-60, 0, 1, &urgent)), 1);
+        assert_eq!(
+            b.pulls(&Context::new(-60, 0, 1, &capped)),
+            0,
+            "a context whose ceiling was lowered must not read the class it once held"
+        );
+        assert_eq!(
+            b.pulls(&Context::new(-60, 0, 1, &capped)),
+            b.pulls(&Context::new(-60, 0, 1, &plain)),
+            "the bucket follows the granted ceiling, nothing else"
+        );
+    }
+
     #[test]
     fn reward_orders_outcomes_correctly() {
         // delivered beats missed
@@ -326,7 +386,7 @@ mod tests {
     #[test]
     fn converges_to_the_best_arm() {
         let mut b = ContextualBandit::new(0.5);
-        let ctx = Context::new(-60, 10, 1, 1);
+        let ctx = Context::new(-60, 10, 1, &NameContext::new(0x1));
         // arm 2 yields the best reward in this context; the rest are worse.
         for _ in 0..300 {
             let a = b.select(&ctx);
@@ -340,7 +400,7 @@ mod tests {
     #[test]
     fn explores_all_arms_before_exploiting() {
         let mut b = ContextualBandit::new(1.0);
-        let ctx = Context::new(-70, 0, 1, 1);
+        let ctx = Context::new(-70, 0, 1, &NameContext::new(0x1));
         let mut seen = [false; ARMS.len()];
         for _ in 0..ARMS.len() {
             let a = b.select(&ctx);
@@ -356,8 +416,8 @@ mod tests {
     #[test]
     fn contexts_learn_independently() {
         let mut b = ContextualBandit::new(0.5);
-        let weak = Context::new(-85, 0, 1, 1);
-        let strong = Context::new(-45, 0, 1, 1);
+        let weak = Context::new(-85, 0, 1, &NameContext::new(0x1));
+        let strong = Context::new(-45, 0, 1, &NameContext::new(0x1));
         assert_ne!(weak, strong);
         b.update(&strong, 2, -0.1);
         assert_eq!(b.pulls(&strong), 1);

@@ -27,19 +27,44 @@ use bytes::Bytes;
 use ndn_radio_drivers::SerialRadioBackend;
 use ndn_transport::FaceError;
 
-use crate::{AdvBackend, ScannedFrame};
+use crate::{AdvBackend, AdvPhy, ScannedFrame};
 
 /// A BLE [`AdvBackend`] over a shared [`SerialRadioBackend`] mux (see module docs). Broadcast and scan go
 /// through the mux's BLE methods; the coex split (`set_ble_share` / `spawn_demand_coex`) lives on the mux
 /// itself, since it governs *both* bearers.
 pub struct SharedBleBackend {
     mux: Arc<SerialRadioBackend>,
+    /// Which advertising PHYs the device behind this mux can actually transmit on.
+    ///
+    /// Declared at construction rather than probed, because the mux type is shared by two very
+    /// different radios: the ESP32-C5 has extended advertising and a coded PHY, while the RTL8720DN's
+    /// controller has neither (its LE feature mask reads `3d 01 …` — extended advertising bit clear).
+    /// Defaulting to 1M-only means a caller that has not said otherwise cannot silently ask a
+    /// legacy-only radio for a PHY it will ignore.
+    phys: &'static [AdvPhy],
 }
 
 impl SharedBleBackend {
     /// Wrap the shared mux (from `Esp32SerialBackend::shared_mux()`) as a BLE `AdvBackend`.
+    ///
+    /// Conservative by default: advertises only [`AdvPhy::Le1M`], the PHY every BLE receiver can hear.
+    /// Use [`new_esp32`](Self::new_esp32) when the device is an ESP32-C5, whose controller also has
+    /// LE 2M and LE Coded.
     pub fn new(mux: Arc<SerialRadioBackend>) -> Self {
-        Self { mux }
+        Self {
+            mux,
+            phys: &[AdvPhy::Le1M],
+        }
+    }
+
+    /// Wrap an **ESP32-C5** mux, declaring the PHYs its controller really has — including
+    /// [`AdvPhy::LeCoded`], the long-range one. MEASURED: coded delivered 20/20 to a capable peer
+    /// where 1M delivered 11/20, and 0/20 to a legacy-only peer that hears 1M perfectly.
+    pub fn new_esp32(mux: Arc<SerialRadioBackend>) -> Self {
+        Self {
+            mux,
+            phys: &[AdvPhy::Le1M, AdvPhy::Le2M, AdvPhy::LeCoded],
+        }
     }
 
     /// The underlying shared mux — for driving the coex split (`set_ble_share`/`spawn_demand_coex`) that
@@ -53,6 +78,29 @@ impl SharedBleBackend {
 impl AdvBackend for SharedBleBackend {
     async fn broadcast(&self, frame: Bytes) -> Result<(), FaceError> {
         self.mux.ble_broadcast(&frame)
+    }
+
+    fn adv_phys(&self) -> &'static [AdvPhy] {
+        self.phys
+    }
+
+    /// Select the advertising PHY, refusing one this device cannot transmit.
+    ///
+    /// The refusal is the point: 2M and Coded ride extended advertising PDUs only, so on a radio
+    /// without extended advertising the request would go out, be ignored, and leave cognition
+    /// believing it had bought range it did not get.
+    fn set_adv_phy(&self, phy: AdvPhy) -> Result<(), FaceError> {
+        if !self.phys.contains(&phy) {
+            return Err(FaceError::Io(std::io::Error::other(format!(
+                "this BLE bearer cannot advertise on {phy:?} (supports {:?})",
+                self.phys
+            ))));
+        }
+        self.mux.set_ble_phy(match phy {
+            AdvPhy::Le1M => 1,
+            AdvPhy::Le2M => 2,
+            AdvPhy::LeCoded => 3,
+        })
     }
 
     async fn next_scanned(&self) -> Result<ScannedFrame, FaceError> {

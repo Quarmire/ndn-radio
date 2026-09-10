@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::policy::NameContext;
+use crate::policy::{DemandRank, NameContext};
 use crate::sense::{Demand, Ewma};
 
 /// Tracks per-prefix demand from Interest/Data events, shadowing PIT in-records.
@@ -104,11 +104,21 @@ impl DemandTracker {
 
     /// Prefixes with live demand (fan-out > 0), as relayed [`NameContext`]s for the
     /// policy to decide on.
+    ///
+    /// ★ Each carries its measured [`DemandRank`]. This is the seam where the *ordering* half of a
+    /// traffic class gets attached, and it is attached from what was actually observed — PIT
+    /// fan-out and re-expression — rather than from anything a sender said. The *ceiling* half
+    /// stays `Normal` here: this tracker has no authority and is not entitled to grant one, so a
+    /// caller with a [`ClassAuthority`] applies [`NameContext::with_ceiling`] on top. Without one,
+    /// `Normal` with a real rank is the correct answer.
     pub fn active_contexts(&self, now_ms: u64) -> Vec<NameContext> {
         self.prefixes
             .iter()
             .filter(|(_, e)| e.fanout(self.pit_lifetime_ms, now_ms) > 0)
-            .map(|(&ph, _)| NameContext::relayed(ph))
+            .map(|(&ph, e)| {
+                let d = e.to_demand(self.pit_lifetime_ms, now_ms);
+                NameContext::relayed(ph).with_demand(DemandRank::from_demand(&d))
+            })
             .collect()
     }
 

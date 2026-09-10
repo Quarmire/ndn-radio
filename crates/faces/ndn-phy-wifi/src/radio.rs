@@ -22,6 +22,15 @@
 // #78: `OpenRadio` plus the timing/profile capability traits travel with the control plane — a
 // bearer built from the standardized opener carries all four, so they are re-exported together.
 pub use ndn_radio_hal::{Bandwidth, DbmRange, OpenRadio, RadioKnobs, RadioProfile, RadioTime};
+// ★ The power vocabulary travels with the knob that takes it. `RadioKnobs::set_tx_power` is
+// re-exported here, so `PowerRequest` (its argument) and `AppliedPower` (its answer) must be too —
+// otherwise a consumer crate that depends on `ndn-phy-wifi` alone (`ndn-fwd`, `ndn-radio-node`)
+// can see the method and cannot name what it takes, and reaches for a bare index again. That is
+// the 2026-09-03 defect's whole shape: a call whose meaning is not visible at the call site.
+pub use ndn_radio_hal::bringup::{
+    AppliedPower, BringUpReport, PowerReference, PowerRequest, PowerWrite, RateGroupPolicy,
+    RfAuthority,
+};
 
 // The `RadioKnobs` impls for the driver backends (`LibUsbRtl88xxBackend`,
 // `Mt7612uBackend`) moved into `ndn-radio-drivers` alongside the backend types —

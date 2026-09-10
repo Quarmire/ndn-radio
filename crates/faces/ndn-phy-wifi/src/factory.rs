@@ -241,6 +241,7 @@ fn build_bearer(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, F
         "loopback" => Ok(Some(build_loopback(rid, spec))),
         "rtl8822e" => build_rtl8822e(rid, spec),
         "af-packet" | "halow" => build_afpacket(rid, spec),
+        "esp32c5" | "c5" => build_esp32c5(rid, spec),
         _ => Ok(None),
     }
 }
@@ -257,29 +258,127 @@ fn build_loopback(rid: RadioId, spec: &RadioSpec) -> RadioBearer {
 
 #[cfg(feature = "libusb-backend")]
 fn build_rtl8822e(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
-    use crate::{FrameIo, LibUsbRtl88xxBackend};
+    use crate::FrameIo;
+    use ndn_radio_drivers::{BringUpRequest, DeviceSelect, open_radio};
     let ch = spec
         .channel
         .ok_or_else(|| invalid("rtl8822e requires channel="))?;
-    // Target `0bda:a81a` (RTL8812EU / 8822E-halmac) specifically — an 8812AU is also
-    // in `RTL88XX_PIDS`, so a plain `open()` can claim the wrong Realtek device.
-    let backend = Arc::new(
-        LibUsbRtl88xxBackend::open_monitor_pid(0xa81a, ch)
-            .map_err(|e| invalid(format!("{e:?}")))?,
-    );
+    // ★ **M8: ONE door.** This arm used to be `open_monitor_pid(0xa81a, ch)` — a two-call ladder
+    // that discarded the `BringUpReport` and, because it bypassed `open_named_radio`, silently
+    // had **no RX pump, no `NDN_RADIO_BW`, no `NDN_TX_PWR` and no `NDN_CCA_OFF`**. It now gets all
+    // four, and a bearer whose regime is on the record. That is a real behaviour change on a
+    // deployed node; it is written out in `open_radio`'s own doc comment.
+    //
+    // Target `0bda:a81a` (RTL8812EU / 8822E-halmac) specifically — an 8812AU is also in
+    // `RTL88XX_PIDS`, so a plain `open()` can claim the wrong Realtek device.
+    let mut req = BringUpRequest::from_env(ch);
     if let Some(p) = spec.tx_power {
-        let _ = backend.set_tx_power(p as u32);
+        // The spec's `tx-power=` now rides INTO the open, so the applied value lands in the
+        // report (and a refusal lands in `report.warnings`) instead of being a separate call whose
+        // result an earlier revision of this function discarded outright.
+        req.power = ndn_radio_hal::PowerRequest::index(p);
     }
-    let radio: Arc<dyn FrameIo> = backend;
-    Ok(Some(
-        RadioBearer::wifi(rid, radio, RadioCapability::wifi_monitor_5ghz(vec![ch]))
-            .with_channel(Some(ch)),
-    ))
+    let open = open_radio(0xa81a, &DeviceSelect::from_env(), &req)?;
+    tracing::info!(
+        target: "named_radio", radio = rid.0, plan = %open.report().plan,
+        plan_digest = format_args!("{:#018x}", open.report().plan_digest),
+        power = %open.report().state.power.render(),
+        "rtl8822e bearer opened"
+    );
+    // ★ **`with_knobs`, and the radio's OWN capability.** Without the first, this bearer had no
+    // control seam at all: the one-shot `spec.tx_power` was the only power this radio ever saw,
+    // and every runtime decision — power, channel, EDCCA, CSD — was computed, recorded as applied,
+    // and dropped.
+    //
+    // The capability swap matters independently: `wifi_monitor_5ghz` is a generic preset claiming
+    // **2x2 / MCS9 / 80 MHz**, while this part's own `RadioProfile` reports 1SS / MCS7 / 40 MHz
+    // (its userspace path has one RX chain). Advertising two streams to a peer that then rates its
+    // replies for two is exactly the mismatch MEASURED as a one-way link. The capability now comes
+    // out of the REPORT, which is where the plan put it — one fact, one place.
+    let cap = open
+        .report()
+        .capability
+        .clone()
+        .ok_or_else(|| invalid("rtl8822e: the bring-up report carries no capability"))?;
+    let radio: Arc<dyn FrameIo> = open.io.clone();
+    let mut bearer = RadioBearer::wifi(rid, radio, cap).with_channel(Some(ch));
+    if let Some(k) = open.knobs.clone() {
+        bearer = bearer.with_knobs(k);
+    }
+    Ok(Some(bearer))
 }
 
 #[cfg(not(feature = "libusb-backend"))]
 fn build_rtl8822e(_rid: RadioId, _spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
     Ok(None) // needs the `libusb-backend` feature (Linux userspace USB driver)
+}
+
+/// **ESP32-C5 over its serial bridge** — `esp32c5;iface=/dev/cu.usbmodemXXX[;channel=N][;tx-power=N]`.
+///
+/// This exists because the C5 was the most instrumented radio in the fleet and *not a radio cognition
+/// could actuate*: it had a rate knob, a calibrated dBm power knob, per-frame PHY metadata, hardware
+/// receive counters and channel profiling, but no arm here — so it only ever appeared in examples, and
+/// every decision the policy makes about MCS, power and channel landed on nothing.
+///
+/// Unlike the libusb arms this attaches the full capability set, not just `FrameIo`: `with_knobs` is
+/// what makes the policy's channel/power/rate decisions actuate, and `with_profile` carries the real
+/// dual-band capability so the planner can choose 5 GHz.
+#[cfg(feature = "serial-radio")]
+fn build_esp32c5(rid: RadioId, spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
+    use ndn_radio_hal::Bandwidth;
+    let port = spec
+        .iface
+        .as_deref()
+        .ok_or_else(|| invalid("esp32c5 requires iface=<serial port>"))?;
+    // ★ M6: the channel travels INTO the bring-up instead of being applied just after it. Same
+    // bytes on the wire — `PLAN_SERIAL_BRIDGE`'s `set_channel` rung is the same
+    // `RadioKnobs::set_channel(ch, Bw20)` this arm used to make itself — but now the tune is a
+    // reported rung and part of the plan digest, instead of an off-the-books call whose failure
+    // this function turned into a bare `?`. `spec.channel == None` sends nothing, as before.
+    let open = ndn_radio_drivers::Esp32SerialBackend::open_c5_radio_on(
+        port,
+        spec.channel.unwrap_or(0),
+        Bandwidth::Bw20,
+    )?;
+    let knobs = open
+        .knobs
+        .clone()
+        .ok_or_else(|| invalid("esp32c5 opened without knobs"))?;
+    if let Some(p) = spec.tx_power {
+        // The C5's power really is an absolute scale, so prefer the dBm knob and let the driver
+        // report what it actually applied — and then SAY what it applied. MEASURED: the IDF
+        // quantises to 11 discrete steps and 21 dBm applies as 20, so the requested value is not
+        // the transmitted one, and `let _ =` here discarded the only place that difference was
+        // visible. Same class as the 8812au's discarded `AppliedPower`, one bearer over.
+        match knobs.set_tx_power_dbm(p as i8) {
+            Ok(applied) => tracing::info!(
+                target: "named_radio", radio = rid.0, requested = p, applied,
+                "esp32c5: spec tx_power applied (dBm readback)"
+            ),
+            Err(e) => tracing::warn!(
+                target: "named_radio", radio = rid.0, requested = p, error = %e,
+                "esp32c5: spec tx_power refused — the radio is at whatever its bring-up left"
+            ),
+        }
+    }
+    let cap = open
+        .profile
+        .as_ref()
+        .map(|p| p.capability())
+        .unwrap_or_else(|| RadioCapability::wifi_monitor_dual_1ss(spec.channel.into_iter().collect()));
+    let mut bearer = RadioBearer::wifi(rid, open.io, cap).with_knobs(knobs);
+    if let Some(t) = open.time {
+        bearer = bearer.with_time(t);
+    }
+    if let Some(pr) = open.profile {
+        bearer = bearer.with_profile(pr);
+    }
+    Ok(Some(bearer.with_channel(spec.channel)))
+}
+
+#[cfg(not(feature = "serial-radio"))]
+fn build_esp32c5(_rid: RadioId, _spec: &RadioSpec) -> Result<Option<RadioBearer>, FaceError> {
+    Ok(None) // needs the `serial-radio` feature
 }
 
 #[cfg(target_os = "linux")]
@@ -376,5 +475,40 @@ mod tests {
             .expect("loopback medium builds");
         assert_eq!(transport.id(), FaceId(42));
         assert_eq!(transport.kind(), FaceKind::Wfb);
+    }
+}
+
+// ⚠ **Gated on the feature the arm itself is gated on.** `build_esp32c5` is
+// `#[cfg(feature = "serial-radio")]`; without it `build_bearer` falls to `_ => Ok(None)` and
+// `esp32c5_is_routed_and_requires_a_port` asserted against a routing arm that is not compiled —
+// it failed on `cargo test -p ndn-phy-wifi --lib` and passed under `--features serial-radio`.
+// (Not part of the bring-up-contract work; a red test in the tree, fixed where it was found.)
+#[cfg(all(test, feature = "serial-radio"))]
+mod c5_bearer_tests {
+    use super::*;
+
+    /// The C5 must be routed, not silently ignored. Before this arm existed `build_bearer` fell
+    /// through to `_ => Ok(None)` for every serial radio, so the most instrumented radio in the
+    /// fleet could never be a face cognition actuated — its rate, power and channel decisions all
+    /// landed on nothing.
+    #[test]
+    fn esp32c5_is_routed_and_requires_a_port() {
+        let spec = parse_spec("esp32c5").expect("spec parses");
+        assert_eq!(spec.driver, "esp32c5");
+        match build_bearer(RadioId(1), &spec) {
+            Err(e) => assert!(
+                format!("{e}").contains("iface"),
+                "the error should name the missing parameter, got: {e}"
+            ),
+            Ok(_) => panic!("esp32c5 without a port must not build a bearer"),
+        }
+    }
+
+    /// An unknown driver still falls through quietly — routing the C5 must not have turned the
+    /// catch-all into an error path for everything else.
+    #[test]
+    fn unknown_driver_still_falls_through() {
+        let spec = parse_spec("not-a-radio").expect("spec parses");
+        assert!(matches!(build_bearer(RadioId(1), &spec), Ok(None)));
     }
 }

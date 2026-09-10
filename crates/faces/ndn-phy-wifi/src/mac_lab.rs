@@ -20,6 +20,10 @@
 
 use std::sync::Arc;
 
+use ndn_radio_cognition::ephemeral_id::{
+    Agreement, COMMITMENT_SLICES, ClassCommitmentWatch, IdDeconfliction,
+};
+
 use super::*;
 
 // ---------------------------------------------------------------------------------------------
@@ -51,12 +55,22 @@ impl<const N: usize> Medium<N> {
 /// A lab scheduler: wall clock (shared by every in-process node, which is what makes the maps
 /// agree), claimable, no hop.
 fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceScheduler {
-    FaceScheduler {
+    let s = FaceScheduler {
         slot: Some(slot),
         hop: None,
-        groups,
-        sched_params: crate::sched::SchedParams::default(),
-        learned: Mutex::new(std::collections::HashMap::new()),
+        // Attached below through `with_groups`, not by field assignment: that builder is what pins
+        // the table's slot depth AND its class assignment into `sched_params` (D2), so a lab node
+        // that side-stepped it would carry a pin its own map contradicts.
+        groups: None,
+        // …and capture the pin from the schedule actually in force rather than defaulting it, so
+        // `map_digest()` in the lab means what it means on air (the default said reserved = 0 while
+        // the lab ran a reserved-lane stride).
+        sched_params: crate::sched::SchedParams::capture(
+            1,
+            ClockSource::Wall,
+            Some(&slot),
+            None,
+        ),
         clock_source: ClockSource::Wall,
         knobs: None,
         bw: crate::Bandwidth::default(),
@@ -77,6 +91,10 @@ fn lab_sched(slot: SlotSchedule, groups: Option<Arc<GroupTable>>) -> FaceSchedul
         rate: None,
         clock_skew_us: 0,
         base: Instant::now(),
+    };
+    match groups {
+        Some(g) => s.with_groups(g),
+        None => s,
     }
 }
 
@@ -114,18 +132,15 @@ async fn wait_for_slot(s: &FaceScheduler, want: impl Fn(u64, u64) -> bool) -> u6
 // ---------------------------------------------------------------------------------------------
 #[test]
 fn prop_p1_map_agreement() {
-    let key = crate::GroupKey([1u8; 16]);
     let table = || {
         Arc::new(
-            GroupTable::new(
-                &key,
-                &[
+            GroupTable::new(&[
                     b"/alarm".as_slice(),
                     b"/bulk".as_slice(),
                     b"/ndn".as_slice(),
                 ],
             )
-            .with_latency(&[b"/alarm".as_slice()]),
+            .with_latency_unauthorised(&[b"/alarm".as_slice()]),
         )
     };
     let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
@@ -162,6 +177,181 @@ fn prop_p1_map_agreement() {
             LeaseClass::Latency => assert!(slot.is_reserved(owned), "latency outside its lane"),
             LeaseClass::Bulk => assert!(!slot.is_reserved(owned), "bulk inside a lane"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// P1b — the CONVERSE of P1: a node that does not compute the same (slot, class) map is DETECTED.
+//
+// P1 asserts five nodes agree. Nothing asserted what happens when one does not, and until the class
+// commitment the answer was "nothing": `LeaseClass` is a per-node input (`with_latency…` takes a
+// slice literal) and it was outside the `SchedParams` pin, so a node that promoted its own prefixes
+// into the reserved lanes emitted a digest IDENTICAL to the honest fleet's while placing that
+// name in a lane the others keep clear (#93). Agreement is unenforceable here by design — there is no
+// convergence protocol, §2 law 6 — which is exactly why the DETECTION half has to be a property.
+//
+// ☠ **This property used to be true in the lab and false on air**, and that is why it is written
+// this way now. It called `build_beacon()` on the defector — but `lab_sched` sets `master: false`,
+// and the face spawns the beacon task ONLY behind `sched.is_master()` (`medium.rs`,
+// `NDN_SCHED_MASTER=1`). So the old assertion exercised a frame the defector would never transmit:
+// a non-master defector was undetectable by anyone, and the property said otherwise. The carrier is
+// now the commitment slice piggybacked on ordinary data (`addr3[5]` bits 2..7,
+// `IdDeconfliction::tx_id` -> `ClassCommitmentWatch::observe`), which every node sends, so the
+// property below asserts detection for a defector with `is_master() == false` — the case that
+// matters and the case that was uncovered.
+// ---------------------------------------------------------------------------------------------
+#[test]
+fn prop_p1b_class_divergence_is_detected_on_ordinary_data_from_a_non_master() {
+    let regs = [
+        b"/alarm".as_slice(),
+        b"/bulk".as_slice(),
+        b"/ndn".as_slice(),
+    ];
+    let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
+    // The fleet's lane policy: /alarm, and only /alarm.
+    let honest = || {
+        Arc::new(GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]))
+    };
+    // The defector runs that policy AND helps itself to a lane for its own bulk traffic. Identical
+    // registration set, identical schedule inputs — the class assignment is the only difference.
+    let defecting = Arc::new(
+        GroupTable::new(&regs)
+            .with_latency_unauthorised(&[b"/alarm".as_slice(), b"/bulk".as_slice()]),
+    );
+
+    let nodes: Vec<FaceScheduler> = (0..4).map(|_| lab_sched(slot, Some(honest()))).collect();
+    let defector = lab_sched(slot, Some(defecting));
+
+    // Premise: the divergence is real, not notional — /bulk leaves the open slots for a lane.
+    let wire = data_wire(&[b"bulk".as_slice(), b"x".as_slice()]);
+    let (hh, hc) = nodes[0].name_group(&wire).expect("keyed");
+    let (dh, dc) = defector.name_group(&wire).expect("keyed");
+    assert_eq!(hh, dh, "premise: the slot KEY is unchanged; only the class moved");
+    assert!(
+        !slot.is_reserved(slot.owner_slot_in(nodes[0].medium_keyed(hh), hc))
+            && slot.is_reserved(slot.owner_slot_in(defector.medium_keyed(dh), dc)),
+        "premise: the promotion moves /bulk out of the open slots and into a reserved lane"
+    );
+
+    // ⚠ The premise that makes this the RIGHT property: NOBODY here is the clock master, so nobody
+    // transmits a beacon. Detection must come off ordinary data or it does not exist.
+    assert!(
+        !defector.is_master() && nodes.iter().all(|n| !n.is_master()),
+        "premise: this is the uncovered case — a non-master defector among non-master peers"
+    );
+
+    // The defector's ordinary data frames, as `medium.rs` builds them: one commitment slice per
+    // frame from the same allocator the TX path uses.
+    let mut defector_tx = IdDeconfliction::new(0xD1D1, 300_000, 2_000);
+    let mut honest_tx = IdDeconfliction::new(0x0A0A, 300_000, 2_000);
+
+    // The property, half 1: every honest node flags the defector within one round of its traffic.
+    for (i, n) in nodes.iter().enumerate() {
+        let mut w = ClassCommitmentWatch::new(300_000);
+        let mut caught_after = None;
+        for f in 0..(COMMITMENT_SLICES as u64 * 2) {
+            let (id, flags) = defector_tx.tx_id(Some(defector.class_commitment()));
+            let v = w.observe(id, flags, n.class_commitment(), 1_000 + f);
+            if v.newly_divergent {
+                caught_after = Some(f + 1);
+                break;
+            }
+            assert!(
+                !v.agreement.is_divergent(),
+                "node {i}: a partially collected round reported a partition"
+            );
+        }
+        let frames = caught_after.expect("node did not detect a promoted lane assignment");
+        assert!(
+            frames <= COMMITMENT_SLICES as u64 + 1,
+            "node {i} needed {frames} frames; a full round is {COMMITMENT_SLICES}"
+        );
+    }
+
+    // The property, half 2: no honest node flags another, ever — not once, not at any point in the
+    // round. A detector that fires on agreement is worse than no detector.
+    for (i, n) in nodes.iter().enumerate() {
+        let mut w = ClassCommitmentWatch::new(300_000);
+        for f in 0..(COMMITMENT_SLICES as u64 * 5) {
+            let (id, flags) = honest_tx.tx_id(Some(nodes[0].class_commitment()));
+            let v = w.observe(id, flags, n.class_commitment(), 1_000 + f);
+            assert!(
+                !v.newly_divergent && !v.agreement.is_divergent(),
+                "node {i} false-partitioned against an honest peer at frame {f}"
+            );
+        }
+        assert!(
+            w.agreement_for(honest_tx.current()).is_complete(),
+            "node {i} should have compared a whole round with an honest peer"
+        );
+    }
+
+    // Detection is symmetric — the defector sees the split too, off the fleet's ordinary data.
+    let mut w = ClassCommitmentWatch::new(300_000);
+    let mut saw = false;
+    for f in 0..(COMMITMENT_SLICES as u64 * 2) {
+        let (id, flags) = honest_tx.tx_id(Some(nodes[0].class_commitment()));
+        saw |= w
+            .observe(id, flags, defector.class_commitment(), 2_000 + f)
+            .newly_divergent;
+    }
+    assert!(saw, "detection is symmetric — the defector sees the split too");
+
+    // And the beacon check still works where a master DOES run: retracting the claim did not delete
+    // the mechanism, it narrowed what it covers (and it keeps the full 64 bits).
+    assert!(
+        nodes[0].beacon_indicates_partition(&defector.build_beacon()),
+        "the master-only beacon carrier still detects the same divergence, at 64-bit width"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P1c — the SAFETY half of P1b: a half-collected commitment must never report a partition.
+//
+// Every neighbour begins half-collected, so if a partial round could read as divergent the detector
+// would false-partition the entire fleet on frame one — trading a silent defect for a noisy false
+// one. This is the property that pins "compare, don't reassemble": there is no accumulated VALUE to
+// be half-built, only accumulated confidence, and confidence below a full round says `Agreeing(n of
+// 21)` or `Unknown` — never a verdict.
+// ---------------------------------------------------------------------------------------------
+#[test]
+fn prop_p1c_a_half_collected_commitment_never_reports_a_partition() {
+    let regs = [b"/alarm".as_slice(), b"/bulk".as_slice()];
+    let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
+    let honest = Arc::new(
+        GroupTable::new(&regs).with_latency_unauthorised(&[b"/alarm".as_slice()]),
+    );
+    let node = lab_sched(slot, Some(honest.clone()));
+    let peer = lab_sched(slot, Some(honest));
+    assert_eq!(node.class_commitment(), peer.class_commitment());
+
+    let mut tx = IdDeconfliction::new(0xBEEF, 300_000, 2_000);
+    let mut w = ClassCommitmentWatch::new(300_000);
+
+    // A neighbour we have never heard is UNJUDGED, not divergent.
+    assert_eq!(w.agreement_for(7), Agreement::Unknown);
+
+    // Frames with no commitment at all (the pre-#93 wire, where bits 2..7 MUST be 0, and every DAR
+    // hint frame) add no evidence in either direction — reading index 0 as a zero slice would
+    // partition us against the whole installed base.
+    for t in 0..32 {
+        let v = w.observe(7, 0, node.class_commitment(), 1_000 + t);
+        assert_eq!(v.agreement, Agreement::Unknown, "index 0 is absent, not data");
+        assert!(!v.newly_divergent);
+    }
+
+    // A partial round from an agreeing peer reports BITS COMPARED, never "same map" and never a
+    // partition.
+    for i in 0..COMMITMENT_SLICES {
+        let (id, flags) = tx.tx_id(Some(peer.class_commitment()));
+        let v = w.observe(id, flags, node.class_commitment(), 2_000 + i as u64);
+        assert_eq!(v.agreement, Agreement::Agreeing { bits: 3 * (i + 1) });
+        assert!(!v.agreement.is_divergent());
+        assert_eq!(
+            v.agreement.is_complete(),
+            i + 1 == COMMITMENT_SLICES,
+            "only a whole round is complete"
+        );
     }
 }
 
@@ -228,10 +418,9 @@ async fn prop_p2_lanes_inviolate_under_claim_pressure() {
 // ---------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn prop_p3_latency_delay_bounded_under_saturating_bulk() {
-    let key = crate::GroupKey([2u8; 16]);
     let table = Arc::new(
-        GroupTable::new(&key, &[b"/alarm".as_slice(), b"/bulk".as_slice()])
-            .with_latency(&[b"/alarm".as_slice()]),
+        GroupTable::new(&[b"/alarm".as_slice(), b"/bulk".as_slice()])
+            .with_latency_unauthorised(&[b"/alarm".as_slice()]),
     );
     let slot = SlotSchedule::new(3000, 8).with_reserved_stride(4);
     let lat = Arc::new(lab_sched(slot, Some(table.clone())));

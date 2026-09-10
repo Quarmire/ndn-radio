@@ -1540,7 +1540,6 @@ dependencies = [
  "ndn-mgmt",
  "ndn-packet",
  "ndn-security",
- "ndn-store",
  "ndn-tlv",
  "ndn-transport",
  "portable-atomic",
@@ -1802,25 +1801,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndn-observability"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "dashmap 6.2.1",
- "ndn-engine",
- "ndn-face-local",
- "ndn-packet",
- "ndn-transport",
- "parking_lot",
- "portable-atomic",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "web-time",
-]
-
-[[package]]
 name = "ndn-packet"
 version = "0.1.0"
 dependencies = [
@@ -1901,20 +1881,16 @@ dependencies = [
  "ndn-coding",
  "ndn-env",
  "ndn-face-wifi-aware",
- "ndn-foundation-types",
  "ndn-frame-io",
- "ndn-fwd-core",
  "ndn-mgmt-wire",
  "ndn-nan",
  "ndn-nan-core",
- "ndn-observability",
  "ndn-packet",
  "ndn-radio",
  "ndn-radio-cognition",
  "ndn-radio-drivers",
  "ndn-radio-hal",
  "ndn-signals-core",
- "ndn-store",
  "ndn-time",
  "ndn-tlv",
  "ndn-transport",
@@ -1940,6 +1916,7 @@ dependencies = [
  "ndn-phy-wifi",
  "ndn-radio-drivers",
  "ndn-radio-hal",
+ "ndn-security",
  "ndn-strategy",
  "ndn-strategy-reach",
  "ndn-time",
@@ -1956,12 +1933,10 @@ name = "ndn-radio-cognition"
 version = "0.1.0"
 dependencies = [
  "ndn-frame-io",
- "ndn-packet",
  "ndn-radio",
  "ndn-radio-drivers",
  "ndn-radio-hal",
  "ndn-signals-core",
- "ndn-tlv",
  "tokio",
  "tracing",
 ]
@@ -2315,16 +2290,6 @@ dependencies = [
  "elliptic-curve",
  "primeorder",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
-dependencies = [
- "lock_api",
- "parking_lot_core",
 ]
 
 [[package]]
