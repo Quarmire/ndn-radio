@@ -710,6 +710,16 @@ impl MediumActuator {
         self.fec_floor = floor;
         self
     }
+
+    /// Seed the applied-channel state with what bring-up already tuned, so the first actuation tick
+    /// does NOT redundantly re-tune a radio that is already on the right channel/width. Essential on
+    /// a coupled-width part (MT7612U) whose "re-tune" is the expensive, storm-prone blob replay:
+    /// without this seed the first tick replayed the channel under live traffic and could fail,
+    /// leaving `last` unset so every subsequent tick retried it (field 2026-09-11).
+    pub fn with_applied_channel(self, channel: u8, bw_code: u8) -> Self {
+        self.last.lock().unwrap().channel = Some((channel, bw_code));
+        self
+    }
 }
 
 impl RadioActuators for MediumActuator {

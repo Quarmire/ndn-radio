@@ -835,7 +835,12 @@ impl RadioPolicy {
         // honest narrowband declaration would make this pick 5 MHz as the *ceiling* and then
         // "narrow" toward 80. Order by MHz, never by code.
         let mut bw = cap.max_bw();
-        if busy >= self.cfg.busy_high
+        // Narrow under contention ONLY when width is an independent actuator. On a coupled-width
+        // radio (e.g. MT7612U: ch36 exists solely at 80 MHz as a captured op-stream) "narrowing"
+        // means replaying the whole channel program, which storms + fails under live traffic — so
+        // hold the channel's single captured width instead (field 2026-09-11).
+        if cap.width_actuated
+            && busy >= self.cfg.busy_high
             && let Some(n) = ndn_radio_hal::Bandwidth::from_code(bw).narrower()
         {
             bw = n.code();
@@ -1302,6 +1307,7 @@ mod power_dbm_tests {
         let cap = RadioCapability {
             db_per_power_idx: Some(0.5),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
         };
         // A very strong peer: lots of surplus margin to give back.
@@ -1320,6 +1326,7 @@ mod power_dbm_tests {
         let cap = RadioCapability {
             db_per_power_idx: Some(0.5),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
         };
         for rssi in [-30i8, -50, -70, -90] {
@@ -1344,6 +1351,7 @@ mod power_dbm_tests {
         let cap = RadioCapability {
             db_per_power_idx: Some(0.5),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(vec![149])
         };
         assert!(cap.tx_power_dbm.is_none());
@@ -1359,6 +1367,7 @@ mod power_dbm_tests {
         let cap = RadioCapability {
             db_per_power_idx: Some(0.5),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_halow_s1g(vec![36]).with_tx_power_dbm(DbmRange::new(1, 27))
         };
         assert_eq!(p.decide_power_dbm(&cap, 0, None), None);
@@ -2078,6 +2087,40 @@ mod tests {
         });
         let p = RadioPolicy::default().decide(&NameContext::new(0xAA), &m, 1_000);
         assert_eq!(p.allocations[0].channel, Some(161));
+    }
+
+    #[test]
+    fn coupled_width_radio_holds_its_single_width_under_contention() {
+        // MT7612U-class: ch36 exists only at 80 MHz, so width is NOT an independent actuator
+        // (`width_actuated=false`). A busy channel must not make cognition "narrow" — on this part
+        // that means replaying the whole channel program, which storms and starves RX
+        // (field 2026-09-11). A `width_actuated=true` radio still narrows under the same load.
+        fn busy_medium(width_actuated: bool) -> MediumState {
+            let mut m = MediumState::new();
+            let mut cap = RadioCapability::wifi_monitor_5ghz(vec![36]); // max_bw = 2 (Bw80)
+            cap.width_actuated = width_actuated;
+            m.register_radio(W, cap);
+            m.observe_occupancy(ChannelOccupancy {
+                radio: W,
+                channel: 36,
+                busy_pct: 95,
+                ts_ms: 1,
+            });
+            m
+        }
+        let coupled =
+            RadioPolicy::default().decide(&NameContext::new(0xAA), &busy_medium(false), 1_000);
+        assert_eq!(
+            coupled.allocations[0].params.bw(),
+            Some(2),
+            "coupled-width radio must HOLD Bw80 under contention, not narrow (a re-tune it cannot do)"
+        );
+        let agile =
+            RadioPolicy::default().decide(&NameContext::new(0xAA), &busy_medium(true), 1_000);
+        assert!(
+            agile.allocations[0].params.bw().unwrap() < 2,
+            "a width-actuated radio still narrows under contention"
+        );
     }
 }
 

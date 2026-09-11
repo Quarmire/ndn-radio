@@ -1282,6 +1282,7 @@ mod tests {
             min_tx_power: None,
             db_per_power_idx: None,
             power_actuated: true,
+            width_actuated: true,
             tx_power_dbm: Some(DbmRange::new(10, 22)),
             retune_us: None,
             rx_only: false,

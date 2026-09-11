@@ -1268,6 +1268,7 @@ mod tests {
         RadioCapability {
             db_per_power_idx: Some(0.5),
             power_actuated: true,
+            width_actuated: true,
             ..RadioCapability::wifi_monitor_5ghz(channels)
         }
     }
