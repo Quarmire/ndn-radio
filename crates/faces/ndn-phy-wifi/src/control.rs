@@ -569,6 +569,57 @@ impl RadioControl {
             .collect()
     }
 
+    /// **OBSERVABILITY: the cognition SENSE->DECIDE snapshot, per radio, at INFO.**
+    ///
+    /// The decision trace (`named_radio::decision`) is per-object and DEBUG-only, so on a live node
+    /// the cognition is effectively unobservable — you cannot see why FEC is (not) engaging. This
+    /// logs, per radio, the sensed inputs (weakest RSSI/SNR, channel busy%, residual PHY PER — the
+    /// exact `fec_redundancy` driver) beside the decided output (MCS/NSS/BW/power/link-FEC R/
+    /// channel). Drive it from a periodic task (see `mount_radio_face`) so `journalctl` shows the
+    /// loop working. `fec_r=0` next to `phy_per=0.000` is the "FEC never engaged" tell.
+    pub fn log_cognition(&self) {
+        use ndn_radio_cognition::MediumView;
+        let now = self.now_ms();
+        let plans = self.last_plans();
+        let medium = self.medium.lock().unwrap();
+        for (id, _cap) in medium.radios() {
+            let rssi = medium.weakest_rssi(id, now);
+            let snr = MediumView::weakest_snr_db(&*medium, id, now);
+            let phy_per = MediumView::residual(&*medium, id).and_then(|r| r.phy_per.get());
+            let dec = plans
+                .iter()
+                .flat_map(|p| p.allocations.iter())
+                .find(|a| a.radio == id);
+            let (chan, mcs, nss, bw, pwr, fec) = match dec {
+                Some(a) => (
+                    a.channel,
+                    a.params.mcs(),
+                    a.params.nss(),
+                    a.params.bw(),
+                    a.params.tx_power,
+                    a.params.link_fec_redundancy,
+                ),
+                None => (None, None, None, None, None, None),
+            };
+            let busy = chan.and_then(|c| medium.busy_pct(id, c));
+            tracing::info!(
+                target: "named_radio::cognition",
+                radio = id.0,
+                rssi_dbm = ?rssi,
+                snr_db = ?snr,
+                busy_pct = ?busy,
+                phy_per = ?phy_per,
+                mcs = ?mcs,
+                nss = ?nss,
+                bw = ?bw,
+                tx_power = ?pwr,
+                fec_r = ?fec,
+                channel = ?chan,
+                "cognition sense->decide",
+            );
+        }
+    }
+
     /// Start **frame-free occupancy sensing** on a radio at bring-up: spawn the
     /// background sampler ([`spawn_occupancy_sampler`]) over the actuator's own
     /// `knobs` handle, so the same radio that ACTs also SENSEs its medium. Call
