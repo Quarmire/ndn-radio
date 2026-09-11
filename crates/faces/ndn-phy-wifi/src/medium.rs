@@ -1214,6 +1214,8 @@ impl GateCounts {
 }
 static TXD_DONE_OK: AtomicU64 = AtomicU64::new(0);
 static TXD_DONE_ERR: AtomicU64 = AtomicU64::new(0);
+/// Frames RECEIVED off any radio (the RX union) — the ingress witness the TX egress lacked.
+static RXD_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static TXD_LOGGER: std::sync::Once = std::sync::Once::new();
 
 /// A snapshot of the radio TX-egress pipeline counters (actual injected frames), for observability.
@@ -1227,6 +1229,8 @@ pub struct TxEgressSnapshot {
     pub done_err: u64,
     /// `MostRobust` frames that bypassed the stored rate (sent at the basic rate).
     pub bypassed: u64,
+    /// Frames RECEIVED off any radio (the RX union) — the ingress witness.
+    pub received: u64,
 }
 
 /// Read the radio TX-egress counters. These are the ACTUAL injected-frame accounting, distinct from
@@ -1240,6 +1244,7 @@ pub fn tx_egress_snapshot() -> TxEgressSnapshot {
         done_ok: TXD_DONE_OK.load(Ordering::Relaxed),
         done_err: TXD_DONE_ERR.load(Ordering::Relaxed),
         bypassed: TXD_BYPASS.load(Ordering::Relaxed),
+        received: RXD_RECEIVED.load(Ordering::Relaxed),
     }
 }
 fn txd_start_logger() {
@@ -1263,8 +1268,9 @@ fn txd_start_logger() {
                     fec = TXD_FEC.load(Ordering::Relaxed),
                     done_ok = TXD_DONE_OK.load(Ordering::Relaxed),
                     done_err = TXD_DONE_ERR.load(Ordering::Relaxed),
+                    received = RXD_RECEIVED.load(Ordering::Relaxed),
                     stuck_in_gate = stuck_gate, stuck_in_inject = stuck_inject,
-                    "radio TX egress counters"
+                    "radio TX/RX counters"
                 );
                 prev = (e, g, d);
             }
@@ -1891,6 +1897,7 @@ impl RunningMedium {
                 loop {
                     match radio.recv_frame().await {
                         Ok(f) => {
+                            RXD_RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // #41: feed the frame's hardware RX timestamp into the scheduler's
                             // disciplined clock — this is the face consuming `.stamp`, the gap the
                             // shared RadioHwClock was built to close. Cheap; only when scheduling is on.

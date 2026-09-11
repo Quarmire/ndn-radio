@@ -71,6 +71,7 @@ impl ControlSurface for RadioCognitionSurface {
         e.push(("radio_tx_injected_ok".into(), tx.done_ok.to_string()));
         e.push(("radio_tx_injected_err".into(), tx.done_err.to_string()));
         e.push(("radio_tx_robust_bypassed".into(), tx.bypassed.to_string()));
+        e.push(("radio_rx_received".into(), tx.received.to_string()));
 
         // --- Aggregate cognition state ---
         e.push(("strategy".into(), t.strategy.into()));
