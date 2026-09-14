@@ -41,6 +41,19 @@ use ndn_transport::link_service::{
 
 use crate::FaceId;
 
+/// Assumed thermal/interference **noise floor** (dBm) for SNR estimation, operator-overridable via
+/// `NDN_RADIO_NOISE_FLOOR_DBM`. Backends that surface no per-frame SNR (RTL8812EU/libusb) let
+/// cognition estimate the outbound SNR as `RSSI − noise_floor`, so the worst-receiver SNR that
+/// drives rate/FEC is populated regardless of chip PHY support. Default −95 dBm ≈ a quiet 5 GHz
+/// 20 MHz channel; raise it on a noisy/contended band so the estimate stays honest.
+fn noise_floor_dbm() -> f32 {
+    std::env::var("NDN_RADIO_NOISE_FLOOR_DBM")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v < 0.0)
+        .unwrap_or(-95.0)
+}
+
 // One face contributes one representative receiver (its aggregate per-face RSSI)
 // to the sense bus, keyed by `FaceId.0`, until per-neighbour reception reports
 // exist (honest aggregate, documented limitation).
@@ -451,10 +464,28 @@ impl RadioControl {
             // the worst-receiver rate cap actually wants: RSSI says our signal arrives loud at the
             // peer, SNR says whether it arrives decodable, and a contended peer reports the first
             // as excellent while dropping most of what we send.
-            if self.node_id != 0
-                && let Some(&(_, snr)) = rep.heard_snr.iter().find(|(n, _)| *n == self.node_id)
-            {
-                m.observe_rx_snr(radio, rep.node_id, Some(f32::from(snr)), now_ms);
+            //
+            // ★ SNR ESTIMATION (field 2026-09-11). The RTL8812EU/libusb backend surfaces no
+            // per-frame SNR, so `heard_snr` is empty on air and `weakest_snr_db()` was `None`
+            // everywhere — cognition flew on RSSI alone and any SNR-driven rate/FEC had no input.
+            // Prefer a real SNR a peer measured and advertised; otherwise ESTIMATE the outbound
+            // SNR from the outbound RSSI we already learn from `heard_neighbors`
+            // (SNR ≈ RSSI − noise_floor), so the worst-receiver SNR is populated regardless of
+            // backend PHY support. The floor is operator-overridable (NDN_RADIO_NOISE_FLOOR_DBM).
+            if self.node_id != 0 {
+                let real = rep
+                    .heard_snr
+                    .iter()
+                    .find(|(n, _)| *n == self.node_id)
+                    .map(|&(_, s)| f32::from(s));
+                let est = rep
+                    .heard_neighbors
+                    .iter()
+                    .find(|(n, _)| *n == self.node_id)
+                    .map(|&(_, r)| f32::from(r) - noise_floor_dbm());
+                if let Some(snr) = real.or(est) {
+                    m.observe_rx_snr(radio, rep.node_id, Some(snr), now_ms);
+                }
             }
         }
         true
@@ -581,10 +612,21 @@ impl RadioControl {
         use ndn_radio_cognition::MediumView;
         let now = self.now_ms();
         let plans = self.last_plans();
+        // Effective on-air FEC = max(decided, floor). The floor (NDN_RADIO_FEC_MIN, applied at
+        // MediumActuator::apply) is what actually hits the air, so the decided value alone is
+        // misleading — it can read None while R=floor goes out on eligible (>MIN_BYTES, bulk) frames.
+        let fec_floor: u16 = std::env::var("NDN_RADIO_FEC_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
         let medium = self.medium.lock().unwrap();
         for (id, _cap) in medium.radios() {
             let rssi = medium.weakest_rssi(id, now);
             let snr = MediumView::weakest_snr_db(&*medium, id, now);
+            // Ambient SNR estimate (RSSI − noise_floor): populated even while the per-neighbour
+            // cooperative map is bootstrap-deadlocked, so we can SEE link quality is senseable
+            // (it just does not reach the worst-receiver cap by invariant).
+            let snr_amb = medium.ambient_snr_db(id);
             let phy_per = MediumView::residual(&*medium, id).and_then(|r| r.phy_per.get());
             let dec = plans
                 .iter()
@@ -602,18 +644,22 @@ impl RadioControl {
                 None => (None, None, None, None, None, None),
             };
             let busy = chan.and_then(|c| medium.busy_pct(id, c));
+            let fec_eff = fec.unwrap_or(0).max(fec_floor);
             tracing::info!(
                 target: "named_radio::cognition",
                 radio = id.0,
                 rssi_dbm = ?rssi,
-                snr_db = ?snr,
+                snr_weak = ?snr,
+                snr_ambient = ?snr_amb,
                 busy_pct = ?busy,
                 phy_per = ?phy_per,
                 mcs = ?mcs,
                 nss = ?nss,
                 bw = ?bw,
                 tx_power = ?pwr,
-                fec_r = ?fec,
+                fec_decided = ?fec,
+                fec_floor,
+                fec_eff,
                 channel = ?chan,
                 "cognition sense->decide",
             );
@@ -820,7 +866,22 @@ impl RadioControl {
                         m.observe_radio_rssi(radio, ls.rssi_dbm, now_ms);
                         // The same seam already carries SNR and nothing read it, so the ambient
                         // inbound quality this radio sees never reached cognition at all.
-                        m.observe_radio_snr(radio, ls.snr_db, now_ms);
+                        //
+                        // ★ SNR ESTIMATION (field 2026-09-11). The RTL8812EU/libusb backend fills
+                        // no per-frame SNR (`ls.snr_db` is always None on air), AND the per-neighbour
+                        // cooperative map is bootstrap-deadlocked (`heard_neighbors` never seeds — the
+                        // only seed is circular through reports), so `weakest_snr_db()` was None
+                        // everywhere and cognition flew on RSSI alone. Estimate the ambient SNR from
+                        // the ambient RSSI the radio DOES measure (SNR ≈ RSSI − noise_floor) — the
+                        // same inbound proxy `weakest_rssi` already relies on — so rate/FEC have an
+                        // SNR to key off. Floor is operator-overridable (NDN_RADIO_NOISE_FLOOR_DBM).
+                        let snr_est = ls.snr_db.or_else(|| {
+                            ls.rssi_dbm.map(|r| {
+                                (f32::from(r) - noise_floor_dbm()).round().clamp(-128.0, 127.0)
+                                    as i8
+                            })
+                        });
+                        m.observe_radio_snr(radio, snr_est, now_ms);
                     }
                 }
                 // §2 CCLF density term: distinct source nonces heard recently (the per-neighbour map
