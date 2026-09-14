@@ -444,6 +444,14 @@ pub(crate) fn apply_knobs(
     // `radio.N.tx_power` reading against. `cap = None` ⇒ no declared band ⇒ no bound and no count,
     // stated rather than faked.
     let mut p = *p;
+    // ★ Operator TX-power override (NDN_RADIO_TX_POWER = index): pin the actuated TX power, overriding
+    // cognition's RSSI-driven back-off — for bringing up a MARGINAL band (UNII-3) where the decided
+    // power may be too low. Forces the index path (clears dBm so the override cannot be shadowed by a
+    // dBm write) and is still clamped to the radio's declared range below, so it can't exceed the max.
+    if let Some(v) = std::env::var("NDN_RADIO_TX_POWER").ok().and_then(|s| s.trim().parse::<u8>().ok()) {
+        p.tx_power = Some(v);
+        p.tx_power_dbm = None;
+    }
     if let Some(c) = cap {
         if let (Some(dbm), Some(range)) = (p.tx_power_dbm, c.tx_power_dbm) {
             let bounded = range.clamp(dbm);
