@@ -1101,11 +1101,13 @@ impl RadioPolicy {
         receivers: usize,
         deficit: f32,
     ) -> Option<u16> {
-        let phy = view
-            .residual(radio)
-            .and_then(|r| r.phy_per.get())
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.95);
+        // DIRECT broadcast loss (report-seq gaps) — non-circular and measurable even at R=0, where
+        // the FEC-residual phy_per is blind (it needs FEC active to measure loss). Size the budget
+        // from the WORSE of the two so parity tracks real broadcast loss and engages proactively
+        // instead of waiting on a residual that never appears (field 2026-09-14).
+        let residual_per = view.residual(radio).and_then(|r| r.phy_per.get()).unwrap_or(0.0);
+        let seq_loss = view.broadcast_loss(radio).unwrap_or(0.0);
+        let phy = residual_per.max(seq_loss).clamp(0.0, 0.95);
         let reinterest = view
             .demand(ctx.prefix_hash)
             .and_then(|d| d.reinterest_rate.get())
@@ -1136,8 +1138,12 @@ impl RadioPolicy {
         };
         let mut eff = (f64::from(phy).powf(n_eff)) as f32;
         eff = (eff * (1.0 + reinterest)).min(0.95);
-        // If diversity already drives the deficit to ~0, don't spend redundancy.
-        if eff < 1e-3 || deficit < f32::EPSILON {
+        // Engage on measured loss. The rank deficit refines the AMOUNT (diversity discount), but it
+        // must NOT be a hard gate when a DIRECT loss signal (report-seq gaps) is present — otherwise
+        // FEC stays off until a rank-deficit producer feeds it, which is exactly the gap that left
+        // the decided budget at 0 and relied entirely on the floor. With direct loss, size from it;
+        // with only the (diversity-discountable) residual, keep the original deficit gate.
+        if eff < 1e-3 || (seq_loss < 1e-3 && deficit < f32::EPSILON) {
             return None;
         }
         let k = self.cfg.generation_k as f32;

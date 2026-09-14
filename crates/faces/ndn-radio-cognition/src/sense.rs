@@ -214,6 +214,14 @@ struct NeighborState {
     /// numbers that originated at the peer it was advertising them to.
     snr_in: HashMap<RadioId, Ewma>,
     report: Option<NeighborReport>,
+    /// Last reception-report sequence heard from this neighbour, for direct broadcast-loss
+    /// estimation from seq gaps (see [`MediumState::observe_report_seq`]). Reports are sent
+    /// robustly (basic rate) at a fixed cadence, so a gap in the monotonic seq is a DIRECT,
+    /// cause-agnostic measurement of broadcast delivery — non-circular, unlike the FEC-residual
+    /// phy_per (blind at R=0) and the never-populated rank deficit.
+    last_report_seq: Option<u32>,
+    /// EWMA of the per-interval report loss fraction (lost/expected) from the seq gaps above.
+    report_loss: Ewma,
     last_seen_ms: u64,
 }
 
@@ -505,6 +513,37 @@ impl MediumState {
         st.report = Some(report);
     }
 
+    /// Fold a reception-report **sequence number** from `neighbor` into a DIRECT broadcast-loss
+    /// estimate (report-seq gaps). Reports are periodic + sent robustly, so a jump of `interval`
+    /// in the monotonic seq means `interval-1` reports were lost on the broadcast link — a real,
+    /// cause-agnostic delivery measurement (collision/interference/range alike), and the signal the
+    /// FEC budget should size from instead of the residual phy_per (blind at R=0). A backward or
+    /// implausibly large jump is a peer restart (seq reset), not loss — reseed without folding.
+    pub fn observe_report_seq(&mut self, neighbor: u64, seq: u32, now_ms: u64) {
+        let st = self.neighbors.entry(neighbor).or_default();
+        st.last_seen_ms = now_ms;
+        if let Some(last) = st.last_report_seq
+            && seq > last
+        {
+            let interval = seq - last;
+            if interval <= 64 {
+                let ratio = (interval - 1) as f32 / interval as f32;
+                st.report_loss.update(ratio);
+            }
+        }
+        st.last_report_seq = Some(seq);
+    }
+
+    /// The **worst** fresh neighbour's report-seq loss — the broadcast delivery loss to provision
+    /// FEC for (worst listener, not average). `None` until at least one gap has been measured.
+    /// Stale neighbours are removed by [`prune`](Self::prune), so no freshness filter is needed.
+    pub fn worst_report_loss(&self) -> Option<f32> {
+        self.neighbors
+            .values()
+            .filter_map(|s| s.report_loss.get())
+            .max_by(|a, b| a.total_cmp(b))
+    }
+
     /// Set/replace the demand record for a prefix-hash (from PIT + CCLF + measured
     /// re-Interest rate + pooled rank deficit).
     pub fn observe_demand(&mut self, prefix_hash: u64, demand: Demand) {
@@ -601,6 +640,12 @@ pub trait MediumView {
     fn capability(&self, radio: RadioId) -> Option<RadioCapability>;
     /// Per-radio residual loss below each layer.
     fn residual(&self, radio: RadioId) -> Option<LinkResidual>;
+    /// DIRECT broadcast-loss estimate (worst neighbour's report-seq gap loss), independent of FEC
+    /// activity and of the rank deficit — the signal the FEC budget should size from on a broadcast
+    /// bearer. `None` until measured. Default `None` for views that do not track it.
+    fn broadcast_loss(&self, _radio: RadioId) -> Option<f32> {
+        None
+    }
     /// End-to-end (network-layer) residual segment loss.
     fn e2e_residual(&self) -> Ewma;
     /// Busy% on `(radio, channel)`, if measured.
@@ -687,6 +732,9 @@ impl MediumView for MediumState {
     }
     fn residual(&self, radio: RadioId) -> Option<LinkResidual> {
         self.residual.get(&radio).copied()
+    }
+    fn broadcast_loss(&self, _radio: RadioId) -> Option<f32> {
+        self.worst_report_loss()
     }
     fn e2e_residual(&self) -> Ewma {
         self.e2e
@@ -1099,5 +1147,25 @@ mod snr_direction_tests {
         m.observe_radio_snr(W, Some(3), 1_000);
         assert_eq!(m.ambient_snr_db(W), Some(3.0));
         assert_eq!(m.weakest_snr_db(W, 1_000), None);
+    }
+
+    /// Report-seq gaps become a DIRECT broadcast-loss estimate — the non-circular signal the FEC
+    /// budget adapts from (independent of FEC activity and of the rank deficit).
+    #[test]
+    fn report_seq_gaps_estimate_broadcast_loss() {
+        let mut m = MediumState::default();
+        // First report: no prior seq, nothing to fold.
+        m.observe_report_seq(7, 1, 1_000);
+        assert_eq!(m.worst_report_loss(), None, "single report yields no gap");
+        // Consecutive seq: interval 1, zero loss folded.
+        m.observe_report_seq(7, 2, 2_000);
+        assert_eq!(m.worst_report_loss(), Some(0.0), "no gap => zero loss");
+        // Gap: seq jumps 2 -> 4 (seq 3 lost) => 1/2 of this interval lost.
+        m.observe_report_seq(7, 4, 3_000);
+        let loss = m.worst_report_loss().expect("loss measured");
+        assert!(loss > 0.0, "a seq gap raises the broadcast-loss estimate, got {loss}");
+        // A peer restart (seq resets backward) must not be read as loss / must not panic.
+        m.observe_report_seq(7, 1, 4_000);
+        assert!(m.worst_report_loss().is_some());
     }
 }

@@ -460,6 +460,9 @@ impl RadioControl {
                     ts_ms: now_ms,
                 },
             );
+            // DIRECT broadcast-loss from the report-seq gap (see observe_report_seq) — the
+            // non-circular signal the FEC budget adapts from, above the floor.
+            m.observe_report_seq(rep.node_id, rep.seq, now_ms);
             // ★ BOOTSTRAP SEED (field 2026-09-11). Fold the INBOUND link from the directly-received
             // report frame: the report names node_id X, and the frame's source nonce gave us the
             // RSSI we heard it at. This is the direct-RX seed the cooperative map never had — without
@@ -593,13 +596,23 @@ impl RadioControl {
     /// mapped to channel-busy% ([`ChannelOccupancy::from_activity`]) and fed to the
     /// sense bus, so `RadioPolicy::decide` sees real medium load — it steers
     /// least-busy channel selection, narrow-BW/EDCCA under load, and the redundancy
-    /// budget. Saturation uses [`DEFAULT_SATURATION_FPS`] (calibratable per site).
+    /// budget. Saturation uses [`DEFAULT_SATURATION_FPS`], operator-overridable per site via
+    /// `NDN_RADIO_SATURATION_FPS`. The 8812au proxy is `REG_RXERR_RPT` (RX-ERROR frames), which
+    /// on a noisy 5 GHz band reads high from FOREIGN traffic the monitor radio cannot decode — not
+    /// our contention — and pegs busy at 100%. Raising the threshold to the site's ambient
+    /// error-frame floor de-pegs it so the load signal discriminates real contention again
+    /// (field 2026-09-14). A real CCA/energy sense would be better but is driver-side + unvalidated.
     pub fn observe_activity(&self, radio: RadioId, channel: u8, frames_per_s: f32, now_ms: u64) {
+        let sat_fps = std::env::var("NDN_RADIO_SATURATION_FPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(DEFAULT_SATURATION_FPS);
         self.observe_occupancy(ChannelOccupancy::from_activity(
             radio,
             channel,
             frames_per_s,
-            DEFAULT_SATURATION_FPS,
+            sat_fps,
             now_ms,
         ));
     }
