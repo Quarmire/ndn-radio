@@ -189,8 +189,17 @@ impl Default for Demand {
 
 #[derive(Clone, Debug, Default)]
 struct NeighborState {
-    /// RSSI EWMA per radio that hears this neighbor (LoRa hears far, Wi-Fi near).
+    /// **OUTBOUND** RSSI EWMA per radio: how loud a neighbour reports hearing *us*, folded from
+    /// its reception reports (`observe_rx`). This is what the worst-receiver rate cap (`weakest_rssi`)
+    /// wants — the link our transmission must survive. (Named `rssi` for history; it is the RSSI
+    /// twin of `snr`, both OUTBOUND.)
     rssi: HashMap<RadioId, Ewma>,
+    /// **INBOUND** RSSI EWMA per radio: how loud *we* hear this neighbour, measured locally from
+    /// directly-received frames (`observe_heard`). Advertised in `heard_neighbors`. The RSSI twin of
+    /// `snr_in` — split out for the same reason (a direct-RX seed the outbound map never had), which
+    /// is what breaks the cooperative bootstrap deadlock: without it `heard_neighbors` could only be
+    /// built from the outbound `rssi`, itself fed only circularly from reports, so it never populated.
+    rssi_in: HashMap<RadioId, Ewma>,
     /// **OUTBOUND** SNR (dB): how cleanly this neighbour reports hearing *us*, folded from its
     /// reception reports. This is what the worst-receiver rate cap wants, because it describes the
     /// link our transmission must survive.
@@ -381,6 +390,23 @@ impl MediumState {
         }
     }
 
+    /// Fold a **locally measured** RSSI for frames received *from* `neighbor` — the INBOUND
+    /// direction, measured directly off received frames (the source nonce's per-neighbour RSSI).
+    /// This is what we advertise in `heard_neighbors`, and it is the direct-RX seed the cooperative
+    /// map was missing: the outbound [`observe_rx`](Self::observe_rx) is fed only from a peer's
+    /// report, which needs our `heard_neighbors` already populated — a bootstrap deadlock this
+    /// breaks (field 2026-09-11). Twin of [`observe_heard_snr`](Self::observe_heard_snr).
+    pub fn observe_heard(&mut self, radio: RadioId, neighbor: u64, rssi_dbm: Option<i8>, now_ms: u64) {
+        let st = self.neighbors.entry(neighbor).or_default();
+        st.last_seen_ms = now_ms;
+        if let Some(r) = rssi_dbm {
+            st.rssi_in
+                .entry(radio)
+                .or_insert_with(|| Ewma::new(0.3))
+                .update(r as f32);
+        }
+    }
+
     /// Fold a per-neighbour **SNR** reading (dB), from a backend that reports per-frame PHY
     /// quality (e.g. the RTL8733BU's Jaguar-3 status block).
     ///
@@ -517,9 +543,13 @@ impl MediumState {
     pub fn snapshot_report(&self, node_id: u64, seq: u32, now_ms: u64) -> ReceptionReport {
         let mut heard_neighbors = Vec::new();
         for (&n, st) in &self.neighbors {
+            // INBOUND (how WE hear n), not the outbound `rssi` (how n hears us). heard_neighbors
+            // advertises our inbound view so the peer learns its OUTBOUND link — building it from the
+            // outbound map was both the wrong direction and the bootstrap deadlock (that map is fed
+            // only circularly from reports). `rssi_in` is seeded directly from received frames.
             if self.fresh(st.last_seen_ms, now_ms)
                 && let Some(r) = st
-                    .rssi
+                    .rssi_in
                     .values()
                     .filter_map(|e| e.get())
                     .max_by(|a, b| a.total_cmp(b))

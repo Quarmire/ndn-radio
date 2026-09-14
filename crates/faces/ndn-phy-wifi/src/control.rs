@@ -35,6 +35,7 @@ use ndn_radio_cognition::{
     default_thresholds, encode_report, lora_airtime_ms, prefix_hash, reward,
 };
 use ndn_signals_core::SignalView;
+use ndn_transport::face::FaceAddr;
 use ndn_transport::link_service::{
     EgressCtx, InboundLpFrame, IngressCtx, LinkServiceFeature, OutboundLpFrame, TickCtx,
 };
@@ -429,7 +430,13 @@ impl RadioControl {
     /// hearing this node — feed that as our **measured outbound** link quality to
     /// them, closing the rate/power loop with real data instead of reciprocity.
     /// Returns false on undecodable bytes or a self-report.
-    pub fn ingest_report(&self, radio: RadioId, bytes: &[u8], now_ms: u64) -> bool {
+    pub fn ingest_report(
+        &self,
+        radio: RadioId,
+        bytes: &[u8],
+        now_ms: u64,
+        inbound_rssi: Option<i8>,
+    ) -> bool {
         let Some(rep) = decode_report(bytes) else {
             return false;
         };
@@ -453,6 +460,21 @@ impl RadioControl {
                     ts_ms: now_ms,
                 },
             );
+            // ★ BOOTSTRAP SEED (field 2026-09-11). Fold the INBOUND link from the directly-received
+            // report frame: the report names node_id X, and the frame's source nonce gave us the
+            // RSSI we heard it at. This is the direct-RX seed the cooperative map never had — without
+            // it `heard_neighbors`/`heard_snr` were fed only circularly from reports and never
+            // populated (bootstrap deadlock). No per-frame SNR from the RTL chip, so estimate inbound
+            // SNR from inbound RSSI; a real advertised value would override downstream.
+            if let Some(rssi) = inbound_rssi {
+                m.observe_heard(radio, rep.node_id, Some(rssi), now_ms);
+                m.observe_heard_snr(
+                    radio,
+                    rep.node_id,
+                    Some(f32::from(rssi) - noise_floor_dbm()),
+                    now_ms,
+                );
+            }
             if self.node_id != 0
                 && let Some(&(_, rssi)) =
                     rep.heard_neighbors.iter().find(|(n, _)| *n == self.node_id)
@@ -497,6 +519,14 @@ impl RadioControl {
             .lock()
             .unwrap()
             .observe_rx(radio, neighbour, rssi_dbm, now_ms);
+    }
+    /// Fold an INBOUND per-neighbour RSSI (locally measured off a received frame) — see
+    /// [`MediumState::observe_heard`]. Feeds `heard_neighbors`.
+    pub fn observe_heard(&self, radio: RadioId, neighbour: u64, rssi_dbm: Option<i8>, now_ms: u64) {
+        self.medium
+            .lock()
+            .unwrap()
+            .observe_heard(radio, neighbour, rssi_dbm, now_ms);
     }
 
     /// Fold a per-frame **SNR** (dB) for a neighbour, from a backend that reports PHY quality
@@ -1174,7 +1204,15 @@ impl LinkServiceFeature for RadioControl {
                     // radio 0 for single-bearer transports that carry no tag.
                     let rx_radio = frame.radio_id.map(RadioId).unwrap_or(RadioId(0));
                     let now = self.now_ms();
-                    if self.ingest_report(rx_radio, content, now) {
+                    // INBOUND RSSI of THIS report frame, by its source nonce — the bootstrap seed
+                    // that populates the cooperative per-neighbour map (see `ingest_report`).
+                    let inbound_rssi = match (&frame.addr, &self.signals) {
+                        (Some(FaceAddr::Ether(nonce)), Some(sig)) => {
+                            sig.source_link(*nonce).and_then(|ls| ls.rssi_dbm)
+                        }
+                        _ => None,
+                    };
+                    if self.ingest_report(rx_radio, content, now, inbound_rssi) {
                         let recv = self.medium.lock().unwrap().receiver_count(now);
                         tracing::debug!(
                             target: "face.radio",
@@ -1727,7 +1765,7 @@ mod tests {
 
         let mut a = RadioControl::new(RadioPolicy::default()).with_node_id(1);
         a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
-        assert!(a.ingest_report(W, &report, 2_000));
+        assert!(a.ingest_report(W, &report, 2_000, Some(-55)));
         // A now hears node 2 (B) at -55 — the measured outbound link — so a unicast
         // for B's demand picks a high MCS.
         a.set_active(vec![NameContext::new(0xF00D)]);
@@ -1766,7 +1804,7 @@ mod tests {
             .with_node_id(2)
             .with_report_interval(1);
         b.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
-        b.observe_rx(W, 1, Some(-55), 0); // B hears A(1) at -55
+        b.observe_heard(W, 1, Some(-55), 0); // B HEARS A(1) inbound at -55 (feeds heard_neighbors)
         let frame = b.broadcast_report_frame().expect("report due");
 
         // A has a *second* radio (id 3); the frame is tagged as received on radio 3.
@@ -1860,7 +1898,7 @@ mod tests {
             .with_node_id(2)
             .with_report_interval(1);
         b.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
-        b.observe_rx(W, 1, Some(-55), 0); // B hears A(1) at -55
+        b.observe_heard(W, 1, Some(-55), 0); // B HEARS A(1) inbound at -55 (feeds heard_neighbors)
         let frame = b.broadcast_report_frame().expect("report frame due");
 
         // The frame is a Data on /localhop/radio/report/* the ingress matcher recognises.
@@ -1877,6 +1915,44 @@ mod tests {
         // A learned its measured outbound link to node 2 — proof the report was decoded
         // and ingested via the ingress hook (which keys the single medium as RadioId(0)).
         assert_eq!(a.neighbor_rssi(W, 2), Some(-55));
+    }
+
+    #[test]
+    fn ingest_report_seeds_heard_neighbors_from_frame_rssi() {
+        // BOOTSTRAP (field 2026-09-11): a node that knows no neighbours yet must still be able to
+        // advertise one, or the cooperative map never populates. Node 2 sends a report with an EMPTY
+        // heard_neighbors (it has heard no one). Node 1 ingests it WITH the directly-measured inbound
+        // RSSI of that very frame; from that seed, node 1's OWN next report must list node 2 in
+        // heard_neighbors — the direct-RX seed that breaks the deadlock.
+        let mut b = RadioControl::new(RadioPolicy::default())
+            .with_node_id(2)
+            .with_report_interval(1);
+        b.register_radio(W, FaceId(20), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        let b_frame = b.broadcast_report_frame().expect("report due");
+        let b_ndn = ndn_packet::lp::lp_ndn_packet_bytes(&b_frame).expect("lp ndn");
+        let b_data = ndn_packet::Data::decode(Bytes::copy_from_slice(b_ndn)).expect("data");
+        let b_content = b_data.content().expect("content");
+        // Sanity: the incoming report carries no neighbours (the deadlock precondition).
+        assert!(
+            decode_report(&b_content).expect("decode").heard_neighbors.is_empty(),
+            "precondition: sender advertises no neighbours yet"
+        );
+
+        let mut a = RadioControl::new(RadioPolicy::default())
+            .with_node_id(1)
+            .with_report_interval(1);
+        a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
+        assert!(a.ingest_report(W, &b_content, 1_000, Some(-60)));
+
+        let a_frame = a.broadcast_report_frame().expect("report due");
+        let a_ndn = ndn_packet::lp::lp_ndn_packet_bytes(&a_frame).expect("lp ndn");
+        let a_data = ndn_packet::Data::decode(Bytes::copy_from_slice(a_ndn)).expect("data");
+        let a_report = decode_report(&a_data.content().expect("content")).expect("decode");
+        assert!(
+            a_report.heard_neighbors.iter().any(|(n, r)| *n == 2 && *r == -60),
+            "bootstrap: heard_neighbors seeded from the received frame's inbound RSSI, got {:?}",
+            a_report.heard_neighbors
+        );
     }
 
     #[test]
