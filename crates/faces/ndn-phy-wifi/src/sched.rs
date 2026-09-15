@@ -460,11 +460,21 @@ pub struct SchedParams {
 /// finish, not a configuration to support; v1<->v1 stays blind until the last node is upgraded.
 pub const SCHED_PARAMS_VERSION: u16 = 2;
 
+/// Default shared slot granularity (D3 fix, field 2026-09-15). The slot key is
+/// `H(first slot_depth name components)`; at depth 1 EVERY `/muas/...` name hashed to
+/// `H("muas")` → one slot → the scheduler funnelled the whole fleet into a single slot
+/// (no separation, throughput choked). Depth 4 groups by `/muas/v2/<node>/<service>`
+/// (telemetry, video, journal, NDNSF, …) so distinct producer flows land in distinct
+/// slots. It is a HARDCODED constant — identical in the binary on every node — so it is
+/// the shared, consistent granularity D3 requires (never a per-node env, the hazard the
+/// deleted NDN_SCHED_GROUP_DEPTH was). Names shorter than 4 components use their full name.
+pub const DEFAULT_SLOT_DEPTH: u8 = 4;
+
 impl Default for SchedParams {
     fn default() -> Self {
         Self {
             version: SCHED_PARAMS_VERSION,
-            slot_depth: 1,
+            slot_depth: DEFAULT_SLOT_DEPTH,
             clock: 0,
             slot_us: 0,
             slots: 0,
@@ -829,7 +839,7 @@ impl FaceScheduler {
             .max(1);
         // Capture the shared schedule pin (D2) from the parsed inputs BEFORE they move into the
         // struct. slot_depth defaults to 1; `with_groups` syncs it up if a deeper table is attached.
-        let sched_params = SchedParams::capture(1, clock_source, slot.as_ref(), hop.as_ref());
+        let sched_params = SchedParams::capture(DEFAULT_SLOT_DEPTH, clock_source, slot.as_ref(), hop.as_ref());
         Some(Self {
             slot,
             hop,
