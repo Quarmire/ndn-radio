@@ -448,7 +448,10 @@ pub(crate) fn apply_knobs(
     // cognition's RSSI-driven back-off — for bringing up a MARGINAL band (UNII-3) where the decided
     // power may be too low. Forces the index path (clears dBm so the override cannot be shadowed by a
     // dBm write) and is still clamped to the radio's declared range below, so it can't exceed the max.
-    if let Some(v) = std::env::var("NDN_RADIO_TX_POWER").ok().and_then(|s| s.trim().parse::<u8>().ok()) {
+    if let Some(v) = std::env::var("NDN_RADIO_TX_POWER")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+    {
         p.tx_power = Some(v);
         p.tx_power_dbm = None;
     }

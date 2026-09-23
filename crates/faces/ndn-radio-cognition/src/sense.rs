@@ -404,7 +404,13 @@ impl MediumState {
     /// map was missing: the outbound [`observe_rx`](Self::observe_rx) is fed only from a peer's
     /// report, which needs our `heard_neighbors` already populated — a bootstrap deadlock this
     /// breaks (field 2026-09-11). Twin of [`observe_heard_snr`](Self::observe_heard_snr).
-    pub fn observe_heard(&mut self, radio: RadioId, neighbor: u64, rssi_dbm: Option<i8>, now_ms: u64) {
+    pub fn observe_heard(
+        &mut self,
+        radio: RadioId,
+        neighbor: u64,
+        rssi_dbm: Option<i8>,
+        now_ms: u64,
+    ) {
         let st = self.neighbors.entry(neighbor).or_default();
         st.last_seen_ms = now_ms;
         if let Some(r) = rssi_dbm {
@@ -1163,7 +1169,10 @@ mod snr_direction_tests {
         // Gap: seq jumps 2 -> 4 (seq 3 lost) => 1/2 of this interval lost.
         m.observe_report_seq(7, 4, 3_000);
         let loss = m.worst_report_loss().expect("loss measured");
-        assert!(loss > 0.0, "a seq gap raises the broadcast-loss estimate, got {loss}");
+        assert!(
+            loss > 0.0,
+            "a seq gap raises the broadcast-loss estimate, got {loss}"
+        );
         // A peer restart (seq resets backward) must not be read as loss / must not panic.
         m.observe_report_seq(7, 1, 4_000);
         assert!(m.worst_report_loss().is_some());

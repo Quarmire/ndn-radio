@@ -1105,7 +1105,10 @@ impl RadioPolicy {
         // the FEC-residual phy_per is blind (it needs FEC active to measure loss). Size the budget
         // from the WORSE of the two so parity tracks real broadcast loss and engages proactively
         // instead of waiting on a residual that never appears (field 2026-09-14).
-        let residual_per = view.residual(radio).and_then(|r| r.phy_per.get()).unwrap_or(0.0);
+        let residual_per = view
+            .residual(radio)
+            .and_then(|r| r.phy_per.get())
+            .unwrap_or(0.0);
         let seq_loss = view.broadcast_loss(radio).unwrap_or(0.0);
         let phy = residual_per.max(seq_loss).clamp(0.0, 0.95);
         let reinterest = view

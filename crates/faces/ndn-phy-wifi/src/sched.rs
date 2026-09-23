@@ -839,7 +839,12 @@ impl FaceScheduler {
             .max(1);
         // Capture the shared schedule pin (D2) from the parsed inputs BEFORE they move into the
         // struct. slot_depth defaults to 1; `with_groups` syncs it up if a deeper table is attached.
-        let sched_params = SchedParams::capture(DEFAULT_SLOT_DEPTH, clock_source, slot.as_ref(), hop.as_ref());
+        let sched_params = SchedParams::capture(
+            DEFAULT_SLOT_DEPTH,
+            clock_source,
+            slot.as_ref(),
+            hop.as_ref(),
+        );
         Some(Self {
             slot,
             hop,
