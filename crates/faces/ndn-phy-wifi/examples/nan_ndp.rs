@@ -84,7 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // recv_frame call and lose whatever arrives in between (see
         // Rtl8812auBackend::spawn_rx_pump). Depth 1 — one reader, so ordered.
         b.spawn_rx_pump(1);
-        println!("[{node}] ✓ 8812AU up (fw {ver}.{sub}) on ch6, TX max, RX pumped");
+        // Firmware version and every rung are in `report.render()` above (the deleted ladder
+        // used to print them here from its own locals).
+        println!("[{node}] ✓ 8812AU up on ch6, TX max, RX pumped");
         b
     };
 
