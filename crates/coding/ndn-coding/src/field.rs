@@ -108,8 +108,15 @@ pub fn pow(base: u8, exp: u32) -> u8 {
 /// In-place `dst[i] ^= mul(coeff, src[i])`. Routes through SIMD shuffle
 /// (NEON / SSSE3 / AVX2) with `feature = "simd"`, otherwise the peasant
 /// byte loop.
+///
+/// # Panics
+/// If `dst.len() != src.len()`.
 pub fn mul_add(dst: &mut [u8], src: &[u8], coeff: u8) {
-    debug_assert_eq!(dst.len(), src.len());
+    // A real assert, not debug_assert: the SIMD kernels index `dst` by
+    // `src.len()` through raw pointers, so a shorter `dst` in a release build
+    // was an out-of-bounds read AND write reachable from this safe fn. The
+    // portable path zips and never showed it. One compare per buffer.
+    assert_eq!(dst.len(), src.len(), "mul_add: dst and src lengths differ");
     if coeff == 0 {
         return;
     }
@@ -203,7 +210,7 @@ mod x86 {
     use super::{build_nibble_tables, mul_add_peasant_buf, mul_peasant};
     use std::sync::OnceLock;
 
-    type AddFn = fn(&mut [u8], &[u8], u8);
+    pub(super) type AddFn = fn(&mut [u8], &[u8], u8);
 
     static DISPATCH: OnceLock<AddFn> = OnceLock::new();
 
@@ -232,58 +239,71 @@ mod x86 {
         unsafe { avx2_inner(dst, src, coeff) }
     }
 
+    /// # Safety
+    /// The CPU supports SSSE3, and `dst.len() >= src.len()` (guaranteed by
+    /// [`super::mul_add`]'s length assert on every non-test path).
     #[target_feature(enable = "ssse3")]
     unsafe fn ssse3_inner(dst: &mut [u8], src: &[u8], coeff: u8) {
         use std::arch::x86_64::*;
         let (lo, hi) = build_nibble_tables(coeff);
-        let v_lo = _mm_loadu_si128(lo.as_ptr() as *const __m128i);
-        let v_hi = _mm_loadu_si128(hi.as_ptr() as *const __m128i);
         let lo_mask = _mm_set1_epi8(0x0F);
         let mut i = 0usize;
         let end = src.len() & !15;
-        while i < end {
-            let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-            let s_lo = _mm_and_si128(s, lo_mask);
-            // `_mm_srli_epi16` shifts 16-bit lanes; mask off neighbour-byte bleed.
-            let s_hi = _mm_and_si128(_mm_srli_epi16(s, 4), lo_mask);
-            let r_lo = _mm_shuffle_epi8(v_lo, s_lo);
-            let r_hi = _mm_shuffle_epi8(v_hi, s_hi);
-            let r = _mm_xor_si128(r_lo, r_hi);
-            let d = _mm_loadu_si128(dst.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d, r));
-            i += 16;
+        // SAFETY: SSSE3 per this fn's contract; every 16-byte load/store is at
+        // `i + 16 <= end <= src.len() <= dst.len()`, and the tables are 16 bytes.
+        unsafe {
+            let v_lo = _mm_loadu_si128(lo.as_ptr() as *const __m128i);
+            let v_hi = _mm_loadu_si128(hi.as_ptr() as *const __m128i);
+            while i < end {
+                let s = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+                let s_lo = _mm_and_si128(s, lo_mask);
+                // `_mm_srli_epi16` shifts 16-bit lanes; mask off neighbour-byte bleed.
+                let s_hi = _mm_and_si128(_mm_srli_epi16(s, 4), lo_mask);
+                let r_lo = _mm_shuffle_epi8(v_lo, s_lo);
+                let r_hi = _mm_shuffle_epi8(v_hi, s_hi);
+                let r = _mm_xor_si128(r_lo, r_hi);
+                let d = _mm_loadu_si128(dst.as_ptr().add(i) as *const __m128i);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, _mm_xor_si128(d, r));
+                i += 16;
+            }
         }
         for j in i..src.len() {
             dst[j] ^= mul_peasant(coeff, src[j]);
         }
     }
 
+    /// # Safety
+    /// The CPU supports AVX2 (which implies SSSE3), and `dst.len() >= src.len()`.
     #[target_feature(enable = "avx2")]
     unsafe fn avx2_inner(dst: &mut [u8], src: &[u8], coeff: u8) {
         use std::arch::x86_64::*;
         let (lo, hi) = build_nibble_tables(coeff);
-        let v_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lo.as_ptr() as *const __m128i));
-        let v_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(hi.as_ptr() as *const __m128i));
         let lo_mask = _mm256_set1_epi8(0x0F);
         let mut i = 0usize;
         let end = src.len() & !31;
-        while i < end {
-            let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            let s_lo = _mm256_and_si256(s, lo_mask);
-            let s_hi = _mm256_and_si256(_mm256_srli_epi16(s, 4), lo_mask);
-            let r_lo = _mm256_shuffle_epi8(v_lo, s_lo);
-            let r_hi = _mm256_shuffle_epi8(v_hi, s_hi);
-            let r = _mm256_xor_si256(r_lo, r_hi);
-            let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
-            _mm256_storeu_si256(
-                dst.as_mut_ptr().add(i) as *mut __m256i,
-                _mm256_xor_si256(d, r),
-            );
-            i += 32;
+        // SAFETY: AVX2 per this fn's contract; every 32-byte load/store is at
+        // `i + 32 <= end <= src.len() <= dst.len()`, and the tables are 16 bytes.
+        unsafe {
+            let v_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lo.as_ptr() as *const __m128i));
+            let v_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(hi.as_ptr() as *const __m128i));
+            while i < end {
+                let s = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+                let s_lo = _mm256_and_si256(s, lo_mask);
+                let s_hi = _mm256_and_si256(_mm256_srli_epi16(s, 4), lo_mask);
+                let r_lo = _mm256_shuffle_epi8(v_lo, s_lo);
+                let r_hi = _mm256_shuffle_epi8(v_hi, s_hi);
+                let r = _mm256_xor_si256(r_lo, r_hi);
+                let d = _mm256_loadu_si256(dst.as_ptr().add(i) as *const __m256i);
+                _mm256_storeu_si256(
+                    dst.as_mut_ptr().add(i) as *mut __m256i,
+                    _mm256_xor_si256(d, r),
+                );
+                i += 32;
+            }
         }
-        // SSSE3 is implied by AVX2, so the 16-byte residue path is safe.
         if src.len() - i >= 16 {
-            super::x86::ssse3_inner(&mut dst[i..], &src[i..], coeff);
+            // SAFETY: AVX2 implies SSSE3; the sub-slices keep `dst.len() >= src.len()`.
+            unsafe { super::x86::ssse3_inner(&mut dst[i..], &src[i..], coeff) };
             return;
         }
         for j in i..src.len() {
@@ -433,7 +453,7 @@ mod tests {
     fn x86_explicit_paths_match_peasant() {
         let max_len = 257;
         let src: Vec<u8> = (0..max_len).map(|i| ((i * 23) ^ 0x5A) as u8).collect();
-        let mut paths: Vec<(&'static str, fn(&mut [u8], &[u8], u8))> = Vec::new();
+        let mut paths: Vec<(&'static str, x86::AddFn)> = Vec::new();
         if let Some(f) = x86::ssse3_for_test() {
             paths.push(("ssse3", f));
         }
