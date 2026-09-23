@@ -1,6 +1,6 @@
 name: CI — ndn-radio
 
-# CI for the named-radio MAC + PHY faces (P1): clippy + host unit/integration tests.
+# CI for the named-radio MAC + PHY faces: fmt + clippy -D warnings + host unit/integration tests.
 #
 # ndn-radio path-deps ndn-rs (packet/tlv/transport/time) and ndn-radio-drivers
 # (HAL / frame-io) as `../` siblings, so every job checks those out next to
@@ -9,9 +9,10 @@ name: CI — ndn-radio
 # Quarmire remotes; on release, switch the path deps to { git, tag } and drop
 # the checkouts.
 #
-# Deliberately NOT run: the feature-gated on-air examples (dev-examples /
-# shared-mux / libusb-backend / serial-radio) need a radio on the bus — `--lib
-# --tests` excludes examples so CI stays host-only and fast.
+# Built and linted but NOT run: the feature-gated on-air examples (dev-examples /
+# shared-mux / libusb-backend / serial-radio) need a radio on the bus to run, not
+# to compile — --all-targets --all-features keeps them from rotting unseen.
+# Tests run --lib --tests so CI stays host-only and fast.
 
 on:
   push:
@@ -33,7 +34,7 @@ env:
 
 jobs:
   lint:
-    name: clippy (lib)
+    name: fmt + clippy (all targets, -D warnings)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,17 +42,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          ref: 2a5840be79098017965517e6c975874602d7f22a # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
-          ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896 # pinned sibling; bump deliberately
+          ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c # pinned sibling; bump deliberately
           path: ndn-radio-drivers
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          ref: 27646a78bb0fd91a7f1fba1f295d5a9ad220fef6 # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
@@ -60,8 +61,13 @@ jobs:
           workspaces: ndn-radio
           shared-key: lint
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: clippy (workspace lib)
-        run: cargo clippy --workspace --lib
+      - name: rustfmt (this repo's packages; path-dep siblings gate their own)
+        run: |
+          PKGS=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(' '.join('-p '+p['name'] for p in json.load(sys.stdin)['packages']))")
+          cargo fmt $PKGS -- --check
+      - name: clippy (workspace, all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: host tests (workspace lib + integration)
@@ -72,17 +78,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-rs
-          ref: 74beb638d3ba7c5654140f827010c6c22b57227f # pinned sibling; bump deliberately
+          ref: 2a5840be79098017965517e6c975874602d7f22a # pinned sibling; bump deliberately
           path: ndn-rs
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-radio-drivers
-          ref: 0315a7ed2f9d11363715cd9edf2e1da4f7d25896 # pinned sibling; bump deliberately
+          ref: 985cd9d70ce0664c6b622da29545c6aa2cd0448c # pinned sibling; bump deliberately
           path: ndn-radio-drivers
       - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/ndn-ext
-          ref: 6de852365eb73c0c5007bf4e26069d0afb8751a6 # pinned sibling; bump deliberately
+          ref: 27646a78bb0fd91a7f1fba1f295d5a9ad220fef6 # pinned sibling; bump deliberately
           path: ndn-ext
       - name: Install system dependencies (libusb)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config
