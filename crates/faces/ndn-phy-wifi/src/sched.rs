@@ -159,8 +159,13 @@ pub struct GroupTable {
 struct GroupEntry {
     /// The `/`-joined prefix bytes (the shared normalization).
     prefix: Vec<u8>,
-    /// `prefix_hash` over the prefix's components — the slot key.
+    /// `prefix_hash` over the prefix's components — the slot key of every name it covers when the
+    /// entry is depth-exact.
     hash: u64,
+    /// The entry has `slot_depth` components, so `hash` IS `H(first slot_depth components)` of any
+    /// name it covers. A SHALLOWER entry (a registration with fewer components than the shared
+    /// depth, e.g. `/muas` at depth 4) must not supply the key: the key comes from the name.
+    depth_exact: bool,
     /// The prefix's lease class (#93): `Latency` names are placed among the reserved lanes,
     /// `Bulk` among the open slots — disjoint by construction. Part of the SHARED map: every node
     /// must classify a prefix identically or their slot maps diverge, which is why class rides the
@@ -193,11 +198,12 @@ impl GroupTable {
             }
             entries.push(GroupEntry {
                 hash,
+                depth_exact: slash.iter().filter(|&&b| b == b'/').count() >= depth,
                 prefix: slash,
                 class: LeaseClass::Bulk,
             });
         }
-        entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.prefix.len()));
         Self {
             entries,
             slot_depth: depth,
@@ -300,24 +306,25 @@ impl GroupTable {
     /// Neither prevents a defection: FNV-1a is unkeyed here on purpose (#44), so this pins AGREEMENT
     /// and does not authenticate. A node that patches its own digest is outside what this can see.
     ///
-    /// **Two sets go in, each because it changes the map:**
-    /// * the `Latency` entries' slot keys — but only when `lanes_reserved`, because
-    ///   [`SlotSchedule::owner_slot_in`] ignores the class entirely at `reserved_stride < 2` (the
-    ///   shipping default, `NDN_SCHED_RESERVE` unset). Committing to something the map does not read
-    ///   would be a false partition by construction;
-    /// * any entry whose truncated prefix is SHALLOWER than `slot_depth`. Such an entry overrides
-    ///   the no-table fallback key `H(first slot_depth components)` with a shorter one, so a
-    ///   neighbour without that registration genuinely keys covered names to a different slot —
-    ///   regardless of class. Unreachable at the shipping `slot_depth = 1` (every non-empty prefix
-    ///   has ≥ 1 component) and unreachable from [`new`](Self::new); it is in because
-    ///   [`new_with_depth`](Self::new_with_depth) + `FaceScheduler::with_groups` will happily pin a
-    ///   deeper table, and a latent silent-divergence hole is worth ten lines to make loud.
+    /// **One set goes in:** the `Latency` entries' slot keys — and only when `lanes_reserved`,
+    /// because [`SlotSchedule::owner_slot_in`] ignores the class entirely at `reserved_stride < 2`
+    /// (the shipping default, `NDN_SCHED_RESERVE` unset). Committing to something the map does not
+    /// read would be a false partition by construction.
+    ///
+    /// Registrations SHALLOWER than `slot_depth` used to be committed too, because such an entry
+    /// overrode the name's `H(first slot_depth components)` key with its own shorter one — a real
+    /// map divergence, dismissed as unreachable at `slot_depth = 1`. Raising the default depth to 4
+    /// (field 2026-09-15) made it reachable: a node registering `/muas` keyed every `/muas/...` name
+    /// back into one slot while a node without that registration keyed it at depth 4, and the
+    /// shallow term then flagged every honest pair with different registrations as partitioned.
+    /// [`hash_for_name`](Self::hash_for_name) now always keys from the name, so a shallow entry
+    /// changes nothing but class — which the latency set already covers.
     ///
     /// **What is deliberately OUT, because committing to it would false-partition honest
-    /// neighbours:** `Bulk` entries at or below the slot depth — a depth-exact bulk entry yields the
-    /// same `(key, class)` pair as no entry at all, so two nodes with *disjoint* bulk registrations
-    /// and a shared lane set compute a bit-identical map and must digest alike; the entries' hashes
-    /// (RX attribution only, legitimately different per registration set); the entry ORDER
+    /// neighbours:** `Bulk` entries — any bulk entry yields the same `(key, class)` pair as no
+    /// entry at all, so two nodes with *disjoint* bulk registrations and a shared lane set compute
+    /// a bit-identical map and must digest alike; the entries' hashes beyond that (legitimately
+    /// different per registration set); the entry ORDER
     /// ([`new_with_depth`](Self::new_with_depth) sorts by prefix *length* only, so equal-length
     /// prefixes keep the caller's slice order — an in-order fold would partition two nodes over a
     /// literal's ordering); and the prefix BYTES (the hash is what the map reads, and bytes would
@@ -330,50 +337,47 @@ impl GroupTable {
     /// hash. Tolerable for `channels_digest`, where nobody wants their channel set to look like
     /// someone else's; not tolerable here.
     ///
-    /// `0` = no commitment (no lanes reserved and no shallow entry), which is also what a scheduler
-    /// with **no** table reports — correctly, because the two compute the same map.
+    /// `0` = no commitment (no lanes reserved), which is also what a scheduler with **no** table
+    /// reports — correctly, because the two compute the same map.
     pub fn class_digest(&self, lanes_reserved: bool) -> u64 {
-        let mut latency: Vec<u64> = Vec::new();
-        let mut shallow: Vec<u64> = Vec::new();
-        for e in &self.entries {
-            if lanes_reserved && e.class == LeaseClass::Latency {
-                latency.push(e.hash);
-            }
-            // `slot_trunc` writes exactly one `/` per component it kept, so this counts components
-            // without re-splitting. Shorter than the shared depth ⇒ this entry supplies a key the
-            // no-table fallback would not have derived.
-            if e.prefix.iter().filter(|&&b| b == b'/').count() < self.slot_depth {
-                shallow.push(e.hash);
-            }
+        if !lanes_reserved {
+            return 0;
         }
-        if latency.is_empty() && shallow.is_empty() {
+        let mut latency: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| e.class == LeaseClass::Latency)
+            .map(|e| e.hash)
+            .collect();
+        if latency.is_empty() {
             return 0;
         }
         latency.sort_unstable();
-        shallow.sort_unstable();
-        let mut bytes = Vec::with_capacity(8 + (latency.len() + shallow.len()) * 8);
-        for set in [&latency, &shallow] {
-            bytes.extend_from_slice(&(set.len() as u32).to_le_bytes());
-            for k in set {
-                bytes.extend_from_slice(&k.to_le_bytes());
-            }
+        let mut bytes = Vec::with_capacity(4 + latency.len() * 8);
+        bytes.extend_from_slice(&(latency.len() as u32).to_le_bytes());
+        for k in &latency {
+            bytes.extend_from_slice(&k.to_le_bytes());
         }
         fnv64(&bytes)
     }
 
-    /// Slot key + class for a name in `/`-joined form: the shared-depth slot group covering it (the
-    /// entries are truncated to `slot_depth`, so this returns `H(first slot_depth components)` — the
-    /// same value the no-table fallback computes, and the same at every node). Component-boundary
-    /// aware: `/a` covers `/a/b` and `/a`, never `/ab`. The table's role here is now only the *class*;
-    /// the *key* is shared by construction (D3).
+    /// Slot key + class for a name in `/`-joined form. The key is ALWAYS the name's shared-depth
+    /// group, `H(first slot_depth components)` — the same value the no-table fallback computes, and
+    /// the same at every node whatever it registered; the covering entry contributes only the
+    /// *class* (D3). A depth-exact entry's precomputed hash already equals that key, so the common
+    /// per-frame path allocates nothing; only a shallow entry hashes the name. Component-boundary
+    /// aware: `/a` covers `/a/b` and `/a`, never `/ab`.
     fn hash_for_name(&self, slash: &[u8]) -> Option<(u64, LeaseClass)> {
-        self.entries
-            .iter()
-            .find(|e| {
-                slash.starts_with(&e.prefix)
-                    && (slash.len() == e.prefix.len() || slash[e.prefix.len()] == b'/')
-            })
-            .map(|e| (e.hash, e.class))
+        let e = self.entries.iter().find(|e| {
+            slash.starts_with(&e.prefix)
+                && (slash.len() == e.prefix.len() || slash[e.prefix.len()] == b'/')
+        })?;
+        let key = if e.depth_exact {
+            e.hash
+        } else {
+            slot_trunc(slash, self.slot_depth).1
+        };
+        Some((key, e.class))
     }
 }
 
@@ -418,7 +422,7 @@ fn slot_trunc(slash: &[u8], depth: usize) -> (Vec<u8>, u64) {
 pub struct SchedParams {
     /// Bumped on any change to the pinned set — the version a beacon digest carries.
     pub version: u16,
-    /// Shared slot granularity: slot key = `H(first slot_depth name components)`. Default 1.
+    /// Shared slot granularity: slot key = `H(first slot_depth name components)`. Default [`DEFAULT_SLOT_DEPTH`].
     pub slot_depth: u8,
     /// Clock source discriminant (0=wall, 1=hardware, 2=common-view). Nodes on different clocks share
     /// no epoch, so the same slot index means different wall instants — a silent split.
@@ -838,7 +842,7 @@ impl FaceScheduler {
             .unwrap_or(1)
             .max(1);
         // Capture the shared schedule pin (D2) from the parsed inputs BEFORE they move into the
-        // struct. slot_depth defaults to 1; `with_groups` syncs it up if a deeper table is attached.
+        // struct. slot_depth defaults to DEFAULT_SLOT_DEPTH; `with_groups` syncs it up if a deeper table is attached.
         let sched_params = SchedParams::capture(
             DEFAULT_SLOT_DEPTH,
             clock_source,
@@ -2190,7 +2194,7 @@ mod tests {
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
             stats: SchedStats::default(),
-            slots: SlotState::new((8) as usize),
+            slots: SlotState::new(8_usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2237,7 +2241,7 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             stats: SchedStats::default(),
-            slots: SlotState::new((8) as usize),
+            slots: SlotState::new(8_usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2324,7 +2328,7 @@ mod tests {
             claimable: false,
             last_domain_rx: super::AtomicU64::new(0),
             stats: SchedStats::default(),
-            slots: SlotState::new((8) as usize),
+            slots: SlotState::new(8_usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2451,7 +2455,18 @@ mod tests {
         );
 
         // Never measured ⇒ refused. We do not silently pay an unknown cost.
-        let lora = RadioCapability::lora(vec![0]);
+        let lora = RadioCapability::lora_with(
+            ndn_radio_hal::RadioKind::Lora,
+            vec![ndn_radio_hal::Band::Sub1GHz],
+            vec![0],
+            ndn_radio_hal::RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12,
+            },
+            256,
+            0.01,
+        )
+        .with_tx_power_dbm(ndn_radio_hal::DbmRange::new(10, 22));
         assert_eq!(lora.retune_us, None);
         let unknown = FaceScheduler {
             hop: parse_hop("36,40,44:10000000"),
@@ -2516,7 +2531,7 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             stats: SchedStats::default(),
-            slots: SlotState::new((8) as usize),
+            slots: SlotState::new(8_usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -2984,7 +2999,7 @@ mod tests {
 
     /// **One filter, one map** (P1, D3): the slot key a TX node derives from the wire name and the
     /// slot a RX node attributes from the parsed name must agree — both on the SHARED slot group
-    /// (`H(first slot_depth components)`, default depth 1), NOT on a per-node longest-registered
+    /// (`H(first slot_depth components)`, the shared default depth), NOT on a per-node longest-registered
     /// prefix — and a foreign unicast frame must die at the origin gate without a parse. This is the
     /// property the whole redesign exists for; if it fails, two nodes compute different maps and every
     /// downstream measurement is noise.
@@ -2997,15 +3012,15 @@ mod tests {
         let mut s = mk_claim_sched();
         s.groups = Some(table.clone());
 
-        // Relevance is decided by PARSING the name (no in-frame filter). At the shared depth 1, an
-        // /ndn/alarm/… name keys on the /ndn group — the deeper /ndn/alarm registration does NOT pull
-        // the slot key deeper (D3: slot granularity is a shared constant; both regs truncate to /ndn).
+        // Relevance is decided by PARSING the name (no in-frame filter). The key is the name's first
+        // DEFAULT_SLOT_DEPTH components: neither the shallower /ndn nor the /ndn/alarm registration
+        // supplies it (D3: slot granularity is a shared constant, registrations only class).
         let wire = data_wire(&[b"ndn", b"alarm", b"7"]);
         let tx_hash = s.name_group_hash(&wire).expect("keyed");
         assert_eq!(
             tx_hash,
-            prefix_hash(&[b"ndn".as_slice()]),
-            "shared depth-1 group keys TX"
+            super::slot_trunc(b"/ndn/alarm/7", super::DEFAULT_SLOT_DEPTH as usize).1,
+            "the shared-depth group of the NAME keys TX"
         );
 
         // RX takes the SAME parse path, so TX keying and RX attribution land on one slot by
@@ -3036,7 +3051,7 @@ mod tests {
             .split(|&c| c == b'/')
             .filter(|c| !c.is_empty())
             .collect();
-        for depth in [1usize, 2] {
+        for depth in [1usize, 2, 4] {
             // Node A registered shallow, node B registered deep — different tables, same shared depth.
             let a = super::GroupTable::new_with_depth(&[b"/ndn/x".as_slice()], depth);
             let b = super::GroupTable::new_with_depth(&[b"/ndn/x/y".as_slice()], depth);
@@ -3362,38 +3377,46 @@ mod tests {
         );
     }
 
-    /// **A registration SHALLOWER than the slot depth is committed too** — the one map-affecting
-    /// thing a `Bulk` entry can do, and the precondition the latency-only scope would otherwise miss.
-    ///
-    /// `slot_trunc` takes `min(depth, comps)`, so a prefix with fewer components than `slot_depth`
-    /// yields a short entry and `hash_for_name` returns its shorter key, while a node without that
-    /// registration falls back to the name's full-depth key: a genuine, silent map split with no
-    /// class involved. Unreachable at the shipping `slot_depth = 1`, and `new_with_depth` has no
-    /// non-test caller — but `with_groups` will pin whatever depth a table reports, so the hole is
-    /// latent rather than impossible, and a latent silent divergence is worth making loud.
+    /// **A registration SHALLOWER than the slot depth keys nothing** — it only classes. The fleet
+    /// registers `/muas` (1 component) while the shipping slot depth is 4: if the entry supplied the
+    /// key, every `/muas/...` name would collapse into one slot at that node (undoing the depth-4
+    /// fix) and a node without the registration would key the same name at depth 4 — a silent
+    /// map split, which the old shallow digest term then reported as a partition between honest
+    /// nodes. Both nodes must compute the name's `H(first slot_depth components)` and agree.
     #[test]
-    fn a_shallower_than_depth_registration_is_committed() {
-        let shallow = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn".as_slice()], 2));
-        let exact = std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn/x".as_slice()], 2));
-        let a = mk_lane_sched(shallow);
-        let b = mk_lane_sched(exact);
+    fn a_shallower_than_depth_registration_keys_like_everyone_else() {
+        for depth in [2usize, 4] {
+            let shallow =
+                std::sync::Arc::new(GroupTable::new_with_depth(&[b"/ndn".as_slice()], depth));
+            let exact = std::sync::Arc::new(GroupTable::new_with_depth(
+                &[b"/ndn/x/y/z".as_slice()],
+                depth,
+            ));
+            let a = mk_lane_sched(shallow);
+            let b = mk_lane_sched(exact);
 
-        // Premise: they really do key the same name to different slot groups.
-        let w = data_wire(&[b"ndn".as_slice(), b"x".as_slice(), b"y".as_slice()]);
-        assert_ne!(
-            a.name_group(&w),
-            b.name_group(&w),
-            "premise: a shallow registration overrides the shared-depth key"
-        );
-        assert_ne!(
-            a.map_digest(),
-            b.map_digest(),
-            "a shallow registration must move the map digest"
-        );
-        assert!(
-            a.beacon_indicates_partition(&b.build_beacon()),
-            "…and must be detected on the beacon"
-        );
+            let w = data_wire(&[
+                b"ndn".as_slice(),
+                b"x".as_slice(),
+                b"y".as_slice(),
+                b"z".as_slice(),
+                b"7".as_slice(),
+            ]);
+            assert_eq!(
+                a.name_group(&w),
+                b.name_group(&w),
+                "a shallow and a deep registration must key one name to one slot at depth {depth}"
+            );
+            assert_eq!(
+                a.map_digest(),
+                b.map_digest(),
+                "different registration depths are not a map difference at depth {depth}"
+            );
+            assert!(
+                !a.beacon_indicates_partition(&b.build_beacon()),
+                "…and must not read as a partition at depth {depth}"
+            );
+        }
     }
 
     /// **The authority gates the promotion; the bare path does not — and the pin sees both.**
@@ -3479,7 +3502,7 @@ mod tests {
     fn co_owner_detection_is_local_recent_and_not_self() {
         use super::{LeaseClass, Ordering, PRESENCE_WINDOW_US};
         let s = mk_claim_sched_slots("8:3000");
-        let slot = s.slot.clone().unwrap();
+        let slot = s.slot.unwrap();
         let now = s.now_us();
         let h = prefix_hash(&[&b"ndn"[..], &b"a"[..]]);
         let keyed = s.medium_keyed(h);
@@ -3583,7 +3606,7 @@ mod tests {
             claimable: true,
             last_domain_rx: super::AtomicU64::new(0),
             stats: SchedStats::default(),
-            slots: SlotState::new((8) as usize),
+            slots: SlotState::new(8_usize),
             hold_slot_start: super::AtomicU64::new(u64::MAX),
             lease_until: super::AtomicU64::new(0),
             claim_unknown: false,
@@ -3669,7 +3692,7 @@ mod tests {
     #[test]
     fn a_claim_holds_the_slot_until_the_owner_speaks() {
         let s = mk_claim_sched();
-        let slot = s.slot.as_ref().unwrap().clone();
+        let slot = s.slot.unwrap();
         let start = 30_000u64;
         let air = wifi_airtime_us(200, Some(7));
 
