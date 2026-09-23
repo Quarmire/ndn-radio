@@ -68,6 +68,8 @@ impl ControlSurface for RadioCognitionSurface {
         //     only FORWARDED traffic; cognition self-reports are injected directly). Surfaced so
         //     `out=0` is never misread as a silent radio (field 2026-09-10). ---
         let tx = crate::medium::tx_egress_snapshot();
+        // entered − (ok + err) = frames still queued or lost before the inject returned.
+        e.push(("radio_tx_entered".into(), tx.enter.to_string()));
         e.push(("radio_tx_injected_ok".into(), tx.done_ok.to_string()));
         e.push(("radio_tx_injected_err".into(), tx.done_err.to_string()));
         e.push(("radio_tx_robust_bypassed".into(), tx.bypassed.to_string()));
