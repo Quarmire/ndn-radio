@@ -630,7 +630,7 @@ mod lease_tests {
         let s = SlotSchedule::new(1000, 8).with_reserved_stride(4); // lanes 0, 4
 
         // Starting in slot 1 with L=8 requested: slots 1,2,3 are open, 4 is reserved -> 3 slots.
-        let now = 1 * 1000 + 10; // inside slot 1
+        let now = 1000 + 10; // inside slot 1
         assert_eq!(s.current_slot(now), 1);
         assert_eq!(
             s.lease_deadline_us(now, LeaseClass::Bulk, 8),

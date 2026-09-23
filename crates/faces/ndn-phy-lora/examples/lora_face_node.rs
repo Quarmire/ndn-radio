@@ -46,8 +46,8 @@ use ndn_packet::encode::DataBuilder;
 use ndn_phy_lora::LoraPhy;
 use ndn_radio_cognition::{LoraRate, RateParams, TxParams};
 use ndn_radio_hal::{
-    Bandwidth, ClockDomainId, FaceError, FrameIo, OpenRadio, RadioCapability, RadioKnobs,
-    RadioProfile, RadioTime, RadioTimeSource,
+    Band, Bandwidth, ClockDomainId, DbmRange, FaceError, FrameIo, OpenRadio, RadioCapability,
+    RadioKind, RadioKnobs, RadioProfile, RadioTime, RadioTimeSource, RateCapability,
 };
 use ndn_transport::{FaceId, Transport};
 use tokio_util::sync::CancellationToken;
@@ -78,10 +78,21 @@ struct SimRadio {
 
 impl SimRadio {
     fn new(max_payload: usize, channel: u8) -> Self {
-        let mut cap = RadioCapability::lora(vec![channel]);
         // The one number this example is here to prove travels: a node that reports a
-        // SMALLER real cap than the preset's optimistic 256 must be respected by the face.
-        cap.max_payload = max_payload;
+        // SMALLER real cap than the old preset's optimistic 256 must be respected by the face.
+        // Everything else is what that preset declared (SX1262, SF 7–12, ETSI 1%, 10–22 dBm).
+        let cap = RadioCapability::lora_with(
+            RadioKind::Lora,
+            vec![Band::Sub1GHz],
+            vec![channel],
+            RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12,
+            },
+            max_payload,
+            0.01,
+        )
+        .with_tx_power_dbm(DbmRange::new(10, 22));
         Self {
             cap,
             log: Mutex::new(Vec::new()),

@@ -498,8 +498,8 @@ mod tests {
             }
             let id = nodes[i].rotate(1_000);
             // No earlier node shares it.
-            for j in 0..i {
-                assert_ne!(id, nodes[j].current(), "node {i} aliased node {j}");
+            for (j, earlier) in nodes[..i].iter().enumerate() {
+                assert_ne!(id, earlier.current(), "node {i} aliased node {j}");
             }
         }
     }

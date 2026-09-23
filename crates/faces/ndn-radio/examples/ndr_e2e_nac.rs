@@ -159,21 +159,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(cap)) =
                 tokio::time::timeout(Duration::from_millis(300), prod.recv_frame()).await
+                && let Some((0x05, wire_name, _)) = parse(&cap.payload)
+                && clear_prefix_is_svc(&wire_name)
             {
-                if let Some((0x05, wire_name, _)) = parse(&cap.payload) {
-                    if clear_prefix_is_svc(&wire_name) {
-                        let _ = pkey; // producer holds the same token key (would recompute tokens to index content)
-                        let aad = name_tlv(&wire_name);
-                        let sealed = pck.seal(b"patient blood-pressure 120/80", &aad).to_bytes();
-                        let d = data(&wire_name, &sealed);
-                        let _ = prod
-                            .inject(InjectFrame::broadcast(
-                                Bytes::from(d),
-                                TxIntent::CONSERVATIVE,
-                            ))
-                            .await;
-                    }
-                }
+                let _ = pkey; // producer holds the same token key (would recompute tokens to index content)
+                let aad = name_tlv(&wire_name);
+                let sealed = pck.seal(b"patient blood-pressure 120/80", &aad).to_bytes();
+                let d = data(&wire_name, &sealed);
+                let _ = prod
+                    .inject(InjectFrame::broadcast(
+                        Bytes::from(d),
+                        TxIntent::CONSERVATIVE,
+                    ))
+                    .await;
             }
         }
     });
@@ -209,24 +207,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while tokio::time::Instant::now() < win {
                 if let Ok(Ok(cap)) =
                     tokio::time::timeout(Duration::from_millis(150), consumer.recv_frame()).await
+                    && let Some((0x06, dname, content)) = parse(&cap.payload)
+                    && dname == wire
+                    && !content.is_empty()
                 {
-                    if let Some((0x06, dname, content)) = parse(&cap.payload) {
-                        if dname == wire && !content.is_empty() {
-                            // confidentiality check: plaintext is NOT on the wire.
-                            if cap.payload.windows(7).any(|w| w == b"patient") {
-                                conf_ok = false;
-                            }
-                            // authorised consumer decrypts.
-                            let aad = name_tlv(&wire);
-                            if let Ok(sealed) = Sealed::from_bytes(&content) {
-                                if let Ok(pt) = auth_content_key(&auth_grant).open(&sealed, &aad) {
-                                    if pt == b"patient blood-pressure 120/80" {
-                                        got = true;
-                                        break 'req;
-                                    }
-                                }
-                            }
-                        }
+                    // confidentiality check: plaintext is NOT on the wire.
+                    if cap.payload.windows(7).any(|w| w == b"patient") {
+                        conf_ok = false;
+                    }
+                    // authorised consumer decrypts.
+                    let aad = name_tlv(&wire);
+                    if let Ok(sealed) = Sealed::from_bytes(&content)
+                        && let Ok(pt) = auth_content_key(&auth_grant).open(&sealed, &aad)
+                        && pt == b"patient blood-pressure 120/80"
+                    {
+                        got = true;
+                        break 'req;
                     }
                 }
             }

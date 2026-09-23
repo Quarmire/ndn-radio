@@ -87,18 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prod = tokio::spawn(async move {
         let mut served = false;
         for _ in 0..120 {
-            if !served {
-                if let Ok(Ok((wire, _))) =
+            if !served
+                && let Ok(Ok((wire, _))) =
                     tokio::time::timeout(Duration::from_millis(60), producer.recv_bytes_with_addr())
                         .await
-                {
-                    if Interest::decode(wire.clone()).is_ok() {
-                        if wire.windows(want.len()).any(|w| w == want.as_slice()) {
-                            println!("producer: got Interest {} → serving Data", "/ndn/ble/big");
-                            served = true;
-                        }
-                    }
-                }
+                && Interest::decode(wire.clone()).is_ok()
+                && wire.windows(want.len()).any(|w| w == want.as_slice())
+            {
+                println!("producer: got Interest /ndn/ble/big → serving Data");
+                served = true;
             }
             let _ = producer.send_bytes(data.clone()).await; // fragments across ext-adv (paced on-device)
             // ~4 fragments × ~110ms firmware pacing ≈ 500ms per full Data; re-send for broadcast redundancy.
@@ -116,20 +113,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while tokio::time::Instant::now() < deadline && !ok {
         if let Ok(Ok((wire, addr))) =
             tokio::time::timeout(Duration::from_millis(800), consumer.recv_bytes_with_addr()).await
+            && let Ok(d) = Data::decode(wire.clone())
+            && d.content()
+                .map(|c| c.as_ref() == content.as_slice())
+                .unwrap_or(false)
         {
-            if let Ok(d) = Data::decode(wire.clone()) {
-                if d.content()
-                    .map(|c| c.as_ref() == content.as_slice())
-                    .unwrap_or(false)
-                {
-                    println!(
-                        "consumer: REASSEMBLED + decoded Data /ndn/ble/big ({} B content) from {:02x?} ✔",
-                        content.len(),
-                        addr
-                    );
-                    ok = true;
-                }
-            }
+            println!(
+                "consumer: REASSEMBLED + decoded Data /ndn/ble/big ({} B content) from {:02x?} ✔",
+                content.len(),
+                addr
+            );
+            ok = true;
         }
     }
     prod.abort();

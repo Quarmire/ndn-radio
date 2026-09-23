@@ -39,7 +39,7 @@ struct Medium<const N: usize> {
 }
 
 impl<const N: usize> Medium<N> {
-    fn deliver(&self, from: usize, group: Option<&[u8; 6]>, addr: Option<&[u8; 6]>, wire: &[u8]) {
+    fn deliver(&self, from: usize, group: Option<&[u8; 6]>, wire: &[u8]) {
         // Each lab node's §2 nonce is derived from its index — stable per node, distinct across
         // nodes, exactly what a real EphemeralSource provides within one rotation period.
         let nonce = [0x02, 0x4e, 0x44, 0x4e, 0x00, from as u8 + 1];
@@ -609,15 +609,14 @@ async fn prop_p6_hidden_terminal_refused_when_the_relay_is_recognizable() {
     m.deliver(
         1,
         Some(&ndn_radio_hal::BROADCAST),
-        None,
         &data_wire(&[b_name.as_bytes()]),
     );
-    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &c_wire); // the relay of /c
+    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), &c_wire); // the relay of /c
 
     let mut claimed = false;
     for _ in 0..6 {
         wait_for_slot(a, |k, _| k == c_slot).await;
-        m.deliver(2, Some(&ndn_radio_hal::BROADCAST), None, &c_wire); // hidden C transmits
+        m.deliver(2, Some(&ndn_radio_hal::BROADCAST), &c_wire); // hidden C transmits
         if a.try_claim(&slot, a_keyed, LeaseClass::Bulk, air).await {
             claimed = true;
             break;
@@ -648,12 +647,12 @@ async fn prop_p6_residual_pure_silent_relay_still_collides() {
     let c_wire = data_wire(&[b"c", b"data"]);
 
     // B relays /c and NOTHING else: a single-slot nonce, indistinguishable from the owner.
-    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), None, &c_wire);
+    m.deliver(1, Some(&ndn_radio_hal::BROADCAST), &c_wire);
 
     let mut collision_at_b = false;
     for _ in 0..6 {
         wait_for_slot(a, |k, _| k == c_slot).await;
-        m.deliver(2, Some(&ndn_radio_hal::BROADCAST), None, &c_wire);
+        m.deliver(2, Some(&ndn_radio_hal::BROADCAST), &c_wire);
         if a.try_claim(&slot, a_keyed, LeaseClass::Bulk, air).await {
             collision_at_b = true;
             break;
@@ -928,7 +927,7 @@ async fn prop_p10_a_lease_burst_pays_one_election() {
     // And the compat counter still conflates them, by documented design — the reason B needed
     // re-registration on election_counts rather than a silent redefinition of claim_counts.
     let (attempts, wins) = s.claim_counts();
-    assert!(attempts as usize >= 1 + continued);
+    assert!(attempts as usize > continued);
     assert_eq!(wins as usize, 1 + continued);
 }
 

@@ -46,18 +46,11 @@ pub(super) fn decode_commitment(v: &[u8]) -> Result<SourceCommitment> {
     let (&kind, rest) = v.split_first().ok_or(CodingError::MalformedMetadata)?;
     match kind {
         0 => {
-            if rest.len() % 32 != 0 {
+            let (hashes, tail) = rest.as_chunks::<32>();
+            if !tail.is_empty() {
                 return Err(CodingError::MalformedMetadata);
             }
-            let hashes = rest
-                .chunks_exact(32)
-                .map(|c| {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(c);
-                    a
-                })
-                .collect();
-            Ok(SourceCommitment::RowHashes(hashes))
+            Ok(SourceCommitment::RowHashes(hashes.to_vec()))
         }
         1 => {
             if rest.len() != 32 {

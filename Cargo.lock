@@ -2142,6 +2142,7 @@ dependencies = [
  "dashmap 6.2.1",
  "futures",
  "ndn-packet",
+ "ndn-runtime",
  "ndn-tlv",
  "portable-atomic",
  "serde",

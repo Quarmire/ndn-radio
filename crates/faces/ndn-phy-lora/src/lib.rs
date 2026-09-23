@@ -1354,10 +1354,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_knob_is_not_re_asked_every_frame() {
         let bus = LoopbackMonitorBus::new();
-        let mut spy_inner = SpyRadio::default();
-        spy_inner.refuse_bw = true;
-        *spy_inner.cap.lock().unwrap() = Some(lora_cap(200));
-        let spy = Arc::new(spy_inner);
+        let spy = Arc::new(SpyRadio {
+            refuse_bw: true,
+            cap: Mutex::new(Some(lora_cap(200))),
+            ..Default::default()
+        });
 
         let cell = Arc::new(RwLock::new(Some(TxParams {
             rate: RateParams::Lora(LoraRate {

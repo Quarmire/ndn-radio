@@ -1434,7 +1434,7 @@ mod tests {
 
     fn hetero() -> MediumState {
         let mut m = wifi_only();
-        m.register_radio(L, RadioCapability::lora(vec![0]));
+        m.register_radio(L, crate::sense::sx1262_lora_preset(vec![0]));
         m
     }
 
