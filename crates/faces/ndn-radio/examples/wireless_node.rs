@@ -298,8 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hook_strategy(&engine, &prefix);
     tokio::time::sleep(Duration::from_millis(1500)).await; // reader spin-up / radio settle
 
-    let exit_ok;
-    match role.as_str() {
+    let exit_ok = match role.as_str() {
         "producer" => {
             let cancel = CancellationToken::new();
             let producer = engine.register_producer(prefix.clone(), cancel.child_token());
@@ -322,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(Duration::from_secs(secs)).await;
             cancel.cancel();
             task.abort();
-            exit_ok = true;
+            true
         }
         _ => {
             // Consumer: route the prefix out the wireless face, then fetch distinct names each round.
@@ -334,18 +333,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("consumer: fetching {rounds} names under {prefix} ...");
             for r in 0..rounds {
                 let name: Name = format!("{prefix}/{r}").parse()?;
-                if let Ok(v) = consumer.fetch_unverified(name.clone()).await {
-                    if v.trust_unchecked().content().is_some() {
-                        delivered += 1;
-                    }
+                if let Ok(v) = consumer.fetch_unverified(name.clone()).await
+                    && v.trust_unchecked().content().is_some()
+                {
+                    delivered += 1;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
             println!("\nconsumer: delivered {delivered}/{rounds}");
             cancel.cancel();
-            exit_ok = delivered > 0;
+            delivered > 0
         }
-    }
+    };
 
     let _ = shutdown;
     // Exit immediately: graceful engine+serial shutdown blocks on the blocking reader threads and wedges

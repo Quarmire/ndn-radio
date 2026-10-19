@@ -119,10 +119,7 @@ fn reader_loop(mut port: Box<dyn serialport::SerialPort>, tx: mpsc::UnboundedSen
         match port.read(&mut tmp) {
             Ok(n) if n > 0 => {
                 acc.extend_from_slice(&tmp[..n]);
-                loop {
-                    let Some(pos) = acc.windows(2).position(|w| w == [SYNC0, SYNC1]) else {
-                        break;
-                    };
+                while let Some(pos) = acc.windows(2).position(|w| w == [SYNC0, SYNC1]) {
                     if acc.len() < pos + 5 {
                         break;
                     }

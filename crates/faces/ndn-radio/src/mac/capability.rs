@@ -333,7 +333,6 @@ mod tests {
 
     #[test]
     fn splice_then_extract_from_lp_wire_roundtrips() {
-        use bytes::Bytes;
         use ndn_tlv::TlvWriter;
         // Minimal LP packet: 0x64 { 0x50 <interest> }.
         let mut w = TlvWriter::new();

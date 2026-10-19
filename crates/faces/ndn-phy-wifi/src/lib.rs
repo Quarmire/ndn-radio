@@ -1010,25 +1010,6 @@ mod tests {
         assert_eq!(face.select_mcs().index, MAX_RELIABLE_MCS);
     }
 
-    /// A name-grouped face drops frames for other groups before NDN decode, but
-    /// One NDN Name TLV (`0x07 { 0x08 comp … }`) and a minimal Data packet wrapping it.
-    fn name_tlv(comps: &[&[u8]]) -> Vec<u8> {
-        let mut inner = Vec::new();
-        for c in comps {
-            inner.push(0x08);
-            inner.push(c.len() as u8);
-            inner.extend_from_slice(c);
-        }
-        let mut t = vec![0x07, inner.len() as u8];
-        t.extend_from_slice(&inner);
-        t
-    }
-    fn data_pkt(name: &[u8]) -> Bytes {
-        let mut d = vec![0x06, name.len() as u8];
-        d.extend_from_slice(name);
-        Bytes::from(d)
-    }
-
     /// **The A-MSDU batcher must reach the backend's `inject_batch_at` override.**
     ///
     /// This is the regression test for the defect #82 part 2 found: part 1 replaced

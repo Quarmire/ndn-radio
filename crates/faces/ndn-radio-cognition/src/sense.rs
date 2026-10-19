@@ -26,6 +26,25 @@ pub use ndn_radio_hal::{
     RadioKind, RateCapability,
 };
 
+/// Test fixture: the values the deprecated `RadioCapability::lora` preset carried (SX1262 on
+/// Sub-GHz, SF 7–12, 256 B payload, ETSI 1% duty, 10–22 dBm), built through `lora_with` so the
+/// tests that were written against that preset keep exercising exactly the same capability.
+#[cfg(test)]
+pub(crate) fn sx1262_lora_preset(channels: Vec<u8>) -> RadioCapability {
+    RadioCapability::lora_with(
+        RadioKind::Lora,
+        vec![Band::Sub1GHz],
+        channels,
+        RateCapability::Lora {
+            min_sf: 7,
+            max_sf: 12,
+        },
+        256,
+        0.01,
+    )
+    .with_tx_power_dbm(ndn_radio_hal::DbmRange::new(10, 22))
+}
+
 /// Identifies one physical radio / face on this node. The degenerate single-radio
 /// case is just one `RadioId`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -404,7 +423,13 @@ impl MediumState {
     /// map was missing: the outbound [`observe_rx`](Self::observe_rx) is fed only from a peer's
     /// report, which needs our `heard_neighbors` already populated — a bootstrap deadlock this
     /// breaks (field 2026-09-11). Twin of [`observe_heard_snr`](Self::observe_heard_snr).
-    pub fn observe_heard(&mut self, radio: RadioId, neighbor: u64, rssi_dbm: Option<i8>, now_ms: u64) {
+    pub fn observe_heard(
+        &mut self,
+        radio: RadioId,
+        neighbor: u64,
+        rssi_dbm: Option<i8>,
+        now_ms: u64,
+    ) {
         let st = self.neighbors.entry(neighbor).or_default();
         st.last_seen_ms = now_ms;
         if let Some(r) = rssi_dbm {
@@ -841,7 +866,7 @@ mod tests {
     fn state() -> MediumState {
         let mut m = MediumState::new();
         m.register_radio(W, RadioCapability::wifi_monitor_5ghz(vec![149, 161, 165]));
-        m.register_radio(L, RadioCapability::lora(vec![0]));
+        m.register_radio(L, sx1262_lora_preset(vec![0]));
         m
     }
 
@@ -871,7 +896,7 @@ mod tests {
     #[test]
     fn rate_capability_is_bearer_typed_and_ranks_across_bearers() {
         let wifi = RadioCapability::wifi_monitor_5ghz(vec![149]);
-        let lora = RadioCapability::lora(vec![0]);
+        let lora = sx1262_lora_preset(vec![0]);
         let sdr = RadioCapability::sdr_sensor(vec![36]);
         // The rate ceiling is a bearer sum type — no privileged field.
         assert!(matches!(wifi.rate, RateCapability::Wifi { max_mcs: 9, .. }));
@@ -1163,7 +1188,10 @@ mod snr_direction_tests {
         // Gap: seq jumps 2 -> 4 (seq 3 lost) => 1/2 of this interval lost.
         m.observe_report_seq(7, 4, 3_000);
         let loss = m.worst_report_loss().expect("loss measured");
-        assert!(loss > 0.0, "a seq gap raises the broadcast-loss estimate, got {loss}");
+        assert!(
+            loss > 0.0,
+            "a seq gap raises the broadcast-loss estimate, got {loss}"
+        );
         // A peer restart (seq resets backward) must not be read as loss / must not panic.
         m.observe_report_seq(7, 1, 4_000);
         assert!(m.worst_report_loss().is_some());

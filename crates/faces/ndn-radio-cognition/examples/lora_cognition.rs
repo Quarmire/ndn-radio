@@ -41,7 +41,6 @@ use ndn_radio_cognition::{
 use ndn_radio_drivers::LoraSerialBackend;
 use ndn_radio_hal::{Bandwidth, RadioKnobs, RadioProfile};
 
-const CHANNEL: u8 = 65; // 915 MHz (US ISM)
 const BW_KHZ: u32 = 125; // the backend's default bandwidth — airtime is computed against it
 /// SF hysteresis deadband. −92/−94 dBm sit on the −90 SF8/SF9 line; without a deadband the two
 /// nodes chatter across it and land on mismatched SFs (a total decode loss). 4 dB holds a converged
@@ -74,9 +73,9 @@ const RENDEZVOUS_MS: u64 = 12_000;
 /// the pairwise name-offset — it caps each node's airtime share and guarantees listening windows, so a
 /// node re-expressing Interests can't self-deafen (half-duplex) to the very Data replies it awaits.
 /// Measured: without it, dropping the offset let one node TX ~2× the other and receive nothing. Kept
-/// but disabled (0) now that the offset is restored — the offset does the turn-taking; the cooldown is
-/// the tool for a future offset-free (time-slotted) MAC.
-const TX_COOLDOWN_MS: u64 = 0;
+/// but disabled (`None`) now that the offset is restored — the offset does the turn-taking; the
+/// cooldown is the tool for a future offset-free (time-slotted) MAC. `Some(ms)` re-enables it.
+const TX_COOLDOWN_MS: Option<u64> = None;
 const RX_GUARD_MS: u64 = 400;
 // With the offset restored (it does the turn-taking), the reply jitter goes back to the offset-safe
 // 200 ms — a suppression-sized (≥ airtime) jitter fights the offset's tight reply timing (increment 1
@@ -259,7 +258,7 @@ impl Node {
 
     /// Listen-after-transmit: true while we should stay off the air and listen (#52 fairness).
     fn in_cooldown(&self) -> bool {
-        self.now().saturating_sub(self.last_tx_ms) < TX_COOLDOWN_MS
+        TX_COOLDOWN_MS.is_some_and(|ms| self.now().saturating_sub(self.last_tx_ms) < ms)
     }
 
     /// xorshift64 — cheap per-node randomness for the reply jitter (no external RNG dep, and the
@@ -877,14 +876,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_radio_cognition::RadioCapability;
+    use ndn_radio_cognition::{Band, RadioCapability, RadioKind, RateCapability};
+    use ndn_radio_hal::DbmRange;
 
     const R: RadioId = RadioId(0);
+    const CHANNEL: u8 = 65; // 915 MHz (US ISM)
 
     fn medium() -> MediumState {
         let mut m = MediumState::new();
-        let mut cap = RadioCapability::lora(vec![CHANNEL]);
-        cap.duty_cycle_max = 1.0; // US 915: no duty ceiling (see `run`)
+        // The SX1262 dongle's capability as the old `RadioCapability::lora` preset described it,
+        // except the duty ceiling: US 915 has none (see `run`).
+        let cap = RadioCapability::lora_with(
+            RadioKind::Lora,
+            vec![Band::Sub1GHz],
+            vec![CHANNEL],
+            RateCapability::Lora {
+                min_sf: 7,
+                max_sf: 12,
+            },
+            256,
+            1.0,
+        )
+        .with_tx_power_dbm(DbmRange::new(10, 22));
         m.register_radio(R, cap);
         m.observe_rx(R, neighbor_key("B"), Some(-40), 0); // a strong, live peer
         m
@@ -961,17 +974,16 @@ mod tests {
         );
 
         let policy = RadioPolicy::default();
-        let mut urgent = NameContext::new(ph);
-        let urgent =
-            urgent.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Urgent), 0));
+        let urgent = NameContext::new(ph)
+            .with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Urgent), 0));
         let plan = policy.decide(&urgent, &m, 0);
         let alloc = plan.allocation_for(R).expect("origin serves its own name");
         // Strong link → fastest SF; urgent → the more robust coding rate.
         assert_eq!(alloc.params.spreading_factor(), Some(7));
         assert_eq!(alloc.params.coding_rate(), Some(2), "urgent → 4/6");
 
-        let mut bulk = NameContext::new(ph);
-        let bulk = bulk.with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Bulk), 0));
+        let bulk = NameContext::new(ph)
+            .with_ceiling(ClassCeiling::authorised(&NameTrusting(Priority::Bulk), 0));
         let bulk_cr = policy
             .decide(&bulk, &m, 0)
             .allocation_for(R)

@@ -342,8 +342,16 @@ mod tests {
             decode_report(&encode_report(&r)).unwrap().tx_power_dbm,
             None
         );
-        // The sentinel is not mistakable for a real power.
-        assert!(TX_POWER_UNKNOWN < -100);
+        // The sentinel is not mistakable for a real power: every power from −100 dBm up (far below
+        // any real transmitter) survives the wire as that power, never collapsing to "no axis".
+        for p in -100..=i8::MAX {
+            r.tx_power_dbm = Some(p);
+            assert_eq!(
+                decode_report(&encode_report(&r)).unwrap().tx_power_dbm,
+                Some(p),
+                "{p} dBm must not read as the unknown sentinel"
+            );
+        }
     }
 
     /// The point of carrying the field: an RSSI becomes a path loss.
@@ -453,10 +461,12 @@ mod snr_section_tests {
 
     #[test]
     fn snr_section_round_trips() {
-        let mut r = ReceptionReport::default();
-        r.node_id = 0xAA;
-        r.heard_neighbors = vec![(1, -50), (2, -70)];
-        r.heard_snr = vec![(1, 22), (2, 7)];
+        let r = ReceptionReport {
+            node_id: 0xAA,
+            heard_neighbors: vec![(1, -50), (2, -70)],
+            heard_snr: vec![(1, 22), (2, 7)],
+            ..Default::default()
+        };
         let d = decode_report(&encode_report(&r)).expect("decode");
         assert_eq!(d.heard_snr, vec![(1, 22), (2, 7)]);
         assert_eq!(d.heard_neighbors, vec![(1, -50), (2, -70)]);
@@ -466,9 +476,11 @@ mod snr_section_tests {
     /// no SNR — never be rejected, which is the flag-day failure this shape avoids.
     #[test]
     fn report_without_the_snr_section_still_decodes() {
-        let mut r = ReceptionReport::default();
-        r.node_id = 0xBB;
-        r.heard_neighbors = vec![(9, -60)];
+        let r = ReceptionReport {
+            node_id: 0xBB,
+            heard_neighbors: vec![(9, -60)],
+            ..Default::default()
+        };
         let mut bytes = encode_report(&r);
         bytes.pop(); // drop the appended zero-length SNR section = an older encoder's output
         let d = decode_report(&bytes).expect("older report must still decode");
@@ -481,10 +493,12 @@ mod snr_section_tests {
     /// rejected like any other truncation. Only a wholly ABSENT section means "older peer".
     #[test]
     fn truncated_snr_section_is_rejected() {
-        let mut r = ReceptionReport::default();
-        r.node_id = 0xCC;
-        r.heard_neighbors = vec![(3, -55)];
-        r.heard_snr = vec![(3, 18), (4, 20)];
+        let r = ReceptionReport {
+            node_id: 0xCC,
+            heard_neighbors: vec![(3, -55)],
+            heard_snr: vec![(3, 18), (4, 20)],
+            ..Default::default()
+        };
         let full = encode_report(&r);
         assert_eq!(
             decode_report(&full[..full.len() - 5]),
@@ -495,8 +509,10 @@ mod snr_section_tests {
 
     #[test]
     fn negative_snr_survives() {
-        let mut r = ReceptionReport::default();
-        r.heard_snr = vec![(7, -5)];
+        let r = ReceptionReport {
+            heard_snr: vec![(7, -5)],
+            ..Default::default()
+        };
         let d = decode_report(&encode_report(&r)).unwrap();
         assert_eq!(d.heard_snr, vec![(7, -5)]);
     }

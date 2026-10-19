@@ -920,8 +920,9 @@ impl RadioControl {
                         // SNR to key off. Floor is operator-overridable (NDN_RADIO_NOISE_FLOOR_DBM).
                         let snr_est = ls.snr_db.or_else(|| {
                             ls.rssi_dbm.map(|r| {
-                                (f32::from(r) - noise_floor_dbm()).round().clamp(-128.0, 127.0)
-                                    as i8
+                                (f32::from(r) - noise_floor_dbm())
+                                    .round()
+                                    .clamp(-128.0, 127.0) as i8
                             })
                         });
                         m.observe_radio_snr(radio, snr_est, now_ms);
@@ -1947,7 +1948,10 @@ mod tests {
         let b_content = b_data.content().expect("content");
         // Sanity: the incoming report carries no neighbours (the deadlock precondition).
         assert!(
-            decode_report(&b_content).expect("decode").heard_neighbors.is_empty(),
+            decode_report(b_content)
+                .expect("decode")
+                .heard_neighbors
+                .is_empty(),
             "precondition: sender advertises no neighbours yet"
         );
 
@@ -1955,14 +1959,17 @@ mod tests {
             .with_node_id(1)
             .with_report_interval(1);
         a.register_radio(W, FaceId(10), RadioCapability::wifi_monitor_5ghz(vec![149]));
-        assert!(a.ingest_report(W, &b_content, 1_000, Some(-60)));
+        assert!(a.ingest_report(W, b_content, 1_000, Some(-60)));
 
         let a_frame = a.broadcast_report_frame().expect("report due");
         let a_ndn = ndn_packet::lp::lp_ndn_packet_bytes(&a_frame).expect("lp ndn");
         let a_data = ndn_packet::Data::decode(Bytes::copy_from_slice(a_ndn)).expect("data");
-        let a_report = decode_report(&a_data.content().expect("content")).expect("decode");
+        let a_report = decode_report(a_data.content().expect("content")).expect("decode");
         assert!(
-            a_report.heard_neighbors.iter().any(|(n, r)| *n == 2 && *r == -60),
+            a_report
+                .heard_neighbors
+                .iter()
+                .any(|(n, r)| *n == 2 && *r == -60),
             "bootstrap: heard_neighbors seeded from the received frame's inbound RSSI, got {:?}",
             a_report.heard_neighbors
         );

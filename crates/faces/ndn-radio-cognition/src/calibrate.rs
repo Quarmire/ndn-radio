@@ -52,8 +52,8 @@ pub const MIN_SNR_DB: [f32; 10] = [5.0, 8.0, 11.0, 14.0, 18.0, 22.0, 24.0, 26.0,
 /// Highest MCS whose demodulation floor `snr_db` clears.
 pub fn snr_ceiling(snr_db: f32) -> u8 {
     let mut best = 0u8;
-    for m in 0..MIN_SNR_DB.len() {
-        if MIN_SNR_DB[m] <= snr_db {
+    for (m, &floor) in MIN_SNR_DB.iter().enumerate() {
+        if floor <= snr_db {
             best = m as u8;
         }
     }
