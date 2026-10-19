@@ -296,14 +296,7 @@ mod imp {
                 let mcs: Option<u8> = args.get(4).and_then(|s| s.parse().ok());
                 let mut f = WifiPhy::new(FaceId(1), backend).with_mtu(mtu);
                 if let Some(index) = mcs {
-                    f = f.with_fixed_mcs(McsDescriptor {
-                        index,
-                        short_gi: false,
-                        vht: false,
-                        nss: 1,
-                        stbc: false,
-                        ldpc: false,
-                    });
+                    f = f.with_fixed_mcs(McsDescriptor::ht(index));
                 }
                 let face = f.into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
@@ -404,14 +397,7 @@ mod imp {
                 let count: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
                 let mcs: u8 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
                 let face = WifiPhy::new(FaceId(2), backend)
-                    .with_fixed_mcs(McsDescriptor {
-                        index: mcs,
-                        short_gi: false,
-                        vht: false,
-                        nss: 1,
-                        stbc: false,
-                        ldpc: false,
-                    })
+                    .with_fixed_mcs(McsDescriptor::ht(mcs))
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 println!("fetching {count}×{size} B under {prefix} at MCS{mcs} on {iface} …");
@@ -439,14 +425,7 @@ mod imp {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(ndn_phy_wifi::MONITOR_MTU);
                 let face = WifiPhy::new(FaceId(2), backend)
-                    .with_fixed_mcs(McsDescriptor {
-                        index: mcs,
-                        short_gi: false,
-                        vht: false,
-                        nss: 1,
-                        stbc: false,
-                        ldpc: false,
-                    })
+                    .with_fixed_mcs(McsDescriptor::ht(mcs))
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let sizes = [256usize, 800, 1400, 2200, 4000, 8000, 16000];
@@ -490,14 +469,7 @@ mod imp {
                 let count: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
                 let mcs: u8 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
                 let face = WifiPhy::new(FaceId(2), backend)
-                    .with_fixed_mcs(McsDescriptor {
-                        index: mcs,
-                        short_gi: false,
-                        vht: false,
-                        nss: 1,
-                        stbc: false,
-                        ldpc: false,
-                    })
+                    .with_fixed_mcs(McsDescriptor::ht(mcs))
                     .into_face();
                 let mut reasm = ReassemblyBuffer::new(Duration::from_secs(2));
                 let sizes = [256usize, 800, 1400, 2200, 4000, 8000, 16000];
