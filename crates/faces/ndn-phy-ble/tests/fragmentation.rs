@@ -24,7 +24,7 @@ async fn large_packet_fragments_into_multiple_adverts() {
 
     // A Data packet several times larger than one extended advertisement.
     let payload = vec![0x5Au8; 800];
-    let data = DataBuilder::new("/ble/adv/big", &payload).sign_digest_sha256();
+    let data = DataBuilder::new(ndn_packet::name!("/ble/adv/big"), &payload).sign_digest_sha256();
     assert!(
         data.len() > EXTENDED_ADV_MTU * 2,
         "test packet must be clearly multi-fragment"
